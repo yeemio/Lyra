@@ -1,6 +1,6 @@
 # 修复已有持仓风险与连续回放状态
 
-状态：修复合同；当前仅建立 Draft PR，尚无修复接受。
+状态：I-22、I-23、I-24 已实现并完成下列隔离检查；等待总控对稳定候选作 ACCEPT/REWORK，尚无修复接受。
 
 审查候选：[`6c7cd196f20a4222d1f97708de7402b2c50ebeb0`](https://github.com/yeemio/Lyra/tree/6c7cd196f20a4222d1f97708de7402b2c50ebeb0)，tree `843eb5b97617ffda179ebb06e2ee2adf03bf19fc`。PR base=`main@6c7cd196f20a4222d1f97708de7402b2c50ebeb0`；head=`review-20261103/l2-risk-replay`，初始合同提交身份见 PR。
 
@@ -36,3 +36,29 @@ Owner 已授权这批经核对的问题修复、验证、对应分支提交/推�
 适用验证在稳定候选完成后运行：项目 typecheck、受影响行为/调用链回归、diff检查；使用公开合成输入/隔离数据库。不是严格 TDD 授权，不强制先写失败测试。每条通过必须附实际命令、输出、环境与准确 head；未运行列明原因，不把报告原93测试当新候选证明。UI/PDF变动须提供与候选绑定的实际呈现证据。
 
 停止条件：每个问题的完整行为出口成立，提供稳定 head、完整 changed paths/diff 与适用验证；当前总控接收。若无 GitHub 写工具，完整可发布补丁/文件即本次传输出口。一个初始结果加一次具名窄返工后先由总控重评，不自动无限重试或改换作者。源码接受不自动等于安装、整体L2、真实A/J或效果接受。
+
+## 本次实现与实际验证（2026-11-03）
+
+修复父提交：`36a1c84a982a9442562fcff9e15260c572a22b77`；未采用其他 PR 提交，base 不变。唯一代码作者为本 Chat。
+
+| 问题 | 实现行为与文件 |
+|---|---|
+| I-22 | `execution.ts` 汇总及逐批卖出共用可卖规则。快照确认数量优先；只有快照日之后的明确解锁日才可解锁余量。卖出扣减确认余量，过去解锁日不能在后续回放日自动释放剩余股份；模拟新增股份保留 T+1。 |
+| I-23 | `replay.ts` 固定计划从信号后首个交易日连续推进至请求终点，再截取事件、机会和净值。`continuity` 保留所有窗口前记录及明确标注范围的累计指标；展示窗口指标为空，不以累计收益冒充窗口收益。历史规则 IS/OOS 仍独立，J 门仍必经。 |
+| I-24 | `plan.ts` 使用 `TOTAL_SUBJECT_MARK_TO_STRESS_V1`：已有持仓按当前参考买价至压力退出价计损失，退出费用按一次合并订单计收，新增损失为合计减已有，合计受总标的预算约束。已有超限时数量为0并给具名原因；不以历史成本抵减当前风险。`contracts.ts` 明确分解字段，旧冻结记录缺字段时不推断合计值。 |
+
+`render.ts` 与 `workbench-render.ts` 同时展示已有/新增/合计损失和合并退出费用，标明已有超限；截取窗口明确展示连续前史与累计指标的时间范围。`risk-replay.test.ts` 使用公开合成生成器创建新的合成 A/J 夹具，身份始终为 STATIC_SIMULATED_FIXTURE；没有生成真实模型意见或覆盖任何既有原件。
+
+兼容性：新增风险口径及情景费用解释进入新计划哈希，并可能改变历史验证哈希。旧静态 A/J 不自动成为新结果的复核；原校验仍拒绝错绑。没有重写旧计划、旧 A/J、旧样本或 P5 参数，也未改 I-05 的停牌/窗口口径。
+
+实际环境为 Node v24.22.1、npm 11.9.0。复用 PR #6 在相同 package-lock 下通过 npm ci 安装的依赖目录，未声称对本工作树另做独立安装接受。
+
+| 检查 | 实际结果 |
+|---|---|
+| `npm run typecheck` | exit 0 |
+| `node --import tsx --test src/stock-research/strategy/risk-replay.test.ts src/stock-research/strategy/risk-input.test.ts` | 11 tests，11 pass，0 fail，0 skip；包括正常 strictWorkbenchResult→工作台 HTML 调用链与授权否定字段 |
+| `git diff --check` | exit 0 |
+| 实际 HTML 生成与内容断言 | 通过；产物为独立合成策略页和工作台片段，含1254元既有风险、0新增数量、超限原因与累计时间范围 |
+| 浏览器视觉呈现 | NOT_RUN：尝试启动已有 Chromium 时退出，`process_singleton_posix.cc:297 socket() failed: Operation not permitted (1)`；未取得截图，不声称浏览器视觉通过 |
+
+未验证边界：依赖未公开 delivery 原件的 `strategy.test.ts`、workbench 集成与旧静态夹具复算未运行；实际八日缺口、严格历史 PIT、独立开盘、逐日规则/公司行为、真实账户/A-J、安装及业务效果保持原边界。没有 PDF 改动，没有采集、模型或业务数据库操作。

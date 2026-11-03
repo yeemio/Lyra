@@ -28,8 +28,15 @@ export function openingContext(data: StrategyData, date: string): OpeningContext
   return { quote: quotes[0]!, state, openAt: session.openAt, nextSession: data.calendar.sessions[i + 1]?.date ?? null };
 }
 
+function lotSellable(lot: Portfolio['lots'][number], date: string): number {
+  if (date < lot.initialDate || date <= lot.acquiredOn) return 0;
+  // A past unlock date is not evidence that the snapshot's restricted remainder can be sold.
+  const subsequentlyUnlocked = lot.unlocksOn > lot.initialDate && date >= lot.unlocksOn;
+  return subsequentlyUnlocked ? lot.quantity : Math.min(lot.quantity, lot.initiallySellable);
+}
+
 export function sellableShares(portfolio: Portfolio, date: string): number {
-  return portfolio.lots.reduce((total, lot) => total + (date <= lot.acquiredOn ? 0 : date >= lot.unlocksOn ? lot.quantity : Math.min(lot.quantity, lot.initiallySellable)), 0);
+  return portfolio.lots.reduce((total, lot) => total + lotSellable(lot, date), 0);
 }
 
 /** 唯一确定性成交函数。它不是模型执行器，不调用模型，也不接收未来的日线字段。 */
@@ -56,7 +63,7 @@ export function executeAtOpen(ctx: OpeningContext, portfolio: Portfolio, side: '
   } else {
     let remaining = qty, cost = 0, dividends = 0;
     for (const lot of out.portfolio.lots) {
-      const available = q.date <= lot.acquiredOn ? 0 : q.date >= lot.unlocksOn ? lot.quantity : Math.min(lot.quantity, lot.initiallySellable);
+      const available = lotSellable(lot, q.date);
       const take = Math.min(remaining, available);
       if (take === 0) continue;
       const partCost = ratio(lot.costFen, take, lot.quantity), partDividend = ratio(lot.dividendsFen, take, lot.quantity);
