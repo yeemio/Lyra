@@ -9,8 +9,8 @@
  *      checklistHash 必须可由 A 输出机械重导出（rederiveChecklistHash）；
  *      清单绑定 A 输出与封存 manifest（哈希两两相符）；J verdicts 恰好覆盖清单全部条目一次；
  *   3. 继承配对：有 inheritance 指针 → changeReason 必填（维持也写）；standalone →
- *      inheritance=null 且 standaloneNote='无基础结论可继承'；J 改判 A 候选（changedFromA）
- *      → changeReason 必填；
+ *      inheritance=null；事件完整重研写明降级原因，其余 standaloneNote='无基础结论可继承'；
+ *      J 改判 A 候选按实际方向差异判定，J 自身及结论 changeReason 均必填；
  *   4. adoption 恒 false（类型层面字面量 false；落库断言由 db 层与读回保证）；
  *   5. settlement 初始 {state:'UNSETTLED'}；conclusionHash = canonicalSha256(除
  *      conclusionHash 外的研究字段)——settlement/createdAt 不属于研究字段，结算回填不改哈希。
@@ -27,6 +27,9 @@ import {
   type SettlementZone,
 } from '../contracts.js';
 import { rederiveChecklistHash, type DimensionCoveragePkg } from '../research/checklist.js';
+import type { ResearchInputPackage } from '../research/inputs.js';
+import { researchTraceOf, validateResearchJ } from '../research/validation.js';
+import { assertVerifiedPrior, validatePostEventContext, type VerifiedPrior } from '../research/inheritance.js';
 
 export type ConclusionErrorCode =
   | 'INVALID_BUSINESS_KEY'
@@ -69,6 +72,9 @@ export interface ConclusionInput {
   checklist: ProgramChecklist;
   jOutput: JOutput;
   manifest: ConclusionManifestRef | SealManifest;
+  /** 必填实际送达包；仅 manifest 哈希或全封存目录不能证明证据送达。 */
+  researchInput: ResearchInputPackage;
+  verifiedPrior?: VerifiedPrior;
   /** 继承指针；null = STANDALONE（standaloneNote 自动标注）。 */
   inheritance: ConclusionInheritance | null;
   /** 继承（维持也写）或 J 改判 A 候选时必填。 */
@@ -129,7 +135,7 @@ function normalizedBusinessKey(bk: ResearchBusinessKey): ResearchBusinessKey {
 /**
  * 构造结论对象（全部字段间校验在此完成；db 层只做落库与读回）。
  * 校验次序稳定：业务键 → manifest 绑定 → 选项空间 → 清单绑定 → 清单哈希重导出 →
- * J 覆盖 → 继承/改判配对。
+ * J 覆盖 → 实际送达/承重/未知处置 → 继承原文核验与改判配对。
  */
 export function buildConclusionObject(input: ConclusionInput): ConclusionObject {
   const businessKey = normalizedBusinessKey(input.businessKey);
@@ -183,6 +189,25 @@ export function buildConclusionObject(input: ConclusionInput): ConclusionObject 
     );
   }
 
+  // 不信任通道或 J 自报：直接构造/合成路径也必须通过相同领域门。
+  const pkg = input.researchInput;
+  if (pkg === undefined || canonicalSha256(pkg.businessKey) !== canonicalSha256(businessKey) ||
+      pkg.versions.methodVersion !== input.methodVersion || pkg.versions.adapterVersion !== input.adapterVersion ||
+      pkg.versions.planAuthVersion !== input.planAuthVersion || pkg.seals[0]?.manifestHash !== manifest.manifestHash) {
+    throw new ConclusionError('MANIFEST_UNBOUND', '结论须绑定同业务键、版本与封存的实际送达包');
+  }
+  validateResearchJ(input.jOutput, pkg, input.aOutput, input.checklist, input.aOutput.simulated, input.checklistCoverage);
+  const eventContext = validatePostEventContext(pkg);
+  if (eventContext?.basis === 'INHERITED') assertVerifiedPrior(eventContext, input.verifiedPrior);
+  if (input.inheritance !== null && (eventContext?.basis !== 'INHERITED' ||
+      eventContext.prior.conclusion.conclusionId !== input.inheritance.fromConclusionId ||
+      eventContext.prior.conclusion.conclusionHash !== input.inheritance.fromConclusionHash)) {
+    throw new ConclusionError('INHERITANCE_PAIRING_INVALID', '继承指针未绑定实际送达的先验原文');
+  }
+  if (input.inheritance === null && eventContext?.basis === 'INHERITED') {
+    throw new ConclusionError('INHERITANCE_PAIRING_INVALID', '实际送达继承先验却丢失继承指针');
+  }
+
   // 5) 继承配对与改判理由
   let standaloneNote: string | null;
   if (input.inheritance !== null) {
@@ -195,7 +220,7 @@ export function buildConclusionObject(input: ConclusionInput): ConclusionObject 
     }
     standaloneNote = null;
   } else {
-    standaloneNote = '无基础结论可继承';
+    standaloneNote = eventContext?.basis === 'STANDALONE' ? `完整重研：${eventContext.reason}` : '无基础结论可继承';
   }
   if (input.jOutput.changedFromA === true && (input.changeReason ?? '').trim().length === 0) {
     throw new ConclusionError('CHANGE_REASON_REQUIRED', 'J 改判 A 候选必须写 changeReason（RM §2.3/§8）');
@@ -213,6 +238,10 @@ export function buildConclusionObject(input: ConclusionInput): ConclusionObject 
       checklistHash: input.checklist.checklistHash,
       jOutputHash: canonicalSha256(input.jOutput),
       manifestHash: manifest.manifestHash,
+      researchTraceSha256: canonicalSha256(researchTraceOf({
+        input: pkg, aOutput: input.aOutput, checklist: input.checklist, jOutput: input.jOutput,
+        ...(input.checklistCoverage === undefined ? {} : { checklistCoverage: input.checklistCoverage }),
+      })),
     },
     inheritance: input.inheritance,
     standaloneNote,

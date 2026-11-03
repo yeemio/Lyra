@@ -295,7 +295,7 @@ test('buildInvocationIndex：final.txt 按 canonicalSha256 建索引；坏文件
     stage: 'J',
     inputHash: H64,
     finalDisposition: 'ABSTAIN',
-    verdicts: [{ checklistId: 'check:p0:CANDIDATE:0', verdict: 'SUPPORTED', decisionBearing: true, correction: null }],
+    verdicts: [{ checklistId: 'check:p0:CANDIDATE:0', verdict: 'SUPPORTED', decisionBearing: true, correction: null, reason: 'TEST_ONLY', evidenceArtifactSha256s: ['11'.repeat(32)], remainingBasisChecklistIds: [] }],
     changedFromA: false,
     changeReason: null,
     strongestCaseDisposition: 'ACCEPTED',

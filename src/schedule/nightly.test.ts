@@ -1,13 +1,14 @@
+import { syntheticConclusionInput } from '../research/research-test-helper.js';
 /**
  * Lyra · 晚间研究循环骨架单测（P5 准备 W27: code-writer-pro）。
  * 隔离 schema + 临时原件目录 + 合成池（26+4 满轮转）+ 合成日历（未来交易日，commit 可在窗）。
  * 公共库只读：一切写入（事实 / 封存 / permit / 结论 / 调度表 / 事件）落隔离 schema。
  * 覆盖：轮转取 6 只 + 事件合并（SC-3.2）+ 池外跳过；dry 零 permit 零结论；
- * commit 落库且 pa-p5-skeleton 身份可查；transport=real 全部 BLOCKED 不留 permit；
+ * commit 落库且 pa-p5-skeleton 身份可查；transport=real 在任何计划/permit 前具名拒绝；
  * 非交易日 / commit 截止已过具名拒绝；settle-due 到期回填。
  */
 import assert from 'node:assert/strict';
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { mkdtemp, rm, writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -16,14 +17,11 @@ import { after, before, test } from 'node:test';
 import type { Pool } from 'pg';
 import { ArtifactStore } from '../artifacts/store.js';
 import type { TradeCalendarTable } from '../adapters/calendar.js';
-import { canonicalSha256 } from '../canonical.js';
 import { applySchema, dropSchema } from '../db/exec.js';
 import { createPool } from '../db/pool.js';
 import { persistConclusion, readConclusion } from '../db/conclusion.js';
 import { readExecutorLock } from '../kernel/lock.js';
 import { insertFact } from '../pintime/facts.js';
-import { deriveChecklist } from '../research/checklist.js';
-import { simulatedModelA, simulatedModelJ } from '../research/simulated.js';
 import { runNightly, SKELETON_PLAN_AUTH_VERSION, type NightlyEntryResult } from './nightly.js';
 
 const schema = `w27_n_${randomUUID().replaceAll('-', '').slice(0, 12)}`;
@@ -255,41 +253,26 @@ test('commit（simulated）：7 研究全 PASS，permit/结论落库且 pa-p5-sk
   assert.equal(lock.holder, '');
 });
 
-test('commit（transport=real）：全部 BLOCKED / MODEL_PROVIDER_UNAUTHORIZED，不留 permit、不组装', async () => {
+test('commit（transport=real）：P5_PROTOCOL_FROZEN，在计划/准入/permit 前拒绝', async () => {
   const beforePermits = await countOf('exec_permit');
   const beforeConclusions = await countOf('conclusion');
-  const out = await runNightly(deps(), {
+  const beforePlans = await countOf('schedule_plan');
+  const beforeAdmissions = await countOf('schedule_admission');
+  await assert.rejects(() => runNightly(deps(), {
     date: '2026-11-09', mode: 'commit', now: new Date('2026-11-09T13:00:00Z'), poolInfoFile,
     transportProvider: 'real',
-  });
-  assert.deepEqual(out.tally, { DRY: 0, PASS: 0, FAILED: 0, BLOCKED: 6, SKIPPED: 0 });
-  for (const e of entriesOf(out, 'BLOCKED')) {
-    assert.equal(e.code, 'MODEL_PROVIDER_UNAUTHORIZED');
-    assert.equal(e.inputBytes, null, '真实通道未授权不组装');
-  }
+  }), (error: unknown) => (error as { code?: string }).code === 'P5_PROTOCOL_FROZEN');
   assert.equal(await countOf('exec_permit'), beforePermits, 'blocked 不入 permit 表');
   assert.equal(await countOf('conclusion'), beforeConclusions);
-  // blocked 准入落档（annotation 前缀 BLOCKED:，供周末指标 blocked 计数）
-  const blockedRows = await pool.query<{ n: string }>(
-    `select count(*)::text as n from schedule_admission where annotation like 'BLOCKED:%'`,
-  );
-  assert.equal(blockedRows.rows[0]?.n, '6');
-  assert.equal(out.zeroRealModelCalls, true);
+  assert.equal(await countOf('schedule_plan'), beforePlans);
+  assert.equal(await countOf('schedule_admission'), beforeAdmissions);
 });
 
 test('settle-due：到期结论结算回填（SETTLED），新结论未到期不预测性回填', async () => {
   // 夹具：600101 老结论（cutoff 2026-10-05，结论时刻改写为 12:00+08 → 参考价日 10-06，窗口 10-06..11-02 走完）
-  const ART = createHash('sha256').update('w27-nightly-manifest').digest('hex');
-  const a = simulatedModelA({ inputHash: createHash('sha256').update('w27n-sd-a').digest('hex'), subjectKind: 'STOCK', subject: '600101', material: { artifactSha256s: [ART], factCount: 1 } });
-  const manifestHash = createHash('sha256').update('w27n-sd-manifest').digest('hex');
-  const checklist = deriveChecklist(a, manifestHash);
-  const j = simulatedModelJ({ inputHash: canonicalSha256({ a, checklist }), subjectKind: 'STOCK', aOutput: a, checklist });
-  const fixture = await persistConclusion(pool, {
-    businessKey: { subjectKind: 'STOCK', subject: '600101', researchKind: 'WEEKLY', cutoff: '2026-10-05T02:00:00.000Z' },
-    methodVersion: 'method@p2-v1', adapterVersion: 'data@p1', planAuthVersion: 'pa-w27-settle-test',
-    aOutput: a, checklist, jOutput: j, manifest: { manifestHash },
-    inheritance: null, changeReason: j.changedFromA ? j.changeReason : null,
-  });
+  const fixture = await persistConclusion(pool, syntheticConclusionInput(
+    { subjectKind: 'STOCK', subject: '600101', researchKind: 'WEEKLY', cutoff: '2026-10-05T02:00:00.000Z' },
+    { methodVersion: 'method@p2-v1', adapterVersion: 'data@p1', planAuthVersion: 'pa-w27-settle-test' }));
   await pool.query('update conclusion set created_at = $1 where conclusion_id = $2', ['2026-10-05T04:00:00Z', fixture.conclusionId]);
 
   const out = await runNightly(deps(), {

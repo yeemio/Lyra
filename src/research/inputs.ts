@@ -37,7 +37,7 @@ import { SW2014_GAP, SW_CLASS_SOURCE_GAP } from '../adapters/swclass.js';
 import { SW_CLASS_SOURCE_GAP_CLOSED } from '../adapters/sw.js';
 import { loadStockPESamples, industryMedianPE, stockPEOf, pePercentileOf } from './industry-valuation.js';
 import { decFromString } from '../settlement/decimal.js';
-import { computeIndicators } from './indicators.js';
+import { computeIndicators, indicatorVersionForMethod, EMA_INDICATOR_VERSION, type IndicatorVersion } from './indicators.js';
 import { qualityIndicators } from './quality.js';
 import { industryMomentumTable, type IndustryMomentumTable } from './rotation.js';
 import { assertRoundTrip, barsToTable, type BarTable } from './tables.js';
@@ -218,6 +218,8 @@ export interface MaterialBase {
   /** 维度号；0 = 非维度材料（L0 身份/规则/回执、L2 索引）。 */
   dimension: number;
   factIds: string[];
+  /** 按封存事实构造的精确配对；旧归档可缺，新的可执行包必须携带。 */
+  evidenceRefs?: { factId: string; artifactSha256: string }[];
 }
 
 export interface BarTableMaterial extends MaterialBase {
@@ -267,11 +269,11 @@ export type Material = BarTableMaterial | RecordsMaterial | NoteMaterial | Index
 export function modelPayloadOf(material: Material): Record<string, unknown> {
   switch (material.kind) {
     case 'BAR_TABLE':
-      return { title: material.title, header: material.table.header, rows: material.table.rows };
+      return { title: material.title, header: material.table.header, rows: material.table.rows, ...(material.evidenceRefs === undefined ? {} : { evidenceRefs: material.evidenceRefs }) };
     case 'RECORDS':
-      return { title: material.title, records: material.records };
+      return { title: material.title, records: material.records, ...(material.evidenceRefs === undefined ? {} : { evidenceRefs: material.evidenceRefs }) };
     case 'NOTE':
-      return { title: material.title, text: material.text };
+      return { title: material.title, text: material.text, ...(material.evidenceRefs === undefined ? {} : { evidenceRefs: material.evidenceRefs }) };
     case 'INDEX':
       return {
         title: material.title,
@@ -487,6 +489,7 @@ function buildStockDimensions(
   poolSubject: PoolSubjectEntry,
   cutoff: Date,
   sw: SwAttribution | null,
+  indicatorVersion: IndicatorVersion,
 inquiryEvents?: InquiryEventRow[], referenceGroups?: ReferenceGroupRow[], rotationTable?: IndustryMomentumTable | null, industryValuation?: { table: ReturnType<typeof industryMedianPE>; stockPE: string | null; stockIndustryPercentile: string | null } | null): DimensionBuild[] {
   const builds: DimensionBuild[] = [];
   const windowStart = cutoff.getTime() - RECENT_QUARTERS_WINDOW_DAYS * 86_400_000;
@@ -770,13 +773,13 @@ inquiryEvents?: InquiryEventRow[], referenceGroups?: ReferenceGroupRow[], rotati
       try {
         const sortedBars = [...bars].sort((a, b) => (String(tv(a).date ?? '') < String(tv(b).date ?? '') ? -1 : 1));
         const closes = sortedBars.map((f) => ({ date: String(tv(f).date ?? ''), close: String(tv(f).close ?? '') })).filter((x) => x.close !== '');
-        const ind = computeIndicators(closes, cutoff.toISOString().slice(0, 10));
+        const ind = computeIndicators(closes, cutoff.toISOString().slice(0, 10), indicatorVersion);
         materials.push({
           materialId: 'mat:5:technical-indicators',
           title: `资金与价格行为：技术指标（程序复算，未复权 close 口径与行情表一致；MA5/20/60、RSI14（Wilder）、MACD(12,26,9) 柱=2×(DIF−DEA)；数据不足项为 null）`,
           dimension: 5,
           kind: 'NOTE',
-          text: JSON.stringify(ind, null, 1),
+          text: JSON.stringify(indicatorVersion === EMA_INDICATOR_VERSION ? { indicatorVersion, ...ind } : ind, null, 1),
           factIds: [],
         });
       } catch { /* 指标计算失败不阻断 */ }
@@ -1245,7 +1248,7 @@ function buildL0FixedMaterials(
   return [identity, contract, statements, rulesNote];
 }
 
-function buildCoverageReceiptMaterial(
+export function buildCoverageReceiptMaterial(
   dimensions: DimensionCoverage[],
   usage: {
     l0FixedBytes: number;
@@ -1386,6 +1389,8 @@ export async function assembleResearchInput(
   opts: AssembleResearchInputOptions,
 ): Promise<AssembledResearchInput> {
   validateBudget(opts.budget);
+  // 方法分流在任何读取/封存写入前明确，不让未知版本静默沿用旧公式。
+  if (opts.subjectKind === 'STOCK') indicatorVersionForMethod(opts.versions.methodVersion);
   const cutoffDate = parseDateStrict(opts.cutoff, 'cutoff');
   const cutoff = cutoffDate.toISOString();
   const researchKind: ResearchKind = opts.researchKind ?? 'WEEKLY';
@@ -1467,7 +1472,7 @@ export async function assembleResearchInput(
   const sw = opts.subjectKind === 'STOCK' ? pickSwIndustryAt(subjectFacts, cutoffDate) : null;
   const builds =
     opts.subjectKind === 'STOCK'
-      ? buildStockDimensions(subjectFacts, benchmarkFacts, poolSubject, cutoffDate, sw, await loadInquiryEvents(pool, opts.subject, cutoff), await loadReferenceGroups(pool, sw === null ? null : sw.l1IndexCode), await loadRotationTable(pool, cutoff), await loadIndustryValuation(pool, opts.subject, cutoff))
+      ? buildStockDimensions(subjectFacts, benchmarkFacts, poolSubject, cutoffDate, sw, indicatorVersionForMethod(opts.versions.methodVersion), await loadInquiryEvents(pool, opts.subject, cutoff), await loadReferenceGroups(pool, sw === null ? null : sw.l1IndexCode), await loadRotationTable(pool, cutoff), await loadIndustryValuation(pool, opts.subject, cutoff))
       : buildEtfDimensions(
           subjectFacts,
           benchmarkFacts,
@@ -1476,10 +1481,17 @@ export async function assembleResearchInput(
         );
 
   // ---- L1 装填（按维度优先级；超层预算降级并标记）----
+  const artifactOf = new Map<string, string>();
+  for (const facts of sealFactSets) for (const f of facts) artifactOf.set(f.factId, f.artifactSha256);
   const dimMaterials: Material[] = [];
   const dimOfMaterial = new Map<string, number>();
   for (const build of builds) {
     for (const material of build.materials) {
+      material.evidenceRefs = material.factIds.map((factId) => {
+        const artifactSha256 = artifactOf.get(factId);
+        if (artifactSha256 === undefined) throw new ResearchInputError('FACT_NOT_IN_SEAL', factId);
+        return { factId, artifactSha256 };
+      });
       dimMaterials.push(material);
       dimOfMaterial.set(material.materialId, material.dimension);
     }
@@ -1525,10 +1537,6 @@ export async function assembleResearchInput(
   const l0FixedBytes = l0FixedBlocks.reduce((n, b) => n + b.bytes, 0);
 
   // ---- L2 索引（送达引用目录 + 封存目录摘要；先于回执构建，回执可引用其最终字节数）----
-  const artifactOf = new Map<string, string>();
-  for (const facts of sealFactSets) {
-    for (const f of facts) artifactOf.set(f.factId, f.artifactSha256);
-  }
   const deliveredFacts: { factId: string; materialId: string; artifactSha256: string; layer: 'L0' | 'L1' }[] = [];
   const seenFacts = new Set<string>();
   const deliveredMaterials: { material: Material; layer: 'L0' | 'L1' }[] = [
@@ -1790,6 +1798,9 @@ export async function validateResearchInputPackage(
         throw new ResearchInputError('FACT_NOT_IN_SEAL', `${material.materialId} 引用 ${factId} 不在封存池`);
       }
       const fact = await loadCached(factId);
+      if (material.evidenceRefs !== undefined && !material.evidenceRefs.some((ref) => ref.factId === factId && ref.artifactSha256 === fact.artifactSha256)) {
+        throw new ResearchInputError('FACT_ARTIFACT_MISMATCH', `${factId} 材料引用与库内配对不符`);
+      }
       if (material.kind === 'BAR_TABLE') {
         const rowMeta = material.table.meta.rowFacts.find((r) => r.factId === factId);
         if (rowMeta !== undefined && rowMeta.artifactSha256 !== fact.artifactSha256) {
@@ -1810,6 +1821,14 @@ export async function validateResearchInputPackage(
   }
 
   // 每个 artifact 哈希可校验读回（readBytes 内建哈希比对）
+  for (const material of pkg.materials) {
+    if (material.kind !== 'INDEX') continue;
+    for (const ref of material.content.deliveredFacts) {
+      if ((await loadCached(ref.factId)).artifactSha256 !== ref.artifactSha256) {
+        throw new ResearchInputError('FACT_ARTIFACT_MISMATCH', `${ref.factId} 送达索引与库内配对不符`);
+      }
+    }
+  }
   let artifactsChecked = 0;
   for (const seal of pkg.seals) {
     for (const ref of seal.artifactRefs) {

@@ -1,3 +1,5 @@
+import { researchJInputHash } from './validation.js';
+import { researchMaterial } from './requests.js';
 /**
  * Lyra · 研究输入组装器 + 报告视图单测（P2 W11）。不碰网络；DB 用隔离 schema
  * （每次运行独立 schema + 临时原件目录），与 pintime.test.ts 同款夹具纪律。
@@ -190,7 +192,7 @@ async function seedUniverse(): Promise<void> {
 
 // ===== 选项构造 =====
 
-const VERSIONS = { methodVersion: 'method@test-1', adapterVersion: 'data@test-1', planAuthVersion: 'pa-test-1' };
+const VERSIONS = { methodVersion: 'method@p2-v2-20261103', adapterVersion: 'data@test-1', planAuthVersion: 'pa-test-1' };
 const GENEROUS_BUDGET = { l0Bytes: 50_000, l1Bytes: 100_000, l2Bytes: 100_000, totalBytes: 200_000 };
 
 function stockOpts(overrides: Partial<AssembleResearchInputOptions> = {}): AssembleResearchInputOptions {
@@ -413,10 +415,10 @@ test('报告视图：A 摘要/清单裁决/J 决定/证据下钻/coverage，末�
     inputHash: pkg.inputHash,
     subjectKind: 'STOCK',
     subject: '600519',
-    material: { artifactSha256s: seal.artifactRefs.map((r) => r.sha256), factCount: seal.factIds.length, gaps: seal.gaps },
+    material: researchMaterial(pkg),
   });
   const checklist = deriveChecklist(aOutput, seal.manifestHash);
-  const jInputHash = canonicalSha256({ j: 'input', aOutputHash: canonicalSha256(aOutput) });
+  const jInputHash = researchJInputHash(pkg, aOutput, checklist);
   const jOutput = simulatedModelJ({ inputHash: jInputHash, subjectKind: 'STOCK', aOutput, checklist });
   const conclusion = await persistConclusion(pool, {
     businessKey: pkg.businessKey,
@@ -427,6 +429,7 @@ test('报告视图：A 摘要/清单裁决/J 决定/证据下钻/coverage，末�
     checklist,
     jOutput,
     manifest: seal,
+    researchInput: pkg,
     inheritance: null,
     changeReason: jOutput.changedFromA ? jOutput.changeReason : null, // J 改判时回抄其改判理由
   });

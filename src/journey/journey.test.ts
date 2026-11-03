@@ -1,3 +1,6 @@
+import { inputFromTestSeal } from '../research/research-test-helper.js';
+import { researchMaterial } from '../research/requests.js';
+import { researchJInputHash } from '../research/validation.js';
 /**
  * Lyra · 旅程测试安装门（P0 Done-when 1；EK-10.2 七断言 + P0 补充断言）。W3: code-writer-pro。
  *
@@ -248,30 +251,14 @@ async function sealRound(subjectKind: SubjectKind, subject: string, cutoffIso: s
 }
 
 function mkAInput(seal: SealManifest): SimulatedAInput {
-  const artifactSha256s = seal.artifactRefs.map((r) => r.sha256).sort();
-  return {
-    inputHash: canonicalSha256({
-      stage: 'A',
-      manifestHash: seal.manifestHash,
-      subjectKind: seal.businessKey.subjectKind,
-      subject: seal.businessKey.subject,
-      factCount: seal.factIds.length,
-      artifactSha256s,
-    }),
-    subjectKind: seal.businessKey.subjectKind,
-    subject: seal.businessKey.subject,
-    material: { artifactSha256s, factCount: seal.factIds.length, gaps: ['合成宇宙：无真实数据源（P0）'] },
-  };
+  const pkg = inputFromTestSeal(seal);
+  return { inputHash: pkg.inputHash, subjectKind: seal.businessKey.subjectKind,
+    subject: seal.businessKey.subject, material: researchMaterial(pkg) };
 }
 
 function mkJInput(seal: SealManifest, aOutput: AOutput, checklist: ProgramChecklist): SimulatedJInput {
   return {
-    inputHash: canonicalSha256({
-      stage: 'J',
-      aOutputHash: canonicalSha256(aOutput),
-      checklistHash: checklist.checklistHash,
-      manifestHash: seal.manifestHash,
-    }),
+    inputHash: researchJInputHash(inputFromTestSeal(seal), aOutput, checklist),
     subjectKind: seal.businessKey.subjectKind,
     aOutput,
     checklist,
@@ -348,6 +335,7 @@ async function runFullRound(
     checklist,
     jOutput,
     manifest: seal,
+    researchInput: inputFromTestSeal(seal),
     inheritance: opts.inheritance ?? null,
     changeReason: opts.changeReason ?? jOutput.changeReason ?? null,
   };
@@ -1007,10 +995,10 @@ jt('Done-when 5：跨类选项/清单绑定/哈希重导出/继承配对/覆盖/
     }),
     'INHERITANCE_PAIRING_INVALID',
   );
-  // J 改判 A 候选（changedFromA）→ changeReason 必填
-  await expectConclusion(
-    () => persistConclusion(e().pool, { ...base, jOutput: { ...base.jOutput, changedFromA: true, changeReason: null }, changeReason: null }),
-    'CHANGE_REASON_REQUIRED',
+  // 实际改判与自报标志共同核对；外部 reason 不能替代 J 自身理由。
+  await assert.rejects(
+    () => persistConclusion(e().pool, { ...base, jOutput: { ...base.jOutput, finalDisposition: base.aOutput.candidate === 'ABSTAIN' ? 'RESEARCH_OUTPERFORM' : 'ABSTAIN', changedFromA: true, changeReason: null }, changeReason: null }),
+    (error: unknown) => (error as { code?: string }).code === 'J_CHANGE_REASON_REQUIRED',
   );
   // 二次写拒绝（含完全相同的重放）：研究字段落库后不可变
   await expectConclusion(() => persistConclusion(e().pool, base), 'CONCLUSION_IMMUTABLE');
@@ -1024,15 +1012,16 @@ jt('Done-when 5：跨类选项/清单绑定/哈希重导出/继承配对/覆盖/
       const final = stockSpace.find(
         (d) => d !== realJ.finalDisposition && d !== a4.candidate,
       ) as (typeof STOCK_DISPOSITIONS)[number];
-      return { ...realJ, finalDisposition: final, changedFromA: true, changeReason: 'J 复核改判（合成注入演示）' };
+      return { ...realJ, finalDisposition: final, changedFromA: true, changeReason: 'J 复核改判（合成注入演示）',
+        strongestCaseDisposition: 'ACCEPTED', verdicts: realJ.verdicts.map((v) => ({ ...v, verdict: 'SUPPORTED', decisionBearing: true, correction: null, remainingBasisChecklistIds: [] })) };
     },
-    inheritance: { fromConclusionId: h.conclusion.conclusionId, fromConclusionHash: h.conclusion.conclusionHash },
-    changeReason: '继承改判演示：维持方向但记录理由（合成注入）',
+    inheritance: null,
+    changeReason: 'J 改判演示（合成注入，独立研究）',
   });
   assert.equal(overridden.conclusion.disposition, overridden.jOutput.finalDisposition);
   assert.notEqual(overridden.conclusion.disposition, overridden.aOutput.candidate, '结论值不抄录 A 候选');
-  assert.equal(overridden.conclusion.inheritance?.fromConclusionId, h.conclusion.conclusionId);
-  assert.equal(overridden.conclusion.standaloneNote, null, '继承结论无 standalone 标注');
+  assert.equal(overridden.conclusion.inheritance, null);
+  assert.equal(overridden.conclusion.standaloneNote, '无基础结论可继承');
   assert.ok((overridden.conclusion.changeReason ?? '').length > 0);
 
   // adoption 恒 false（读回断言）+ 结算占位区：回填只写占位区、研究字段与哈希不动
