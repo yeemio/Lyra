@@ -23,7 +23,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Pool } from 'pg';
 import { AdapterPauseError } from '../adapters/backoff.js';
-import { EMRISK_ADAPTER_VERSION, EmriskAdapter } from '../adapters/emrisk.js';
+import { EMRISK_ADAPTER_VERSION, EmriskAdapter, isEmriskCompletion, type EmriskCompletion } from '../adapters/emrisk.js';
 import { PoolBackfillError, parseResearchPool } from './pool-market.js';
 
 const repoRoot = fileURLToPath(new URL('../../', import.meta.url));
@@ -71,6 +71,8 @@ export interface EmriskSegStat {
   /** 源空集（空原件如实入档，正常完成态）。 */
   emptySource: boolean;
   completedAt: string;
+  /** 历史账本可无此字段；没有协议完成证明的段不得跳过。 */
+  completion?: EmriskCompletion;
 }
 
 export interface EmriskProgress {
@@ -78,6 +80,7 @@ export interface EmriskProgress {
   adapterVersion: string;
   updatedAt: string;
   completed: Record<string, EmriskSegStat>;
+  failures?: Record<string, { at: string; error: string }>;
 }
 
 export function emptyEmriskProgress(): EmriskProgress {
@@ -100,6 +103,7 @@ export async function loadEmriskProgress(path: string): Promise<EmriskProgress> 
       adapterVersion: typeof parsed.adapterVersion === 'string' ? parsed.adapterVersion : EMRISK_ADAPTER_VERSION,
       updatedAt: typeof parsed.updatedAt === 'string' ? parsed.updatedAt : new Date().toISOString(),
       completed: parsed.completed,
+      failures: parsed.failures ?? {},
     };
   } catch {
     return emptyEmriskProgress();
@@ -121,6 +125,7 @@ export type EmriskFetchResult = {
   insertedFactIds: string[];
   identicalFactIds: string[];
   rejectedRows: unknown[];
+  completion: EmriskCompletion;
 };
 export type EmriskFetchFn = (segment: EmriskSegment) => Promise<EmriskFetchResult>;
 
@@ -152,7 +157,10 @@ export async function runEmriskBackfill(opts: EmriskRunOptions): Promise<EmriskR
   const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const log = opts.log ?? (() => {});
   const progress = await loadEmriskProgress(opts.progressPath);
-  const pending = opts.segments.filter((s) => progress.completed[s.segKey] === undefined);
+  const pending = opts.segments.filter((s) => {
+    const stat = progress.completed[s.segKey];
+    return stat === undefined || !isEmriskCompletion(stat.completion, s.resource, s.code, stat.rowCount);
+  });
   const skippedDone = opts.segments.length - pending.length;
   log(`[emrisk] segments=${String(opts.segments.length)} done=${String(skippedDone)} pending=${String(pending.length)} throttle=${String(throttleMs)}ms`);
 
@@ -166,8 +174,19 @@ export async function runEmriskBackfill(opts: EmriskRunOptions): Promise<EmriskR
       await sleep(throttleMs - sinceLastCall);
     }
     const startedAt = Date.now();
-    const r = await opts.fetch(segment);
     realCalls += 1;
+    let r: EmriskFetchResult;
+    try {
+      r = await opts.fetch(segment);
+      if (!isEmriskCompletion(r.completion, segment.resource, segment.code, r.rowCount)) {
+        throw new PoolBackfillError('EMRISK_COMPLETION_UNVERIFIED', segment.segKey);
+      }
+    } catch (error) {
+      progress.failures ??= {};
+      progress.failures[segment.segKey] = { at: new Date().toISOString(), error: String(error) };
+      await saveEmriskProgress(opts.progressPath, progress);
+      throw error;
+    }
     sinceLastCall = Date.now() - startedAt;
     rejectedRowsTotal += r.rejectedRows.length;
     const empty = r.rowCount === 0;
@@ -184,7 +203,9 @@ export async function runEmriskBackfill(opts: EmriskRunOptions): Promise<EmriskR
       rejected: r.rejectedRows.length,
       emptySource: empty,
       completedAt: new Date().toISOString(),
+      completion: r.completion,
     };
+    delete progress.failures?.[segment.segKey];
     await saveEmriskProgress(opts.progressPath, progress);
     log(`[emrisk] ${segment.segKey} rows=${String(r.rowCount)} new=${String(r.insertedFactIds.length)} dup=${String(r.identicalFactIds.length)} rejected=${String(r.rejectedRows.length)}${empty ? ' (空原件入档)' : ''}`);
   }

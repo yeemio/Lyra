@@ -85,7 +85,7 @@ function factEqual(a: TimePointFact, b: TimePointFact): boolean {
  * 同 factId 异内容 → 抛 FACT_CONFLICT（修正只新增 + supersedes，不覆盖，POINT-IN-TIME §4）；
  * supersedes_fact_id 悬空引用 → FACT_SUPERSEDES_MISSING。
  */
-export async function insertFactRow(pool: Pool, fact: TimePointFact): Promise<'INSERTED' | 'IDENTICAL'> {
+export async function insertFactRow(pool: Pick<Pool, 'query'>, fact: TimePointFact): Promise<'INSERTED' | 'IDENTICAL'> {
   const params = [
     fact.factId,
     fact.subjectType,
@@ -127,7 +127,7 @@ export async function insertFactRow(pool: Pool, fact: TimePointFact): Promise<'I
   return 'IDENTICAL';
 }
 
-export async function loadFactRow(pool: Pool, factId: string): Promise<FactRow | null> {
+export async function loadFactRow(pool: Pick<Pool, 'query'>, factId: string): Promise<FactRow | null> {
   const res = await pool.query('select * from pintime_fact where fact_id = $1', [factId]);
   const row = res.rows[0] as FactRow | undefined;
   return row ?? null;

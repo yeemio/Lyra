@@ -19,6 +19,7 @@ import {
   type EmriskSegment,
 } from './emrisk.js';
 import { PoolBackfillError } from './pool-market.js';
+import { emriskCompletion } from '../adapters/emrisk-test-helper.js';
 
 let stateDir: string;
 
@@ -92,8 +93,10 @@ test('进度：坏形状文件回空（不崩）', async () => {
   const path = join(stateDir, 'prog-bad.json');
   const { writeFile } = await import('node:fs/promises');
   await writeFile(path, '{"version": 99}', 'utf8');
+  const before = Date.now();
   const loaded = await loadEmriskProgress(path);
-  assert.deepEqual(loaded, emptyEmriskProgress());
+  assert.deepEqual({ ...loaded, updatedAt: '' }, { ...emptyEmriskProgress(), updatedAt: '' });
+  assert.ok(Date.parse(loaded.updatedAt) >= before && Date.parse(loaded.updatedAt) <= Date.now());
 });
 
 // ===== runner =====
@@ -109,6 +112,7 @@ function fakeFetch(
       insertedFactIds: Array.from({ length: (result.inserted as number) ?? 10 }, (_, i) => `f${String(i)}`),
       identicalFactIds: [],
       rejectedRows: (result.rejectedRows as unknown[]) ?? [],
+      completion: emriskCompletion(segment.resource, segment.code, (result.rowCount as number) ?? 10),
     };
   };
   return Object.assign(fn, { calls });
@@ -148,6 +152,7 @@ test('runEmriskBackfill：断点续跑跳过已完成段；空集如实完成态
     code: '600519', resource: 'pledge_ratio', rowCount: 608,
     inserted: 608, identical: 0, rejected: 0, emptySource: false,
     completedAt: '2026-10-25T04:00:00.000Z',
+    completion: emriskCompletion('pledge_ratio', '600519', 608),
   };
   await saveEmriskProgress(path, progress);
 
@@ -181,6 +186,7 @@ test('runEmriskBackfill：拒绝行计数如实累计', async () => {
       insertedFactIds: ['f1'],
       identicalFactIds: ['f2'],
       rejectedRows: [{ rowIndex: 1, code: 'X' }, { rowIndex: 2, code: 'Y' }],
+      completion: emriskCompletion(segment.resource, segment.code, 3),
     };
   };
   const result = await runEmriskBackfill({

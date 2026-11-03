@@ -328,7 +328,8 @@ test('fetchL1Component：响应入原件库但不产生事实（派发冻结事�
 test('fetchClassifyXls：XLS 字节即原件（sha 一致），事实含 2014/2021 行', async () => {
   const adapter = mkAdapter(fixtureExecutor((args) => {
     assert.deepEqual(args, ['classify_xls']);
-    return JSON.parse(CLASSIFY_JSON) as BridgeResponse;
+    return { ...JSON.parse(CLASSIFY_JSON), meta: { sha256: createHash('sha256').update('fake-xls-bytes').digest('hex'),
+      bytes: Buffer.byteLength('fake-xls-bytes'), dataRows: 5 } } as BridgeResponse;
   }));
   const res = await adapter.fetchClassifyXls();
   assert.equal(res.rowCount, 5);
