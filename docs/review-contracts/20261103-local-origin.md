@@ -1,6 +1,6 @@
 # 限制本机客户端的 Host 与写请求来源
 
-状态：修复合同；当前仅建立 Draft PR，尚无修复接受。
+状态：I-21 修复已实现并完成下列隔离检查；等待总控对稳定候选作 ACCEPT/REWORK，尚无修复接受。
 
 审查候选：[`6c7cd196f20a4222d1f97708de7402b2c50ebeb0`](https://github.com/yeemio/Lyra/tree/6c7cd196f20a4222d1f97708de7402b2c50ebeb0)，tree `843eb5b97617ffda179ebb06e2ee2adf03bf19fc`。PR base=`main@6c7cd196f20a4222d1f97708de7402b2c50ebeb0`；head=`review-20261103/local-origin`，初始合同提交身份见 PR。
 
@@ -36,3 +36,22 @@ Owner 已授权这批经核对的问题修复、验证、对应分支提交/推�
 适用验证在稳定候选完成后运行：项目 typecheck、受影响行为/调用链回归、diff检查；使用公开合成输入/隔离数据库。不是严格 TDD 授权，不强制先写失败测试。每条通过必须附实际命令、输出、环境与准确 head；未运行列明原因，不把报告原93测试当新候选证明。UI/PDF变动须提供与候选绑定的实际呈现证据。
 
 停止条件：每个问题的完整行为出口成立，提供稳定 head、完整 changed paths/diff 与适用验证；当前总控接收。若无 GitHub 写工具，完整可发布补丁/文件即本次传输出口。一个初始结果加一次具名窄返工后先由总控重评，不自动无限重试或改换作者。源码接受不自动等于安装、整体L2、真实A/J或效果接受。
+
+## 本次实现与实际验证（2026-11-03）
+
+修复父提交：`a93068000a46f9b93cf935c1d6beafbfec6f0c26`；未采用其他 PR 的提交，base 不变。唯一代码作者为本 Chat。
+
+- `server-origin.ts`：在 local owner 身份建立前验证唯一 Host、明确的 localhost/127.0.0.1/[::1] 名称和实际监听端口；拒绝绝对 URL、歧义 authority 和转发头绕过。写请求的 Origin 必须与请求本机 origin 完全一致；提供 Fetch Metadata 时必须为 same-origin。无浏览器来源头的本机客户端仍须通过原有 CSRF。
+- `server.ts`：接入上述入口检查；local 非回环 bind 默认拒绝。显式设置 `LYRA_SR_ALLOW_NON_LOOPBACK_BIND=1` 可选择非回环监听，但不会放宽 Host/Origin/CSRF。SaaS 路径保留现有身份规则。
+- `server-origin.test.ts`：隔离 HTTP 请求覆盖拒绝在 owner 读取前发生、三个合法 authority、实际 IPv6 回环监听、跨站/空/错端口 Origin、Fetch Metadata、CSRF 和显式监听配置。测试依赖中的数据库和模型操作均直接抛错。
+
+实际环境：Node v24.22.1、npm 11.9.0，Linux 隔离工作树。
+
+| 检查 | 实际结果 |
+|---|---|
+| `npm ci --ignore-scripts --no-audit --no-fund --fetch-retries=0 --fetch-timeout=15000` | exit 0；added 90 packages；禁用生命周期脚本，不等同于完整安装接受 |
+| `npm run typecheck` | exit 0 |
+| `node --import tsx --test src/stock-research/server-origin.test.ts` | 6 tests，6 pass，0 fail，0 skip |
+| `git diff --check` | exit 0 |
+
+未验证边界：真实浏览器 DNS 重绑定端到端利用、代理/TLS 部署、真实业务数据库、真实模型、安装接受均 NOT_RUN。本次仅改变请求拒绝边界，未修改页面模板或 PDF。HTTP 回归读取了实际渲染响应并验证风险表单与 CSRF 的可见/不可见行为，不宣称完成全面安全审计。
