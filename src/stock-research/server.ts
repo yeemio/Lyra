@@ -60,6 +60,7 @@ import { fileStrategyStore, type RealStrategyStore } from './strategy/real-store
 import type { L2WorkbenchStore } from './strategy/workbench-contracts.js';
 import type { WorkbenchPageState } from './strategy/workbench-render.js';
 import { createRiskExport, riskLotCount, RISK_LOT_LIMIT, RiskInputError } from './strategy/risk-input.js';
+import { assertLocalBind, localRequestError } from './server-origin.js';
 
 export interface SrServerConfig {
   port: number;
@@ -69,6 +70,8 @@ export interface SrServerConfig {
   sessionTtlMs: number;
   /** 〔C3/R0〕单平台客户端本地模式（缺省）：免登录单用户，账户/套餐/商业面退出交付范围。 */
   mode: 'local' | 'saas';
+  /** Explicit network-listen opt-in; it does not extend local mode's accepted HTTP authorities. */
+  allowNonLoopbackBind?: boolean;
 }
 
 export function srServerConfigFromEnv(env: NodeJS.ProcessEnv): SrServerConfig {
@@ -79,6 +82,7 @@ export function srServerConfigFromEnv(env: NodeJS.ProcessEnv): SrServerConfig {
     adminPassword: env.LYRA_SR_ADMIN_PASSWORD ?? null,
     sessionTtlMs: Number(env.LYRA_SR_SESSION_TTL_MS ?? 7 * 24 * 3600 * 1000),
     mode: env.LYRA_SR_MODE === 'saas' ? 'saas' : 'local',
+    allowNonLoopbackBind: env.LYRA_SR_ALLOW_NON_LOOPBACK_BIND === '1',
   };
 }
 
@@ -738,6 +742,7 @@ const handleRiskExport: Handler = async (ctx) => {
 // ===== 服务装配 =====
 
 export function createSrServer(deps: SrFullDeps): Server {
+  assertLocalBind(deps.config);
   const routes: { method: string; pattern: RegExp; handler: Handler }[] = [
     { method: 'GET', pattern: /^\/login$/, handler: handleLoginGet },
     { method: 'POST', pattern: /^\/login$/, handler: handleLoginPost },
@@ -768,6 +773,11 @@ export function createSrServer(deps: SrFullDeps): Server {
 
   const server = createServer(async (req, res) => {
     try {
+      const boundaryError = deps.config.mode === 'local' ? localRequestError(req) : null;
+      if (boundaryError) {
+        send(res, 403, renderErrorPage(403, boundaryError));
+        return;
+      }
       const url = new URL(req.url ?? '/', 'http://127.0.0.1');
       const method = (req.method ?? 'GET').toUpperCase();
       const auth = await authed(deps, req);
