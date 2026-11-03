@@ -19,7 +19,7 @@
  * - HOLDER_COUNT ← akshare.stock_zh_a_gdhs_detail_em（派发候选族实测通过；东财数据中心
  *   RPT_HOLDERNUM_DET 按个股过滤，一次调用全历史；600519 实测 63 行，2013-03-22 → 2026-06-30）。
  *   列为 akshare 原样中文字段名，含统计截止日与公告披露日两个时点字段；
- *   该包装对空结果集崩溃（TypeError NoneType），桥捕获该形态按空集如实返回。
+ *   桥现直接核验同报告的来源信封及全部分页；不再将包装异常解释为空集。
  *
  * 时点语义（本文件冻结口径；快照与披露两类口径并存）：
  * - PLEDGE_RATIO：周度/不定期快照口径——快照日=TRADE_DATE（该周快照以该交易日为时点）；
@@ -273,18 +273,15 @@ export function makeEmriskBridgeExecutor(opts: EmriskBridgeExecutorOptions = {})
       parsed = null;
     }
     if (parsed === null || typeof parsed.ok !== 'boolean') {
-      if (killed) throw new TransientAdapterError('EMRISK_BRIDGE_TIMEOUT', `超过 ${String(timeoutMs)}ms`);
-      throw new TransientAdapterError(
-        'EMRISK_BRIDGE_OUTPUT_INVALID',
-        `stdout 不可解析（exit=${failed ? 'nonzero' : '0'}，前 120 字符：${stdout.slice(0, 120)}` +
-          (stdout.length > 120 ? '…' : ')'),
-      );
+      // 不可解析的输出也交给适配器存原件，不能仅在错误信息里留下截断前缀。
+      return { ok: false, error_code: killed ? 'EMRISK_BRIDGE_TIMEOUT' : 'EMRISK_BRIDGE_OUTPUT_INVALID',
+        error: killed ? `超过 ${String(timeoutMs)}ms` : 'stdout is not a bridge envelope',
+        meta: { rawStdout: stdout, processFailed: failed, killed } } as BridgeResponse;
     }
-    if (!parsed.ok) {
-      const code = parsed.error_code ?? 'EMRISK_QUERY_FAILED';
-      if (code === 'USAGE_ERROR') throw new AdapterError(code, parsed.error ?? '');
-      throw new TransientAdapterError(code, parsed.error ?? '');
+    if (failed && parsed.ok) {
+      return { ...parsed, ok: false, error_code: 'EMRISK_BRIDGE_EXIT_FAILED', error: 'bridge exited nonzero' };
     }
+    // 错误信封交给适配器先存原件再分类；后页失败的原文与分页状态不得丢掉。
     return parsed;
   };
 }
@@ -310,6 +307,65 @@ export interface EmriskAdapterOptions {
 
 export type EmriskResource = 'pledge_ratio' | 'holder_count';
 
+export const EMRISK_PROTOCOL = 'emrisk-pages-v1' as const;
+
+export interface EmriskCompletion {
+  protocol: typeof EMRISK_PROTOCOL;
+  resource: EmriskResource;
+  code: string;
+  rowCount: number;
+  pages: number;
+  emptySource: boolean;
+  artifactSha256: string;
+}
+
+function record(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** 完成证明随适配器结果进入断点账本，旧版无证明的空集不再具有跳过资格。 */
+export function isEmriskCompletion(value: unknown, resource: EmriskResource, code: string, rowCount: number): value is EmriskCompletion {
+  if (!record(value)) return false;
+  return value.protocol === EMRISK_PROTOCOL && value.resource === resource && value.code === code &&
+    Number.isSafeInteger(rowCount) && rowCount >= 0 && value.rowCount === rowCount &&
+    Number.isSafeInteger(value.pages) && value.pages === (rowCount === 0 ? 1 : Math.ceil(rowCount / 500)) &&
+    value.emptySource === (rowCount === 0) && typeof value.artifactSha256 === 'string' &&
+    /^[a-f0-9]{64}$/.test(value.artifactSha256);
+}
+
+/** 在退避和完成记账之前验证桥合同；注入执行器同样不能省略完整性证明。 */
+export function validateEmriskResponse(response: BridgeResponse, resource: EmriskResource, code: string): EmriskRow[] {
+  if (!record(response) || response.ok !== true) {
+    const errorCode = record(response) && typeof response.error_code === 'string' ? response.error_code : 'EMRISK_QUERY_FAILED';
+    if (errorCode === 'USAGE_ERROR') throw new AdapterError(errorCode, response?.error);
+    throw new TransientAdapterError(errorCode, response?.error);
+  }
+  const meta: unknown = response['meta'];
+  if (!Array.isArray(response.rows) || !response.rows.every(record) || !record(meta) ||
+      meta.protocol !== EMRISK_PROTOCOL || meta.resource !== resource || meta.code !== code || meta.complete !== true ||
+      meta.expectedRows !== response.rows.length || meta.receivedRows !== response.rows.length ||
+      meta.emptySource !== (response.rows.length === 0) || !Array.isArray(meta.rawPages) ||
+      !Number.isSafeInteger(meta.expectedPages) ||
+      meta.rawPages.length !== Math.max(1, Math.ceil(response.rows.length / 500)) || meta.httpCalls !== meta.rawPages.length) {
+    throw new TransientAdapterError('EMRISK_RESPONSE_UNVERIFIED', 'missing or inconsistent completion evidence');
+  }
+  let rawCount = 0;
+  for (const [index, page] of meta.rawPages.entries()) {
+    let envelope: unknown;
+    try { envelope = record(page) && typeof page.body === 'string' ? JSON.parse(page.body) : null; } catch { envelope = null; }
+    if (!record(page) || page.page !== index + 1 || page.status !== 200 || !record(envelope) || envelope.success !== true ||
+        !record(envelope.result) || !Array.isArray(envelope.result.data) ||
+        envelope.result.count !== response.rows.length || envelope.result.pages !== meta.expectedPages ||
+        (response.rows.length === 0 ? meta.expectedPages !== 0 && meta.expectedPages !== 1 : meta.expectedPages !== meta.rawPages.length) ||
+        !envelope.result.data.every(record)) {
+      throw new TransientAdapterError('EMRISK_RESPONSE_UNVERIFIED', 'invalid source page evidence');
+    }
+    rawCount += envelope.result.data.length;
+  }
+  if (rawCount !== response.rows.length) throw new TransientAdapterError('EMRISK_RESPONSE_UNVERIFIED', 'incomplete source rows');
+  return response.rows;
+}
+
 export interface EmriskFetchResult {
   adapterVersion: string;
   command: string;
@@ -323,6 +379,7 @@ export interface EmriskFetchResult {
   rejectedRows: { rowIndex: number; code: string }[];
   /** DATA-SOURCES §5 修订口径声明原文（R4，原样携带）。 */
   notices: string[];
+  completion: EmriskCompletion;
 }
 
 export class EmriskAdapter {
@@ -387,8 +444,33 @@ export class EmriskAdapter {
     const scope = `emrisk:${spec.resource}:${spec.objectKey}`;
     // 抓取（含桥内分页）+ 桥合同校验都在退避内：瞬态坏响应按 §7 退避重试（30s/60s/120s）；
     // 3 次仍失败 → 暂停上报落库（EK-7.3 四要素，同 scope 幂等覆盖）。
-    const response = await this.gate.run(() =>
-      runWithBackoff(() => this.execBridge([command, ...params]), {
+    let priorAttemptArtifactSha256: string | null = null;
+    const received = await this.gate.run(() =>
+      runWithBackoff(async () => {
+        const fetchedAt = this.now().toISOString();
+        let response: BridgeResponse;
+        try {
+          response = await this.execBridge([command, ...params]);
+        } catch (error) {
+          const failed = await this.store.put(new TextEncoder().encode(canonicalJsonString({
+            command, params, fetchedAt, priorAttemptArtifactSha256, transportError: String(error),
+          })), 'application/json', fetchedAt);
+          priorAttemptArtifactSha256 = failed.sha256;
+          if (error instanceof Error) error.message += ` [artifact=${failed.sha256}]`;
+          throw error;
+        }
+        const artifact = await this.store.put(new TextEncoder().encode(canonicalJsonString({
+          command, params, fetchedAt, priorAttemptArtifactSha256, response,
+        })), 'application/json', fetchedAt);
+        priorAttemptArtifactSha256 = artifact.sha256;
+        try {
+          const rows = validateEmriskResponse(response, spec.resource, spec.objectKey);
+          return { rows, artifact, fetchedAt };
+        } catch (error) {
+          if (error instanceof Error) error.message += ` [artifact=${artifact.sha256}]`;
+          throw error;
+        }
+      }, {
         adapter: 'emrisk',
         scope,
         pool: this.pool,
@@ -397,13 +479,7 @@ export class EmriskAdapter {
         baseDelayMs: this.backoffBaseDelayMs,
       }),
     );
-    const rows = response.rows ?? [];
-    const fetchedAt = this.now().toISOString();
-    const artifact = await this.store.put(
-      new TextEncoder().encode(canonicalJsonString(rows)),
-      'application/json',
-      fetchedAt,
-    );
+    const { rows, artifact, fetchedAt } = received;
     const mapped = spec.map(rows, {
       adapterVersion: this.adapterVersion,
       fetchedAt,
@@ -436,6 +512,11 @@ export class EmriskAdapter {
       identicalFactIds,
       rejectedRows: mapped.rejections,
       notices: [BACKFILL_REVISION_NOTICE],
+      completion: {
+        protocol: EMRISK_PROTOCOL, resource: spec.resource, code: spec.objectKey,
+        rowCount: rows.length, pages: Math.max(1, Math.ceil(rows.length / 500)),
+        emptySource: rows.length === 0, artifactSha256: artifact.sha256,
+      },
     };
   }
 }

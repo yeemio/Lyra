@@ -29,6 +29,7 @@
  * 该表是官方今日发布的回溯史（属最新修订口径），typedValue 原样保留来源字段。
  */
 import { execFile } from 'node:child_process';
+import { createHash, randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
@@ -36,7 +37,7 @@ import { promisify } from 'node:util';
 import type { Pool } from 'pg';
 import type { ArtifactRef, TimePointFact, TimePointSubjectType } from '../contracts.js';
 import { canonicalJsonString, canonicalSha256 } from '../canonical.js';
-import { insertFact } from '../pintime/facts.js';
+import { observeSwFact, putSwArtifact } from './sw-observations.js';
 import type { ArtifactStore } from '../artifacts/store.js';
 import {
   BACKFILL_REVISION_NOTICE,
@@ -216,9 +217,13 @@ export function mapClassifyRowsToFacts(rows: SwRow[], ctx: SwMapContext): SwRowM
   const facts: SwMappedFact[] = [];
   const rejections: { rowIndex: number; code: string }[] = [];
   const parsed: { rowIndex: number; f: ReturnType<typeof classifyFields> }[] = [];
+  const incompleteStocks = new Set<string>();
   rows.forEach((row, rowIndex) => {
     const f = classifyFields(row);
-    if (f === null) rejections.push({ rowIndex, code: 'SW_CLASSIFY_ROW_INVALID' });
+    if (f === null) {
+      rejections.push({ rowIndex, code: 'SW_CLASSIFY_ROW_INVALID' });
+      if (typeof row['股票代码'] === 'string' && row['股票代码'] !== '') incompleteStocks.add(row['股票代码']);
+    }
     else parsed.push({ rowIndex, f });
   });
   type Entry = { rowIndex: number; code: string; inISO: string; ind: string; updISO: string; row: SwRow };
@@ -232,7 +237,24 @@ export function mapClassifyRowsToFacts(rows: SwRow[], ctx: SwMapContext): SwRowM
     list.push(e);
     byStock.set(e.code, list);
   }
-  for (const [code, list] of byStock) {
+  for (const [code, original] of byStock) {
+    // 有效期依赖该股的完整变更链；过滤坏行后不得把上一段伪造为延长或永续。
+    if (incompleteStocks.has(code)) {
+      for (const entry of original) rejections.push({ rowIndex: entry.rowIndex, code: 'SW_CLASSIFY_HISTORY_INCOMPLETE' });
+      continue;
+    }
+    const byDate = new Map<string, Entry>();
+    let conflict = false;
+    for (const entry of original) {
+      const previous = byDate.get(entry.inISO);
+      if (previous !== undefined && canonicalJsonString(previous.row) !== canonicalJsonString(entry.row)) conflict = true;
+      byDate.set(entry.inISO, entry);
+    }
+    if (conflict) {
+      for (const entry of original) rejections.push({ rowIndex: entry.rowIndex, code: 'SW_CLASSIFY_DATE_CONFLICT' });
+      continue;
+    }
+    const list = [...byDate.values()];
     list.sort((a, b) => (a.inISO < b.inISO ? -1 : a.inISO > b.inISO ? 1 : a.ind.localeCompare(b.ind)));
     for (let i = 0; i < list.length; i += 1) {
       const cur = list[i]!;
@@ -447,6 +469,7 @@ export interface SwFetchResult {
   rejectedRows: { rowIndex: number; code: string }[];
   /** DATA-SOURCES §5 修订口径声明原文（全部输出原样携带）。 */
   notices: string[];
+  observationIds: string[];
 }
 
 export class SwAdapter {
@@ -563,7 +586,13 @@ export class SwAdapter {
       command === 'classify_xls'
         ? await readFile(join(this.root, SW_XLS_VAR_PATH)) // XLS 字节即原件（桥已落盘）
         : new TextEncoder().encode(canonicalJsonString(rows));
-    const artifact = await this.store.put(bytes, spec.mediaType, fetchedAt);
+    if (command === 'classify_xls') {
+      const meta = (response as BridgeResponse & { meta?: { sha256?: unknown; bytes?: unknown; dataRows?: unknown } }).meta;
+      if (meta?.sha256 !== createHash('sha256').update(bytes).digest('hex') || meta?.bytes !== bytes.byteLength || meta?.dataRows !== rows.length) {
+        throw new AdapterError('SW_XLS_ARTIFACT_MISMATCH', 'bridge rows and cached XLS identity do not match');
+      }
+    }
+    const artifact = await putSwArtifact(this.pool, this.store, bytes, spec.mediaType, fetchedAt);
     const mapped = spec.map(rows, {
       adapterVersion: this.adapterVersion,
       fetchedAt,
@@ -571,10 +600,12 @@ export class SwAdapter {
     });
     const insertedFactIds: string[] = [];
     const identicalFactIds: string[] = [];
+    const observationIds: string[] = [];
+    const captureId = randomUUID();
     for (const m of mapped.facts) {
-      // insertFact 同 factId 同内容幂等（IDENTICAL）；事实身份由原始行内容派生（DATA-SOURCES §6.5）。
-      const status = await insertFact(this.pool, m.fact);
-      (status === 'INSERTED' ? insertedFactIds : identicalFactIds).push(m.fact.factId);
+      const observed = await observeSwFact(this.pool, m.fact, scope, captureId);
+      (observed.identical ? identicalFactIds : insertedFactIds).push(observed.factId);
+      observationIds.push(observed.observationId);
     }
     await resumePause(this.pool, 'sw', scope);
     return {
@@ -588,6 +619,7 @@ export class SwAdapter {
       identicalFactIds,
       rejectedRows: mapped.rejections,
       notices: [BACKFILL_REVISION_NOTICE],
+      observationIds,
     };
   }
 }

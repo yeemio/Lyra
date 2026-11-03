@@ -23,6 +23,7 @@ import {
 } from './adapter-types.js';
 import { ConcurrencyGate, applyP1Migration, type BackoffSleeper } from './backoff.js';
 import { p1RunId, type BridgeExecutor } from './baostock.js';
+import { emriskResponse } from './emrisk-test-helper.js';
 import {
   EMRISK_ADAPTER_VERSION,
   EmriskAdapter,
@@ -209,7 +210,10 @@ let artifactsDir: string;
 let store: ArtifactStore;
 
 function fixtureExecutor(script: (args: string[]) => BridgeResponse | Promise<BridgeResponse>): BridgeExecutor {
-  return async (args) => script(args);
+  return async (args) => {
+    const response = await script(args);
+    return response.ok ? emriskResponse(args[0] === 'pledge' ? 'pledge_ratio' : 'holder_count', args[1]!, response.rows ?? []) : response;
+  };
 }
 
 function mkAdapter(exec: BridgeExecutor, sleeper?: BackoffSleeper, baseDelayMs?: number): EmriskAdapter {
@@ -256,7 +260,7 @@ test('fetchPledgeRatio：入库 + as-of 截点过滤（快照日次日 00:00+08 
   assert.equal(r1.rejectedRows.length, 1);
   assert.ok(r1.notices.includes(BACKFILL_REVISION_NOTICE), 'R4 声明原文随行');
   const bytes = await store.readBytes(r1.artifact.sha256); // 原件写入即校验读回
-  assert.equal((JSON.parse(new TextDecoder().decode(bytes)) as unknown[]).length, 3);
+  assert.equal(JSON.parse(new TextDecoder().decode(bytes)).response.rows.length, 3);
 
   // as-of 截点：availableAt=2014-03-07T16:00Z（快照日+1）；此前不可见，此后可见。
   const before = await asOfFacts(pool, {
@@ -320,7 +324,7 @@ test('fetchHolderCount：入库 + as-of（披露日次日 00:00+08 前不可见�
   assert.equal(r2.insertedFactIds.length, 0);
   assert.equal(r2.rejectedRows.length, 0);
   const bytes = await store.readBytes(r2.artifact.sha256);
-  assert.equal(new TextDecoder().decode(bytes), '[]');
+  assert.deepEqual(JSON.parse(new TextDecoder().decode(bytes)).response.rows, []);
 });
 
 test('退避：瞬态错误 3 次尝试（等待逐次加倍）后成功；永久错误不重试', async () => {

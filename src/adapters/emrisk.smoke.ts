@@ -4,11 +4,11 @@
  * 真实请求 2 次桥调用（600519，池内样本）：
  * 1. pledge（东财 RPT_CSDC_LIST 按个股过滤，全历史周度快照；桥内按 500 行/页分页，
  *    600519 实测 608 行 → 2 页 HTTP）；
- * 2. gdhs（akshare.stock_zh_a_gdhs_detail_em，全历史；63 行 → 1 页 HTTP）。
- * 底层 HTTP 页数从桥响应 meta.httpCalls 如实采集（户数包装不分页计 1）；合计 ≤4 预算。
+ * 2. gdhs（同源 RPT_HOLDERNUM_DET，全历史；历史样本 63 行 → 1 页 HTTP）。
+ * 底层 HTTP 页数从桥响应 meta.httpCalls 如实采集；合计 ≤4 预算。
  * 事实身份由原始行派生（不含抓取时刻）→ 重放去重由单测与全量回填 IDENTICAL 计数证明，冒烟不重复请求。
  *
- * 断言：原始行 canonical JSON 原件入库（哈希校验读回）+ 事实落库
+ * 断言：含完整来源信封/原文的 canonical JSON 原件入库（哈希校验读回）+ 事实落库
  * （PLEDGE_RATIO availableAt=快照日次日 00:00+08；HOLDER_COUNT availableAt=公告披露日次日
  * 00:00+08、sourcePublishedAt=披露日 00:00+08、eventAt=统计截止日 00:00+08）+
  * as-of 读回无泄漏（逐事实与全体 max availableAt ≤ 当前时刻）+ 事实数 = 行数（无未解释行）。
@@ -55,7 +55,7 @@ async function main(): Promise<number> {
   await mkdir(artifactsDir, { recursive: true });
   const store = new ArtifactStore(artifactsDir);
 
-  // 真实请求计数：桥调用粒度 + 底层 HTTP 页数（桥 meta.httpCalls 如实采集；户数包装不分页计 1）
+  // 真实请求计数：桥调用粒度 + 底层 HTTP 页数（桥 meta.httpCalls 如实采集）
   let bridgeCalls = 0;
   let httpPages = 0;
   const realExec = makeEmriskBridgeExecutor();
@@ -71,15 +71,15 @@ async function main(): Promise<number> {
 
   // ---- 真实请求 1：质押全历史周度快照（一次桥调用，桥内分页如实计数）----
   const pledge = await adapter.fetchPledgeRatio(CODE);
-  const pledgeRows = JSON.parse(
+  const pledgeRows = (JSON.parse(
     new TextDecoder().decode(await store.readBytes(pledge.artifact.sha256)),
-  ) as PledgeRow[];
+  ) as { response: { rows: PledgeRow[] } }).response.rows;
 
   // ---- 真实请求 2：股东户数全历史（一次桥调用）----
   const gdhs = await adapter.fetchHolderCount(CODE);
-  const gdhsRows = JSON.parse(
+  const gdhsRows = (JSON.parse(
     new TextDecoder().decode(await store.readBytes(gdhs.artifact.sha256)),
-  ) as GdhsRow[];
+  ) as { response: { rows: GdhsRow[] } }).response.rows;
 
   // ---- 断言：行数与拒绝 ----
   if (pledge.rowCount !== pledgeRows.length || pledge.rowCount < 300) {

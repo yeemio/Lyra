@@ -7,8 +7,8 @@
     -v <repo>:/work python:3.11-slim python /work/adapters/emrisk/bridge.py <cmd> <code>
 
 单文件多子命令 CLI，stdout 只输出一个 JSON 对象（与 adapters/{baostock,sw}/bridge.py 同合同）：
-成功 {ok: true, rows: [...], meta}，失败 {ok: false, error_code, error}；退出码 0/1。
-rows 字段原样保留来源字段名（DATA-SOURCES §6.2）；空集如实返回 rows=[]（不报错、不造数）。
+成功 {ok: true, rows: [...], meta}，失败 {ok: false, error_code, error, meta}；退出码 0/1。
+只有来源成功且计数/分页证明完整时才可返回 rows=[]；错误原文和已收分页状态随 meta 保存。
 
 选型（W29 2026-10-25 容器内实测，证据 /tmp/lyra-w29/probe*.json 探测输出与
 src/adapters/emrisk.ts 文件头"来源与选型"节）：
@@ -23,14 +23,15 @@ src/adapters/emrisk.ts 文件头"来源与选型"节）：
 - 股东户数子命令 gdhs：派发候选实测通过——akshare.stock_zh_a_gdhs_detail_em(symbol=<code>)
   （东财数据中心 RPT_HOLDERNUM_DET 按个股过滤，一次调用全历史；600519 实测 63 行，
   2013-03-22 → 2026-06-30；列含统计截止日与公告披露日两个时点字段）。
-  该 akshare 包装在来源空集时因 result=None 崩溃（TypeError）——此处捕获该形态按空集返回
-  （真查询失败仍按 QUERY_ERROR 上报）。
+  当前桥直接核验同一报告的成功信封与全部分页，并保留既有中文列映射；
+  result=None、TypeError 和未完成的分页均为失败，不能解释为来源空集。
 
 时点口径（映射层 src/adapters/emrisk.ts 冻结，桥只取数不改语义）：
 - 质押：周度快照口径，快照日=TRADE_DATE；availableAt=快照日次日 00:00 Asia/Shanghai（保守）。
 - 股东户数：公告披露口径，事件=统计截止日、披露=公告日期；availableAt=披露日次日 00:00（保守）。
 """
 import json
+import math
 import os
 import re
 import sys
@@ -46,9 +47,10 @@ DATE_PREFIX_PATTERN = re.compile(r"^(\d{4}-\d{2}-\d{2})")
 
 
 class BridgeError(Exception):
-    def __init__(self, code, message):
+    def __init__(self, code, message, meta=None):
         super().__init__(message)
         self.code = code
+        self.meta = meta
 
 
 def _require(cond, message):
@@ -90,68 +92,95 @@ def with_trade_date_iso(row):
     return out
 
 
-def cmd_pledge(code):
+def fetch_report(code, resource, report, sort_column):
+    """Only a successful, complete protocol response can establish an empty set.
+
+    Keep every HTTP body (including a failing later page) in the receipt. A
+    missing/changed count, page drift or duplicate page is an incomplete query,
+    never a completed empty segment. No partially collected rows are published.
+    """
     import requests
 
     base = {
-        "sortColumns": "TRADE_DATE",
+        "sortColumns": sort_column,
         "sortTypes": "1",
         "pageSize": "500",
-        "reportName": PLEDGE_REPORT,
+        "reportName": report,
         "columns": "ALL",
         "source": "WEB",
         "client": "WEB",
         "filter": f'(SECURITY_CODE="{code}")',
     }
-    rows = []
-    page = 1
-    pages = None
-    http_calls = 0
+    rows, receipts, seen = [], [], set()
+    page, pages, count = 1, None, None
+
+    def meta(complete=False):
+        return {
+            "protocol": "emrisk-pages-v1", "resource": resource, "code": code,
+            "complete": complete, "emptySource": complete and count == 0,
+            "expectedPages": pages, "expectedRows": count,
+            "receivedRows": len(rows), "failedPage": None if complete else page,
+            "httpCalls": len(receipts), "rawPages": receipts,
+            "sourceUrl": EM_DATA_URL + "?" + urllib.parse.urlencode(dict(base, pageNumber="1")),
+        }
+
+    def fail(error_code, message):
+        raise BridgeError(error_code, message, meta())
+
     while True:
         params = dict(base, pageNumber=str(page))
         try:
             resp = requests.get(EM_DATA_URL, params=params, timeout=60)
         except Exception as exc:
-            raise BridgeError(QUERY_ERROR, f"HTTP 异常：{type(exc).__name__}: {exc}") from exc
-        http_calls += 1
+            receipts.append({"page": page, "error": f"{type(exc).__name__}: {exc}"})
+            fail(QUERY_ERROR, f"HTTP 异常（第 {page} 页）：{exc}")
+        receipts.append({"page": page, "status": resp.status_code, "body": resp.text})
         if resp.status_code != 200:
-            raise BridgeError(QUERY_ERROR, f"HTTP {resp.status_code}（第 {page} 页）")
+            fail(QUERY_ERROR, f"HTTP {resp.status_code}（第 {page} 页）")
         try:
-            data = resp.json()
+            data = json.loads(resp.text)
         except Exception as exc:
-            raise BridgeError(QUERY_ERROR, f"JSON 解析失败（第 {page} 页）：{exc}") from exc
+            fail("EMRISK_RESPONSE_INVALID", f"JSON 解析失败（第 {page} 页）：{exc}")
+        if not isinstance(data, dict) or data.get("success") is not True:
+            fail("EMRISK_SOURCE_ERROR", f"来源未确认成功（第 {page} 页）")
         result = data.get("result")
-        if result is None:
-            # 来源空集（该股在 RPT_CSDC_LIST 无快照行）：如实空集返回（success/message 进 meta）。
-            return {
-                "ok": True,
-                "rows": [],
-                "meta": {
-                    "resource": "pledge_ratio",
-                    "code": code,
-                    "emptySource": True,
-                    "sourceMessage": data.get("message"),
-                    "httpCalls": http_calls,
-                },
-            }
-        page_rows = result.get("data") or []
-        rows.extend(with_trade_date_iso(r) for r in page_rows)
-        pages = result.get("pages")
-        if not isinstance(pages, int) or pages < 1 or page >= pages:
+        if not isinstance(result, dict) or not isinstance(result.get("data"), list):
+            fail("EMRISK_RESPONSE_INVALID", f"result/data 形状错误（第 {page} 页）")
+        current_pages, current_count = result.get("pages"), result.get("count")
+        if (type(current_pages) is not int or type(current_count) is not int
+                or current_pages < 0 or current_pages > 10000 or current_count < 0):
+            fail("EMRISK_PAGINATION_INVALID", f"pages/count 非法（第 {page} 页）")
+        if page == 1:
+            pages, count = current_pages, current_count
+        elif (pages, count) != (current_pages, current_count):
+            fail("EMRISK_PAGINATION_INVALID", f"分页总量发生变化（第 {page} 页）")
+        page_rows = result["data"]
+        if count == 0:
+            if page != 1 or pages not in (0, 1) or page_rows:
+                fail("EMRISK_PAGINATION_INVALID", "空集与分页计数不一致")
+            break
+        if pages != math.ceil(count / 500) or page > pages:
+            fail("EMRISK_PAGINATION_INVALID", f"分页数量不一致（第 {page} 页）")
+        if len(page_rows) != min(500, count - (page - 1) * 500):
+            fail("EMRISK_PAGINATION_INVALID", f"分页行数不完整（第 {page} 页）")
+        for row in page_rows:
+            if not isinstance(row, dict) or row.get("SECURITY_CODE") != code:
+                fail("EMRISK_RESPONSE_INVALID", f"行或主体错误（第 {page} 页）")
+            fingerprint = json.dumps(row, sort_keys=True, ensure_ascii=False)
+            if fingerprint in seen:
+                fail("EMRISK_PAGINATION_INVALID", f"分页重复行（第 {page} 页）")
+            seen.add(fingerprint)
+        rows.extend(page_rows)
+        if page == pages:
             break
         page += 1
-    return {
-        "ok": True,
-        "rows": rows,
-        "meta": {
-            "resource": "pledge_ratio",
-            "code": code,
-            "rows": len(rows),
-            "pages": pages,
-            "httpCalls": http_calls,
-            "sourceUrl": EM_DATA_URL + "?" + urllib.parse.urlencode(dict(base, pageNumber="1")),
-        },
-    }
+    return {"ok": True, "rows": rows, "meta": meta(True)}
+
+
+def cmd_pledge(code):
+    result = fetch_report(code, "pledge_ratio", PLEDGE_REPORT, "TRADE_DATE")
+    result["rows"] = [with_trade_date_iso(row) for row in result["rows"]]
+    return result
 
 
 GDHS_DATE_FIELDS = ("股东户数统计截止日", "股东户数公告日期")
@@ -171,33 +200,36 @@ def normalize_gdhs_dates(row):
 
 
 def cmd_gdhs(code):
-    # 空集形态（akshare 对 result=None 下标崩溃）在包装内先探一次空集再调正式接口不可行
-    # （多一次真实请求）；改为捕获该 TypeError 形态按空集返回，其余异常照常上报。
-    try:
-        import akshare as ak
-
-        df = ak.stock_zh_a_gdhs_detail_em(symbol=code)
-    except TypeError as exc:
-        if "NoneType" in str(exc):
-            return {
-                "ok": True,
-                "rows": [],
-                "meta": {
-                    "resource": "holder_count",
-                    "code": code,
-                    "emptySource": True,
-                    "note": "akshare 对空结果集崩溃，按空集如实返回",
-                },
-            }
-        raise BridgeError(QUERY_ERROR, f"akshare TypeError：{exc}") from exc
-    except Exception as exc:
-        raise BridgeError(QUERY_ERROR, f"{type(exc).__name__}: {exc}") from exc
-    rows = [normalize_gdhs_dates(jsonable(dict(rec))) for rec in df.to_dict(orient="records")]
-    return {
-        "ok": True,
-        "rows": rows,
-        "meta": {"resource": "holder_count", "code": code, "rows": len(rows)},
+    # Same report and field meanings as AKShare's detail API, with explicit
+    # source-envelope verification instead of inferring emptiness from TypeError.
+    fields = {
+        "END_DATE": "股东户数统计截止日", "INTERVAL_CHRATE": "区间涨跌幅",
+        "HOLDER_NUM": "股东户数-本次", "PRE_HOLDER_NUM": "股东户数-上次",
+        "HOLDER_NUM_CHANGE": "股东户数-增减", "HOLDER_NUM_RATIO": "股东户数-增减比例",
+        "AVG_MARKET_CAP": "户均持股市值", "AVG_HOLD_NUM": "户均持股数量",
+        "TOTAL_MARKET_CAP": "总市值", "TOTAL_A_SHARES": "总股本",
+        "CHANGE_SHARES": "股本变动", "CHANGE_REASON": "股本变动原因",
+        "HOLD_NOTICE_DATE": "股东户数公告日期", "SECURITY_CODE": "代码",
+        "SECURITY_NAME_ABBR": "名称",
     }
+    text_fields = {"END_DATE", "HOLD_NOTICE_DATE", "SECURITY_CODE", "SECURITY_NAME_ABBR", "CHANGE_REASON"}
+    result = fetch_report(code, "holder_count", "RPT_HOLDERNUM_DET", "END_DATE")
+    rows = []
+    for raw in result["rows"]:
+        row = {}
+        for source, target in fields.items():
+            value = raw.get(source)
+            if source not in text_fields:
+                try:
+                    value = float(value)
+                    if not math.isfinite(value):
+                        value = None
+                except (TypeError, ValueError):
+                    value = None
+            row[target] = value
+        rows.append(normalize_gdhs_dates(row))
+    result["rows"] = rows
+    return result
 
 
 def run(cmd, code):
@@ -220,7 +252,7 @@ def main(argv):
         cmd, code = parse_args(argv)
         payload = run(cmd, code)
     except BridgeError as exc:
-        payload = {"ok": False, "error_code": exc.code, "error": str(exc)}
+        payload = {"ok": False, "error_code": exc.code, "error": str(exc), "meta": exc.meta}
     except Exception as exc:  # 未预期异常按瞬态查询失败上报（TS 侧退避重试）
         payload = {"ok": False, "error_code": QUERY_ERROR, "error": f"{type(exc).__name__}: {exc}"}
     finally:

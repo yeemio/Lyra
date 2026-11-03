@@ -89,9 +89,10 @@ async function main(): Promise<void> {
     // 对象键不落列（schema 冻结），日期域从 typed_value->>'日期' 读回（YYYY-MM-DD 字典序）。
     const check = await pool.query<{ n: number; first: string; last: string }>(
       `select count(*)::int as n, min(typed_value->>'日期') as first, max(typed_value->>'日期') as last
-       from pintime_fact
+       from pintime_fact f
        where adapter_version = $1 and fact_kind = 'SW_INDEX_BAR'
-         and subject_type = 'INDEX' and subject_id = '801020'`,
+         and subject_type = 'INDEX' and subject_id = '801020'
+         and not exists (select 1 from pintime_fact child where child.supersedes_fact_id = f.fact_id)`,
       [SW_ADAPTER_VERSION],
     );
     const row = check.rows[0];

@@ -32,6 +32,10 @@ import {
   VALUATION_TARGETS,
   ValuationAdapter,
   makeValuationBridgeExecutor,
+  mapAllARowsToFacts,
+  mapCsindexDailyRowsToFacts,
+  mapLgRowsToFacts,
+  type ValuationFetchResult,
   type ValuationRow,
 } from '../adapters/valuation.js';
 import { ArtifactStore } from '../artifacts/store.js';
@@ -108,6 +112,76 @@ export function coverageChecksFor(
   ];
 }
 
+export interface ValuationBatchResult {
+  exitCode: 0 | 2;
+  failures: { check: string; detail: string }[];
+  coverage: CoverageCheck[];
+  ingest: { scope: string; inserted: number; identical: number; rejected: number; rowCount: number; artifact: string }[];
+}
+
+/** 整批映射/拒绝率预检先于任何事实写入；实际写入只消费已核验的内存快照。 */
+export async function importValidatedValuationBatch(opts: {
+  plan: ValuationPlanStep[];
+  responses: ReadonlyMap<string, ValuationRow[]>;
+  fetchedAtMs: number;
+  reportPath: string;
+  ingest: (step: ValuationPlanStep, rows: ValuationRow[]) => Promise<ValuationFetchResult>;
+}): Promise<ValuationBatchResult> {
+  const result: ValuationBatchResult = { exitCode: 0, failures: [], coverage: [], ingest: [] };
+  const prepared: { step: ValuationPlanStep; rows: ValuationRow[] }[] = [];
+  const firstDateExpect: Record<string, string> = { '000905': '2007-02-01', '000852': '2015-01-01' };
+  const rejectedRows: { scope: string; rows: { rowIndex: number; code: string }[] }[] = [];
+  for (const originalStep of opts.plan) {
+    const step = structuredClone(originalStep);
+    const scope = `${step.command}:${step.subject}`;
+    const rows = structuredClone(opts.responses.get(scope) ?? []);
+    prepared.push({ step, rows });
+    try {
+      if (!Array.isArray(rows) || rows.some((row) => row === null || typeof row !== 'object' || Array.isArray(row))) {
+        throw new Error('VALUATION_ROWS_INVALID');
+      }
+      result.coverage.push(...coverageChecksFor(step.command, step.subject, rows, opts.fetchedAtMs, firstDateExpect));
+      // 此上下文仅供纯映射形状核验；不持久化预检事实或伪原件身份。
+      const ctx = { adapterVersion: VALUATION_ADAPTER_VERSION, fetchedAt: new Date(opts.fetchedAtMs).toISOString(), artifactSha256: '0'.repeat(64) };
+      const mapped = step.command === 'csindex_daily' ? mapCsindexDailyRowsToFacts(step.subject, rows, ctx)
+        : step.command === 'lg_pe' ? mapLgRowsToFacts(step.subject, 'PE', rows, ctx)
+          : step.command === 'lg_pb' ? mapLgRowsToFacts(step.subject, 'PB', rows, ctx)
+            : mapAllARowsToFacts(step.command === 'all_a_pe' ? 'PE' : 'PB', rows, ctx);
+      rejectedRows.push({ scope, rows: mapped.rejections });
+      result.coverage.push({ name: `${scope}:rejects`, ok: mapped.rejections.length * 100 <= rows.length * 5,
+        detail: `拒截 ${mapped.rejections.length}/${rows.length}（硬门 ≤5%）` });
+    } catch (error) {
+      result.coverage.push({ name: `${scope}:mapping`, ok: false, detail: String(error) });
+    }
+  }
+  result.failures = result.coverage.filter((c) => !c.ok).map((c) => ({ check: c.name, detail: c.detail }));
+  if (result.failures.length > 0) {
+    result.exitCode = 2;
+    await writeFile(opts.reportPath, JSON.stringify({
+      generatedAt: new Date().toISOString(), adapterVersion: VALUATION_ADAPTER_VERSION,
+      conclusion: 'VALUATION VALIDATION FAILED：整批核验失败，未写入估值事实。',
+      ...result, rejectedRows,
+    }, null, 2), 'utf8');
+    return result;
+  }
+  for (const { step, rows } of prepared) {
+    const r = await opts.ingest(step, rows);
+    result.ingest.push({ scope: r.scope, inserted: r.insertedFactIds.length, identical: r.identicalFactIds.length,
+      rejected: r.rejectedRows.length, rowCount: r.rowCount, artifact: r.artifact.sha256 });
+  }
+  return result;
+}
+
+function ingestStep(adapter: ValuationAdapter, step: ValuationPlanStep): Promise<ValuationFetchResult> {
+  switch (step.command) {
+    case 'csindex_daily': return adapter.fetchCsindexDaily(step.subject);
+    case 'lg_pe': return adapter.fetchLgPe(step.subject, step.lgKey);
+    case 'lg_pb': return adapter.fetchLgPb(step.subject, step.lgKey);
+    case 'all_a_pe': return adapter.fetchAllAPe();
+    case 'all_a_pb': return adapter.fetchAllAPb();
+  }
+}
+
 // ===== 缓存执行器（真实调用台账 + 节流）=====
 
 class Ledger {
@@ -175,12 +249,6 @@ async function main(): Promise<void> {
   await mkdir(artifactsDir, { recursive: true });
   const store = new ArtifactStore(artifactsDir);
   const exec = makeCachedExecutor(makeValuationBridgeExecutor(), ledger);
-  const adapter = new ValuationAdapter({ pool, store, execBridge: exec });
-
-  const failures: { check: string; detail: string }[] = [];
-  const check = (name: string, ok: boolean, detail: string): void => {
-    if (!ok) failures.push({ check: name, detail });
-  };
 
   try {
     await applySchema(pool);
@@ -205,62 +273,21 @@ async function main(): Promise<void> {
       console.log(`[valuation] ${step.label}: rows=${String(rows.length)}`);
     }
 
-    // ---------- 阶段 2：核验 ----------
-    console.log('[valuation] 阶段 2 覆盖核验');
-    // 首行深度门槛（实测全史起点：上证50/沪深300 自 2005、中证500 自 2007-01-31（指数 2007-01-15
-    // 发布）、中证1000 自 2014-10-31；门槛放宽一月余量）
-    const firstDateExpect: Record<string, string> = { '000905': '2007-02-01', '000852': '2015-01-01' };
-    const coverage: unknown[] = [];
-    for (const step of plan) {
-      const rows = responses.get(`${step.command}:${step.subject}`) ?? [];
-      for (const c of coverageChecksFor(step.command, step.subject, rows, fetchedAtMs, firstDateExpect)) {
-        check(c.name, c.ok, c.detail);
-        coverage.push(c);
-      }
-    }
-    if (failures.length > 0) {
-      const report = {
-        generatedAt: new Date().toISOString(),
-        adapterVersion: VALUATION_ADAPTER_VERSION,
-        conclusion: `覆盖核验失败 ${String(failures.length)} 项，未写入估值事实。`,
-        failures,
-        coverage,
-        realCalls: { thisRun: ledger.realCalls, sessionTotal: ledger.calls.length },
-      };
-      await writeFile(IMPORT_REPORT_PATH, JSON.stringify(report, null, 2), 'utf8');
-      console.error(`[valuation] 覆盖核验失败 ${String(failures.length)} 项（报告 ${IMPORT_REPORT_PATH}），不写事实`);
-      for (const f of failures.slice(0, 20)) console.error(`  ✗ ${f.check}: ${f.detail}`);
-      process.exitCode = 2;
+    // ---------- 阶段 2/3：整批预检，然后消费同一内存快照 ----------
+    const validated = await importValidatedValuationBatch({
+      plan, responses, fetchedAtMs, reportPath: IMPORT_REPORT_PATH,
+      ingest: async (step, rows) => {
+        // 不再重读可变 JSON 缓存或再次取数；预检与写入使用相同的行。
+        const replay: BridgeExecutor = async () => ({ ok: true, rows: rows as BridgeResponse['rows'] });
+        return ingestStep(new ValuationAdapter({ pool, store, execBridge: replay,
+          now: () => new Date(fetchedAtMs) }), step);
+      },
+    });
+    const { coverage, ingest, failures } = validated;
+    if (validated.exitCode !== 0) {
+      console.error(`[valuation] 整批核验失败 ${failures.length} 项（报告 ${IMPORT_REPORT_PATH}），不写事实`);
+      process.exitCode = validated.exitCode;
       return;
-    }
-    console.log(`[valuation] 覆盖核验通过（${String(plan.length)} 步）`);
-
-    // ---------- 阶段 3：入库（缓存回放，0 新调用）----------
-    console.log('[valuation] 阶段 3 入库');
-    const ingest: { scope: string; inserted: number; identical: number; rejected: number; rowCount: number; artifact: string }[] = [];
-    for (const step of plan) {
-      const r =
-        step.command === 'csindex_daily'
-          ? await adapter.fetchCsindexDaily(step.subject)
-          : step.command === 'lg_pe'
-            ? await adapter.fetchLgPe(step.subject, step.lgKey)
-            : step.command === 'lg_pb'
-              ? await adapter.fetchLgPb(step.subject, step.lgKey)
-              : step.command === 'all_a_pe'
-                ? await adapter.fetchAllAPe()
-                : await adapter.fetchAllAPb();
-      ingest.push({
-        scope: r.scope,
-        inserted: r.insertedFactIds.length,
-        identical: r.identicalFactIds.length,
-        rejected: r.rejectedRows.length,
-        rowCount: r.rowCount,
-        artifact: r.artifact.sha256,
-      });
-      console.log(`[valuation] ${step.label}: rows=${String(r.rowCount)} inserted=${String(r.insertedFactIds.length)} identical=${String(r.identicalFactIds.length)} rejected=${String(r.rejectedRows.length)}`);
-      const rej = r.rejectedRows.length;
-      check(`${step.command}:${step.subject}:rejects`, rej <= Math.max(1, Math.floor(r.rowCount * 0.05)),
-        `拒截 ${String(rej)}/${String(r.rowCount)}（>5% 视为来源形态漂移）`);
     }
 
     // 入库后 DB 计数（按 subject × 来源）
@@ -311,7 +338,7 @@ async function main(): Promise<void> {
     };
     await writeFile(IMPORT_REPORT_PATH, JSON.stringify(importReport, null, 2), 'utf8');
     console.log(JSON.stringify({
-      result: failures.length === 0 ? 'VALUATION IMPORT OK' : 'VALUATION IMPORT OK（入库后检查有失败项，见报告）',
+      result: 'VALUATION IMPORT OK',
       importReportPath: IMPORT_REPORT_PATH,
       factsBySubjectSource: importReport.factsBySubjectSource,
       realCallsThisRun: ledger.realCalls,

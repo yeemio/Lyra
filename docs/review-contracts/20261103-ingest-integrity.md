@@ -1,6 +1,6 @@
 # 修复来源错误、重复抓取和导入质量门
 
-状态：修复合同；当前仅建立 Draft PR，尚无修复接受。
+状态：R1 源码修复候选已实现，待总控 ACCEPT/REWORK；Draft PR、真实运行及业务接受边界不变。
 
 审查候选：[`6c7cd196f20a4222d1f97708de7402b2c50ebeb0`](https://github.com/yeemio/Lyra/tree/6c7cd196f20a4222d1f97708de7402b2c50ebeb0)，tree `843eb5b97617ffda179ebb06e2ee2adf03bf19fc`。PR base=`main@6c7cd196f20a4222d1f97708de7402b2c50ebeb0`；head=`review-20261103/ingest-integrity`，初始合同提交身份见 PR。
 
@@ -42,3 +42,46 @@ Owner 已授权这批经核对的问题修复、验证、对应分支提交/推�
 适用验证在稳定候选完成后运行：项目 typecheck、受影响行为/调用链回归、diff检查；使用公开合成输入/隔离数据库。不是严格 TDD 授权，不强制先写失败测试。每条通过必须附实际命令、输出、环境与准确 head；未运行列明原因，不把报告原93测试当新候选证明。UI/PDF变动须提供与候选绑定的实际呈现证据。
 
 停止条件：每个问题的完整行为出口成立，提供稳定 head、完整 changed paths/diff 与适用验证；当前总控接收。若无 GitHub 写工具，完整可发布补丁/文件即本次传输出口。一个初始结果加一次具名窄返工后先由总控重评，不自动无限重试或改换作者。源码接受不自动等于安装、整体L2、真实A/J或效果接受。
+
+## R1 实施与交付记录（2026-11-03）
+
+唯一代码作者仍为本普通 Chat。父提交固定为 `541957b059af48dd578ae75425d0bd98410a340a`；base 仍为原 main 基线，不采用 PR6/7 或其他修复 PR 的依赖提交。准确 head/tree 见包含本合同的冻结提交及随包 MANIFEST，不在提交内自引用尚未生成的哈希。GitHub 代码/评论写入的既有 403 不重复探测，交付原作者 Git bundle 供总控机械发布。
+
+### I-06：SW 观察与修订
+
+- `src/adapters/sw-observations.ts` 将相同业务行的首次事实与后续观察分开：首次事实及其时间/原件身份保持不变，每次抓取追加 `sw_fact_observation` 收据，包含抓取身份、语义指纹、观察时刻和本次原件哈希。
+- 业务键使用适配器、主体、kind、validFrom，分类行业改码不会断开旧版本；真实 typedValue、validTo 等语义差异新增 `supersedesFactId` 修订，可得时点不早于该次观察。保存源语义指纹，避免修订可得时点推进后重复抓取又增版。不同内容的较早/同刻观察与已有多头均具名拒绝，不猜测覆盖顺序。
+- 每行的事务锁、查头、事实与收据写入使用同一数据库 client；收据失败回滚该行事实。首次同源同内容 CAS 写入另有事务锁，避免文件元数据初始化竞争；不修改通用原件库或放宽其他来源的 `FACT_CONFLICT`。
+- 分类同日重复去重、同日多值整股拒绝；能识别股票归属的坏行使该股整条分类链拒绝，不能由过滤坏行推导有效期延长。XLS 实际字节的 SHA、长度和行数必须匹配本次桥元数据，缓存被并发覆盖时在写事实前失败。
+- 必要类型联动：`src/db/pintime.ts` 的两项查询接口改为接受最小 query 能力，支持事务 client，比较语义未改。必要调用者联动：`src/backfill/sw-801020.ts` 的计数改为只统计未被修订覆盖的当前版本；否则历史版本保留后会误报行数超额。这是合同列举路径外唯一文件联动，不执行该回填或改写历史。
+
+### I-07：来源协议与回填完成证明
+
+- pledge 与 gdhs 共用严格分页验证：必须明确 success=true、合法 result/data、稳定 pages/count、逐页行数一致、主体一致且无重复页行。来源错误、结构错误、运输异常和后页失败均失败；只有协议确认的零计数空集可成功。
+- gdhs 直接读取原同源 `RPT_HOLDERNUM_DET` 报告并保留既有中文字段映射，避免 AKShare 包装异常掩盖源信封。没有执行真实来源请求；线上兼容性未接受。
+- 每次响应先存 CAS，含完整 HTTP body、分页状态与前次尝试原件引用；非 JSON 桥输出也保留完整 stdout。适配器再次验证完成证明，再进入映射/写入。失败后的重试链及最终错误原件哈希保存在暂停/回填失败记录中。
+- 回填仅在匹配资源/主体/行数的 `emrisk-pages-v1` 证明齐备后记 completed。旧账本所有无证明段均须重新验证（包括旧空集和旧非空段），故障不升级证明，后续获准重跑可恢复。本轮没有读取或改写真实账本。
+- 既有 smoke 和数据库测试调用者同步读取新的原件信封结构；真实 smoke 未运行。
+
+### M-04：估值整批质量门
+
+- `importValidatedValuationBatch` 在任何事实写入前，对整批的覆盖、结构、实际映射结果及拒绝率执行预检；拒绝率严格按 ≤5% 计算，不再为短批次额外放行一行。
+- 任一步失败仅写错误报告（含逐行拒绝原因），返回退出码 2；正常 CLI 将该结果赋给 `process.exitCode`，没有 `IMPORT OK` 假成功。后置步骤失败也不会留下前置步骤事实。
+- 全部通过后才调用适配器，逐步消费同一份预检内存快照，不再从可变 JSON 缓存重新取行。此质量门不新增“任意运行时/数据库故障下整批事务原子性”的承诺；运行时写入失败仍按既有幂等恢复路径处理。
+
+### 实际检查与未验边界
+
+环境：Node v24.22.1；精确 lockfile 未改。已实际执行 `npm ci --offline --ignore-scripts --no-audit --no-fund`，安装 90 个包，退出 0；这不是产品服务安装接受。
+
+| 检查 | 实际结果及界限 |
+|---|---|
+| `npm run typecheck` | 退出 0；冻结后还会以准确 head 记录最终输出。 |
+| `node --import tsx --test --test-concurrency=1 src/adapters/emrisk-integrity.test.ts src/adapters/sw-observations.test.ts src/backfill/emrisk.test.ts src/backfill/valuation.test.ts src/backfill/valuation-integrity.test.ts` | 28 项：27 PASS、1 SKIP、0 FAIL；跳过项即下述 PG 集成，不算通过。 |
+| `python -m unittest discover -s adapters/emrisk -p 'test_*.py' -v` | 8/8 PASS，退出 0；仅合成 requests 模块及隔离 CLI，无真实请求。 |
+| diff 检查 | 已执行 `git diff --check`，退出 0；冻结包另列相对父提交检查及哈希。 |
+| 源 SQL / 双池并发 / 收据回滚 / seal 冻结 | **NOT_RUN**：环境无 PostgreSQL 服务/工具，未提供 `LYRA_REPAIR_TEST_PG`。已提供显式隔离连接门控的 PG 回归，不回退应用默认数据库。由总控在同一冻结候选补验。 |
+| 既有 `sw.test.ts`、`emrisk.test.ts` 数据库套件 | **NOT_RUN**：两者默认连接数据库，本环境没有可用的隔离实例；仅完成类型检查及必要 fixture 联动。 |
+| 估值真实 CLI、实际 DB 零新增断言 | **NOT_RUN**：已验证正常调用的整批门函数零 ingest 调用及隔离子进程退出 2；未将这些合成测试记成真实导入/业务库证明。 |
+| UI/PDF | 本 PR 无界面/PDF 改动，不适用；PR7 视觉未验边界保留。 |
+
+旧资料、行业八日、严格历史 PIT、真实 A/J、账户、安装与效果接受边界均保留；I-05、P5、PM 独占文件未改。当前仅交付本 PR 的 I-06/I-07/M-04，剩余 PR1/3/4/5 共 20 项仍待后续实施。
