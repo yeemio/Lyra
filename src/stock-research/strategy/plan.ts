@@ -44,25 +44,33 @@ export function portfolioOf(account: AccountSnapshot): Portfolio {
 export function sizeRisk(account: AccountSnapshot | null, at: string, portfolio: Portfolio | null, buyPriceFen: number, stopFen: number, lotShares: number, rules: StrategyRules, tickFen: number): RiskSizing {
   integer(buyPriceFen, 'buyPriceFen', 1); integer(stopFen, 'stopFen', 1); integer(lotShares, 'lotShares', 1); integer(tickFen, 'tickFen', 1);
   const base: RiskSizing = { status: 'MISSING_ACCOUNT', quantity: null, buyPriceFen, stressExitFen: null, buyGrossFen: null, buyFeesFen: null, stressLossFen: null, accountHash: account ? canonicalSha256(account) : null,
-    formula: 'max lot-multiple q satisfying buyGross+buyFees<=cash; (held+q)*buyPrice<=explicit value cap; buyGross+buyFees-(stressExit*q-sellFees)<=explicit loss budget; stressExit=adversely slipped/tick-rounded stop*(1-stressGapBps/10000)', issues: [] };
+    riskMethod: 'TOTAL_SUBJECT_MARK_TO_STRESS_V1', heldQuantity: null, existingStressLossFen: null, incrementalStressLossFen: null, totalStressLossFen: null, stressSellFeesFen: null,
+    formula: 'max lot-multiple q satisfying buyGross+buyFees<=cash; (held+q)*buyPrice<=explicit value cap; existingLoss=held*(buyPrice-stressExit)+sellFees(held*stressExit); totalLoss=(held+q)*(buyPrice-stressExit)+buyFees(q*buyPrice)+sellFees((held+q)*stressExit)<=explicit total subject loss budget; incrementalLoss=totalLoss-existingLoss; stressLossFen=incrementalLoss; existing holdings marked at current buyPrice, not historical cost; one combined exit order; stressExit=adversely slipped/tick-rounded stop*(1-stressGapBps/10000)', issues: [] };
   if (!account) { base.issues.push('USER_CONFIRMED_ACCOUNT_AND_RISK_BUDGET_MISSING'); return base; }
   if (account.availableAt > at || account.asOf > at || account.confirmedAt > at) { base.status = 'ACCOUNT_NOT_AVAILABLE'; base.issues.push('ACCOUNT_FROM_FUTURE'); return base; }
   const p = portfolio ?? portfolioOf(account);
   const held = p.lots.reduce((n, l) => n + l.quantity, 0);
+  base.heldQuantity = held;
   const stressExit = slipped(ratio(stopFen, 10_000 - account.constraints.stressGapBps, 10_000), 'SELL', rules.costs, tickFen);
   base.stressExitFen = stressExit;
   if (stressExit <= 0 || stopFen >= buyPriceFen) { base.status = 'RISK_REJECTED'; base.quantity = 0; base.issues.push('INVALID_PRICE_RISK_RELATION'); return base; }
+  const existingLoss = gross(buyPriceFen - stressExit, held) + fees(gross(stressExit, held), 'SELL', rules.costs);
+  base.existingStressLossFen = existingLoss;
   const maxValue = Math.max(0, account.constraints.maxPositionValueFen - gross(buyPriceFen, held));
-  let lo = 0, hi = Math.floor(Math.min(p.cashFen, maxValue) / buyPriceFen / lotShares);
+  let lo = 0, hi = existingLoss > account.constraints.maxLossFen ? 0 : Math.floor(Math.min(p.cashFen, maxValue) / buyPriceFen / lotShares);
   const acceptable = (lots: number): boolean => {
     const q = lots * lotShares, amount = gross(buyPriceFen, q);
-    const buyFees = fees(amount, 'BUY', rules.costs), sale = gross(stressExit, q);
-    const loss = amount + buyFees - sale + fees(sale, 'SELL', rules.costs);
+    const buyFees = fees(amount, 'BUY', rules.costs), sale = gross(stressExit, held + q);
+    const loss = gross(buyPriceFen - stressExit, held + q) + buyFees + fees(sale, 'SELL', rules.costs);
     return amount + buyFees <= p.cashFen && loss <= account.constraints.maxLossFen && amount <= maxValue;
   };
   while (lo < hi) { const mid = Math.ceil((lo + hi) / 2); if (acceptable(mid)) lo = mid; else hi = mid - 1; }
-  const q = lo * lotShares, amount = gross(buyPriceFen, q), buyFees = fees(amount, 'BUY', rules.costs), sale = gross(stressExit, q);
-  base.status = q > 0 ? 'SIZED' : 'RISK_REJECTED'; base.quantity = q; base.buyGrossFen = amount; base.buyFeesFen = buyFees; base.stressLossFen = amount + buyFees - sale + fees(sale, 'SELL', rules.costs);
+  const q = lo * lotShares, amount = gross(buyPriceFen, q), buyFees = fees(amount, 'BUY', rules.costs), sale = gross(stressExit, held + q);
+  base.stressSellFeesFen = fees(sale, 'SELL', rules.costs);
+  base.totalStressLossFen = gross(buyPriceFen - stressExit, held + q) + buyFees + base.stressSellFeesFen;
+  base.incrementalStressLossFen = base.totalStressLossFen - existingLoss;
+  base.status = q > 0 ? 'SIZED' : 'RISK_REJECTED'; base.quantity = q; base.buyGrossFen = amount; base.buyFeesFen = buyFees; base.stressLossFen = base.incrementalStressLossFen;
+  if (existingLoss > account.constraints.maxLossFen) base.issues.push('EXISTING_POSITION_EXCEEDS_TOTAL_LOSS_BUDGET');
   if (q === 0) base.issues.push('LOT_CASH_VALUE_OR_LOSS_BUDGET_BLOCKED');
   return base;
 }
@@ -86,8 +94,9 @@ export function freezePlan(data: StrategyData, rules: StrategyRules, signalDate:
     ...(indicativeRisk?.stressExitFen ? [{ name: '跳空压力情景', rawExit: indicativeRisk.stressExitFen, alreadySlipped: true, assumption: '假定失效阈值后再下跳显式stressGap；更大跳空仍可能发生' }] : []),
   ].map((x) => {
     const entryPriceFen = indicativeRisk?.buyPriceFen ?? slipped(close, 'BUY', rules.costs, dayRule.tickFen), exitPriceFen = x.alreadySlipped ? x.rawExit : slipped(x.rawExit, 'SELL', rules.costs, dayRule.tickFen);
-    const totalFeesFen = q !== null && q > 0 ? fees(gross(entryPriceFen, q), 'BUY', rules.costs) + fees(gross(exitPriceFen, q), 'SELL', rules.costs) : null;
-    return { name: x.name, assumption: x.assumption, entryPriceFen, exitPriceFen, quantity: q, totalFeesFen, netPnlFen: q !== null && q > 0 && totalFeesFen !== null ? gross(exitPriceFen - entryPriceFen, q) - totalFeesFen : null };
+    const held = indicativeRisk?.heldQuantity ?? 0;
+    const totalFeesFen = q !== null && q > 0 ? fees(gross(entryPriceFen, q), 'BUY', rules.costs) + fees(gross(exitPriceFen, held + q), 'SELL', rules.costs) - fees(gross(exitPriceFen, held), 'SELL', rules.costs) : null;
+    return { name: x.name, assumption: `${x.assumption}；金额为新增数量，退出费用按合并退出的边际费用分摊`, entryPriceFen, exitPriceFen, quantity: q, totalFeesFen, netPnlFen: q !== null && q > 0 && totalFeesFen !== null ? gross(exitPriceFen - entryPriceFen, q) - totalFeesFen : null };
   }) : [];
   const trend = snapshot.decision === 'TREND_CANDIDATE';
   const core = {

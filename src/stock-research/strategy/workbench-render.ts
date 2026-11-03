@@ -42,9 +42,10 @@ function metrics(m: Metrics): string {
 }
 function replay(title: string, r: ReplayResult): string {
   return `<section class="sr-section"><h2 class="sr-sec-h">${esc(title)}</h2><p><strong>${esc(label(r.status))}</strong> · ${esc(r.window.from)} → ${esc(r.window.to)}；当前条件：${esc(label(r.condition))}。</p>
-${r.metrics ? metrics(r.metrics) : '<p>指标尚未计算；无收益或数量结论。</p>'}
+${r.metrics ? metrics(r.metrics) : '<p>展示窗口指标未计算；累计指标若存在见下方。</p>'}
+${r.continuity ? `<p>状态从 ${esc(r.continuity.replayedFrom)} 连续回放，展示起点不重置计划。以下累计指标覆盖 ${esc(r.continuity.replayedFrom)} → ${esc(r.window.to)}，不代表展示窗口收益。</p>${r.continuity.cumulativeMetrics ? metrics(r.continuity.cumulativeMetrics) : '<p>累计指标未计算。</p>'}<details><summary>窗口前史：${r.continuity.priorOpportunities.length} 条机会、${r.continuity.priorEvents.length} 条事件</summary>${table(['日期', '判断', '原因'], r.continuity.priorOpportunities.map((o) => [o.date, label(o.decision), o.reasonCodes.map(reason).join('；')]))}${table(['时点', '事件', '原因'], r.continuity.priorEvents.map((e) => [e.at, label(e.kind), reason(e.reason)]))}</details>` : ''}
 ${r.issues.length ? table(['计算限制', '日期'], r.issues.map((i) => [i.detail, i.date])) : ''}
-<details><summary>全部机会分母（${r.opportunities.length}条，含等待、拒绝与占用）</summary>${table(['日期', '当日判断', '原因'], r.opportunities.map((o) => [o.date, label(o.decision), o.reasonCodes.map(reason).join('；') || '无补充原因']))}</details>
+<details><summary>${r.continuity ? '展示窗口机会' : '全部机会分母'}（${r.opportunities.length}条，含等待、拒绝与占用）</summary>${table(['日期', '当日判断', '原因'], r.opportunities.map((o) => [o.date, label(o.decision), o.reasonCodes.map(reason).join('；') || '无补充原因']))}</details>
 <details><summary>全部事件与归因（${r.events.length}条，含未成交与失败）</summary>${table(['时间', '事件', '归因', '原因', '数量', '价格', '费用', '净损益'], r.events.map((e) => [e.at, label(e.kind), label(e.attribution), reason(e.reason), count(e.quantity, '股'), money(e.priceFen), money(e.feesFen), money(e.netPnlFen)]))}</details></section>`;
 }
 function planContent(plan: FrozenPlan): string {
@@ -55,7 +56,9 @@ ${table(['期限与成本假设', '冻结值'], [['最长持有期限', count(pl
 <h3>进入、等待与退出条件</h3><ul>${plan.conditions.map((c) => `<li>${esc(c)}</li>`).join('')}</ul>
 ${table(['备选方案', '当前选择', '理由'], plan.alternatives.map((a) => [label(a.family), a.selected ? '选中' : '保留对照', a.reason]))}
 <h3>按结果所用输入计算的压力情景</h3><p>${esc(risk ? label(risk.status) : '尚未计算风险数量')}。合成结果中的数量和资金只属于演示；下方新录入不会自动改写本计划。</p>
-${risk ? table(['情景项目', '计算值'], [['数量', count(risk.quantity, '股')], ['进入价格', money(risk.buyPriceFen)], ['压力退出价', money(risk.stressExitFen)], ['进入金额', money(risk.buyGrossFen)], ['进入费用', money(risk.buyFeesFen)], ['压力损失', money(risk.stressLossFen)]]) : ''}
+${risk ? table(['情景项目', '计算值'], [['数量', count(risk.quantity, '股')], ['进入价格', money(risk.buyPriceFen)], ['压力退出价', money(risk.stressExitFen)], ['进入金额', money(risk.buyGrossFen)], ['进入费用', money(risk.buyFeesFen)], ['已有持仓压力损失', money(risk.existingStressLossFen)], ['新增数量压力损失', money(risk.incrementalStressLossFen)], ['合计标的压力损失', money(risk.totalStressLossFen)], ['合并退出费用', money(risk.stressSellFeesFen)]]) : ''}
+${risk?.issues.length ? table(['风险约束'], risk.issues.map((i) => [i === 'EXISTING_POSITION_EXCEEDS_TOTAL_LOSS_BUDGET' ? '已有仓位压力损失已超过该标的总预算；不得新增数量' : i])) : ''}
+<p>压力损失按当前参考买价至压力退出价计算；已有持仓不按历史成本抵减风险，退出费用按合并卖出计收。旧冻结结果未提供分解时显示未计算。</p>
 <h3>计划限制</h3><ul>${plan.limitations.map((text) => `<li>${esc(text)}</li>`).join('')}</ul></section>`;
 }
 function riskForm(csrf: string, values: Record<string, string>, error?: string): string {

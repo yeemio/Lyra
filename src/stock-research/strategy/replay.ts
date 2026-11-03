@@ -19,7 +19,22 @@ export function replayRules(data: StrategyData, rules: StrategyRules, window: Re
 }
 
 export function replayFrozenPlan(data: StrategyData, plan: FrozenPlan, review: PlanReview, window: ReplayResult['window']): ReplayResult {
-  return replay(data, plan.rules, window, plan, review);
+  const signalIndex = data.calendar.sessions.findIndex((s) => s.date === plan.signalDate);
+  const first = signalIndex < 0 ? undefined : data.calendar.sessions[signalIndex + 1];
+  if (!first || window.from <= plan.signalDate || window.from > window.to) return replay(data, plan.rules, window, plan, review);
+  const full = replay(data, plan.rules, { from: first.date, to: window.to }, plan, review);
+  if (window.from <= first.date) return { ...full, window };
+  return {
+    ...full, window, metrics: null,
+    issues: [...full.issues, { code: 'DISPLAY_SLICE_METRICS_NOT_COMPUTED', date: window.from, detail: `状态从${first.date}连续承接；累计指标单独保留，不冒充展示窗口收益` }],
+    opportunities: full.opportunities.filter((o) => o.date >= window.from),
+    events: full.events.filter((e) => e.date >= window.from),
+    equity: full.equity.filter((e) => e.date >= window.from),
+    continuity: { replayedFrom: first.date,
+      priorOpportunities: full.opportunities.filter((o) => o.date < window.from),
+      priorEvents: full.events.filter((e) => e.date < window.from),
+      priorEquity: full.equity.filter((e) => e.date < window.from), cumulativeMetrics: full.metrics },
+  };
 }
 
 function replay(data: StrategyData, rules: StrategyRules, window: ReplayResult['window'], fixed: FrozenPlan | null, review: PlanReview | null): ReplayResult {

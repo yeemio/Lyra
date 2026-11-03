@@ -168,6 +168,13 @@ export interface RiskSizing {
   buyGrossFen: number | null;
   buyFeesFen: number | null;
   stressLossFen: number | null;
+  /** Absent on legacy frozen plans; never infer a verified total budget from the legacy scalar. */
+  riskMethod?: 'TOTAL_SUBJECT_MARK_TO_STRESS_V1';
+  heldQuantity?: number | null;
+  existingStressLossFen?: number | null;
+  incrementalStressLossFen?: number | null;
+  totalStressLossFen?: number | null;
+  stressSellFeesFen?: number | null;
   accountHash: string | null;
   formula: string;
   issues: string[];
@@ -262,6 +269,14 @@ export interface ReplayResult {
   events: StrategyEvent[];
   equity: { date: string; equityFen: number; investedFen: number; staleMark: boolean }[];
   metrics: Metrics | null;
+  /** Fixed plans replay from the first post-signal session. Display slices retain all prior records. */
+  continuity?: {
+    replayedFrom: string;
+    priorOpportunities: Opportunity[];
+    priorEvents: StrategyEvent[];
+    priorEquity: ReplayResult['equity'];
+    cumulativeMetrics: Metrics | null;
+  };
   finalPortfolio: Portfolio | null;
   condition: 'UNTRIGGERED' | 'TRIGGERED' | 'INVALID' | 'EXPIRED' | 'MISSED' | 'FAILED';
   efficacyAccepted: false;
