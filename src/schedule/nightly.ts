@@ -937,6 +937,7 @@ export async function settleDueConclusions(
             subject: c.businessKey.subject,
             disposition: c.disposition as 'RESEARCH_OUTPERFORM' | 'RESEARCH_UNDERPERFORM' | 'ABSTAIN',
             conclusionTime: c.createdAt,
+            benchmark: c.evidence.benchmark,
             cutoff: c.businessKey.cutoff,
             ...asOfField,
             ...windowField,
@@ -944,7 +945,9 @@ export async function settleDueConclusions(
         : await settleEtfConclusion(factPool, {
             subject: c.businessKey.subject,
             disposition: c.disposition as 'RESEARCH_UP' | 'RESEARCH_DOWN' | 'ABSTAIN',
+            cutoff: c.businessKey.cutoff,
             conclusionTime: c.createdAt,
+            benchmark: c.evidence.benchmark,
             ...asOfField,
             ...windowField,
           });

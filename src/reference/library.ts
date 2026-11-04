@@ -9,23 +9,26 @@
  * 匹配为空只有缺口没有群组（缺口是合法产出，§8）——buildGroupLibrary 对样本数低于
  * MIN_GROUP_SAMPLE 的节点不产出统计块（不降档凑样本，§5）。
  *
- * 持久化：src/db/reference-migration.sql（reference_group_library：group_key、path、
- * sample_count、base_ratio、stats jsonb、nested_declaration、created_at）。
+ * 持久化：src/db/reference-migration.sql（reference_library_versions 完整不可变发布，
+ * 成员/窗口/输入事实身份/最大可用及观察时刻/构建时刻/DB 发布时间）。旧可变表仅保留审计。
  * 单测不碰网络不碰 DB：统计构建为纯函数，持久化接口由调用方注入 Pool。
  */
 import { readFile } from 'node:fs/promises';
 import type { Pool } from 'pg';
+import type { TimePointFact } from '../contracts.js';
+import { canonicalJsonString, canonicalSha256 } from '../canonical.js';
 import {
   NESTED_GROUP_DECLARATION,
   REVISION_NOTICE,
   baseRateOf,
+  industryAsOf,
   industryLayerKey,
   marketCapLayerKey,
   type BaseRateBlock,
   type GroupLayerName,
   type ReferenceEventLayers,
 } from './groups.js';
-import { fAdd, fDiv, fixedToString, parseFixed, type Fixed } from './excess.js';
+import { adjustFactorsFromFacts, dailyBarsFromFacts, eventWindowReturns, swIndexBarsFromFacts, fAdd, fDiv, fixedToString, parseFixed, type Fixed } from './excess.js';
 
 // ===== 群组统计对象 =====
 
@@ -40,6 +43,8 @@ export interface WindowStat {
 
 export interface GroupStatBlock {
   groupKey: string;
+  /** 本群组的完整成员快照；与统计和版本一起不可变，不依赖当前 events 表。 */
+  members: ReferenceEventLayers[];
   /** 逐层键（与 groupKey 的 '|' 连接一致；嵌套路径）。 */
   path: string[];
   layers: GroupLayerName[];
@@ -117,6 +122,7 @@ function statBlockOf(
 ): GroupStatBlock {
   return {
     groupKey: path.join('|'),
+    members: [...samples].sort((a, b) => canonicalJsonString(a).localeCompare(canonicalJsonString(b))),
     path,
     layers,
     sampleCount: samples.length,
@@ -234,7 +240,7 @@ export function buildGroupLibrary(
   return { groups, totalSamples: samples.length, dataGaps: [...gaps].sort(), layerInputMissing };
 }
 
-// ===== 持久化（reference_group_library；src/db/reference-migration.sql）=====
+// ===== 不可变版本持久化（src/db/reference-migration.sql）=====
 
 const migrationSqlUrl = new URL('../db/reference-migration.sql', import.meta.url);
 
@@ -258,61 +264,165 @@ export async function applyReferenceMigration(pool: Pool): Promise<void> {
   }
 }
 
-export interface GroupLibraryRow {
-  group_key: string;
-  path: unknown;
-  sample_count: number;
-  base_ratio: unknown;
-  stats: unknown;
-  nested_declaration: string;
-  created_at: Date;
+export class ReferenceVersionError extends Error {
+  constructor(readonly code: string, detail: string) { super(`${code}: ${detail}`); this.name = 'ReferenceVersionError'; }
 }
 
-/** 群组统计落库（upsert：group_key 恒可解析；版本绑定随 stats jsonb 更新，created_at 保留首建）。 */
-export async function saveGroupStats(pool: Pool, blocks: GroupStatBlock[]): Promise<number> {
-  let saved = 0;
-  const client = await pool.connect();
-  try {
-    await client.query('begin');
-    for (const b of blocks) {
-      await client.query(
-        `insert into reference_group_library
-          (group_key, path, sample_count, base_ratio, stats, nested_declaration)
-         values ($1, $2::jsonb, $3, $4::jsonb, $5::jsonb, $6)
-         on conflict (group_key) do update set
-           path = excluded.path,
-           sample_count = excluded.sample_count,
-           base_ratio = excluded.base_ratio,
-           stats = excluded.stats,
-           nested_declaration = excluded.nested_declaration`,
-        [
-          b.groupKey,
-          JSON.stringify(b.path),
-          b.sampleCount,
-          JSON.stringify(b.baseRatio),
-          JSON.stringify(b.stats),
-          b.nestedDeclaration,
-        ],
-      );
-      saved += 1;
-    }
-    await client.query('commit');
-  } catch (error) {
-    try {
-      await client.query('rollback');
-    } catch {
-      // 同上。
-    }
-    throw error;
-  } finally {
-    client.release();
+export interface ReferenceVersionPayload {
+  schemaVersion: 1;
+  buildIdentity: GroupStatBlock['versionBinding'];
+  materializedAt: string;
+  inputAvailableAtMax: string;
+  inputObservedAtMax: string;
+  maturityAtMax: string;
+  groups: GroupStatBlock[];
+  inputFacts: { factId: string; artifactSha256: string; factHash: string; availableAt: string; firstObservedAt: string }[];
+}
+export interface ReferenceVersion {
+  versionId: string;
+  contentHash: string;
+  publishedAt: string;
+  payload: ReferenceVersionPayload;
+}
+
+function instant(value: string): string {
+  const ms = Date.parse(value);
+  if (!Number.isFinite(ms)) throw new ReferenceVersionError('REFERENCE_TIME_INVALID', value);
+  return new Date(ms).toISOString();
+}
+
+/** 只构造有完整成员/成熟窗口/输入事实身份的版本。当前修订值不升级为严格 PIT。 */
+export function referenceVersionPayload(blocks: GroupStatBlock[], inputFacts: readonly TimePointFact[], buildIdentity = blocks[0]?.versionBinding): ReferenceVersionPayload {
+  if (buildIdentity === undefined || (blocks.length !== 0 && inputFacts.length === 0)) throw new ReferenceVersionError('REFERENCE_LINEAGE_MISSING', '缺构建身份或非空群组的输入事实');
+  const materializedAt = instant(buildIdentity.materializedAt);
+  const byId = new Map(inputFacts.map((f) => [f.factId, f]));
+  if (byId.size !== inputFacts.length) throw new ReferenceVersionError('REFERENCE_LINEAGE_CONFLICT', '重复输入 factId');
+  const keys = new Set<string>();
+  const maturities: string[] = [];
+  const checkedEvents = new Map<string, string>();
+  const factGroups = new Map<string, TimePointFact[]>();
+  for (const f of inputFacts) {
+    const key = `${f.subjectType}/${f.subjectId}/${f.factKind}`;
+    const group = factGroups.get(key) ?? [];
+    group.push(f); factGroups.set(key, group);
   }
-  return saved;
+  for (const b of blocks) {
+    if (keys.has(b.groupKey) || canonicalJsonString(b.versionBinding) !== canonicalJsonString(buildIdentity) || b.members.length !== b.sampleCount ||
+        new Set(b.members.map((m) => m.lineage?.eventId)).size !== b.members.length) {
+      throw new ReferenceVersionError('REFERENCE_LINEAGE_CONFLICT', b.groupKey);
+    }
+    keys.add(b.groupKey);
+    const recalculated = statBlockOf(b.layers, b.path, b.members, baseRateOf(b.members), {
+      ...buildIdentity, minGroupSample: 1,
+    });
+    if (canonicalSha256({ stats: b.stats, baseRatio: b.baseRatio }) !==
+        canonicalSha256({ stats: recalculated.stats, baseRatio: recalculated.baseRatio })) {
+      throw new ReferenceVersionError('REFERENCE_STATS_UNBOUND', b.groupKey);
+    }
+    for (const m of b.members) {
+      const l = m.lineage;
+      const fact = l === undefined ? undefined : byId.get(l.evidenceFactId);
+      if (!l?.eventId || fact?.subjectType !== 'STOCK' || fact.subjectId !== m.subject ||
+          instant(fact.availableAt) > instant(m.eventTime) || instant(m.eventTime) > materializedAt) {
+        throw new ReferenceVersionError('REFERENCE_EVENT_UNBOUND', `${m.subject}@${m.eventTime}`);
+      }
+      const memberHash = canonicalSha256(m);
+      const previous = checkedEvents.get(l.eventId);
+      if (previous !== undefined && previous !== memberHash) throw new ReferenceVersionError('REFERENCE_LINEAGE_CONFLICT', l.eventId);
+      if (previous === undefined) {
+        const get = (type: string, subject: string, kind: string) => factGroups.get(`${type}/${subject}/${kind}`) ?? [];
+        const industry = industryAsOf(get('STOCK', m.subject, 'INDUSTRY_CLASS_VERSION').filter((f) => f.adapterVersion.startsWith('sw@')), m.eventTime);
+        if (canonicalSha256(industry) !== canonicalSha256(m.industry)) throw new ReferenceVersionError('REFERENCE_INDUSTRY_UNBOUND', l.eventId);
+        const window = eventWindowReturns({ subject: m.subject, eventTime: m.eventTime, industryL1AsOf: industry?.l1IndexCode ?? null,
+          bars: dailyBarsFromFacts(get('STOCK', m.subject, 'DAILY_BAR')),
+          factors: adjustFactorsFromFacts(get('STOCK', m.subject, 'ADJUST_FACTOR')),
+          indexBars: industry?.l1IndexCode == null ? [] : swIndexBarsFromFacts(get('INDEX', industry.l1IndexCode, 'SW_INDEX_BAR')) });
+        const expectedWindows = window.windows.map((w) => ({ h: w.h, status: w.status, endDate: w.endDate,
+          maturedAt: w.endDate !== null && (w.status === 'OK' || w.status === 'INDEX_GAP') ? instant(`${w.endDate}T15:00:00+08:00`) : null }));
+        if (canonicalSha256(expectedWindows) !== canonicalSha256(l.windows) ||
+            window.windows.some((w) => w.excessReturn !== (w.h === 1 ? m.h1Excess : w.h === 5 ? m.h5Excess : m.h20Excess)) ||
+            window.invalidation.downTriggered !== m.invalidationDown || window.invalidation.upTriggered !== m.invalidationUp) {
+          throw new ReferenceVersionError('REFERENCE_WINDOW_UNBOUND', l.eventId);
+        }
+        checkedEvents.set(l.eventId, memberHash);
+      }
+      if (l.windows.length !== 3 || new Set(l.windows.map((w) => w.h)).size !== 3) {
+        throw new ReferenceVersionError('REFERENCE_MATURITY_MISSING', l.eventId);
+      }
+      for (const h of [1, 5, 20] as const) {
+        const w = l.windows.find((x) => x.h === h);
+        const value = h === 1 ? m.h1Excess : h === 5 ? m.h5Excess : m.h20Excess;
+        if (w === undefined || (value !== null && (w.status !== 'OK' || w.maturedAt === null || w.endDate === null))) {
+          throw new ReferenceVersionError('REFERENCE_MATURITY_MISSING', `${l.eventId}/${h}`);
+        }
+        if (w.maturedAt !== null) {
+          const expected = instant(`${w.endDate}T15:00:00+08:00`);
+          if (instant(w.maturedAt) !== expected || expected > materializedAt || expected <= instant(m.eventTime)) {
+            throw new ReferenceVersionError('REFERENCE_MATURITY_INVALID', `${l.eventId}/${h}`);
+          }
+          maturities.push(expected);
+        }
+      }
+    }
+  }
+  const refs = inputFacts.map((f) => ({ factId: f.factId, artifactSha256: f.artifactSha256,
+    factHash: canonicalSha256(f), availableAt: instant(f.availableAt), firstObservedAt: instant(f.firstObservedAt) }))
+    .sort((a, b) => a.factId.localeCompare(b.factId));
+  const actualAvailable = refs.map((r) => r.availableAt).sort().at(-1) ?? null;
+  if ((buildIdentity.inputAvailableAtMax === null ? null : instant(buildIdentity.inputAvailableAtMax)) !== actualAvailable) {
+    throw new ReferenceVersionError('REFERENCE_INPUT_BOUND_MISMATCH', '构建声明与实际输入最大可用时间不符');
+  }
+  const inputAvailableAtMax = actualAvailable ?? materializedAt;
+  const inputObservedAtMax = refs.map((r) => r.firstObservedAt).sort().at(-1) ?? materializedAt;
+  if (inputAvailableAtMax > materializedAt || inputObservedAtMax > materializedAt) {
+    throw new ReferenceVersionError('REFERENCE_INPUT_AFTER_BUILD', materializedAt);
+  }
+  return { schemaVersion: 1, buildIdentity: structuredClone(buildIdentity), materializedAt, inputAvailableAtMax, inputObservedAtMax,
+    maturityAtMax: maturities.sort().at(-1) ?? materializedAt,
+    groups: structuredClone(blocks).sort((a, b) => a.groupKey.localeCompare(b.groupKey)), inputFacts: refs };
 }
 
-export async function loadGroupLibraryRows(pool: Pool): Promise<GroupLibraryRow[]> {
-  const res = await pool.query(
-    'select group_key, path, sample_count, base_ratio, stats, nested_declaration, created_at from reference_group_library order by group_key asc',
+/** 追加一个完整版本；冲突只允许相同内容，不覆盖/删除任何旧群组。published_at 由 DB 生成。 */
+export async function saveGroupStats(pool: Pool, blocks: GroupStatBlock[], inputFacts: readonly TimePointFact[] = [], buildIdentity = blocks[0]?.versionBinding): Promise<number> {
+  const payload = referenceVersionPayload(blocks, inputFacts, buildIdentity);
+  const contentHash = canonicalSha256(payload);
+  const versionId = `rl-${contentHash}`;
+  const result = await pool.query(
+    `insert into reference_library_versions
+      (version_id, content_hash, payload, materialized_at, input_available_at_max, input_observed_at_max, maturity_at_max)
+     values ($1,$2,$3::jsonb,$4,$5,$6,$7) on conflict (version_id) do nothing`,
+    [versionId, contentHash, canonicalJsonString(payload), payload.materializedAt,
+      payload.inputAvailableAtMax, payload.inputObservedAtMax, payload.maturityAtMax],
   );
-  return res.rows as GroupLibraryRow[];
+  if (result.rowCount === 0) {
+    const row = await pool.query('select content_hash, payload from reference_library_versions where version_id=$1', [versionId]);
+    if (row.rows[0]?.content_hash !== contentHash || canonicalSha256(row.rows[0]?.payload) !== contentHash) {
+      throw new ReferenceVersionError('REFERENCE_VERSION_CONFLICT', versionId);
+    }
+  }
+  return blocks.length;
+}
+
+/** 研究截点可见的最后一次完整发布；不从旧可变表降级读取，不混合不同构建的群组。 */
+export async function loadReferenceVersion(pool: Pool, cutoff: string): Promise<ReferenceVersion | null> {
+  const at = instant(cutoff);
+  const res = await pool.query(
+    `select version_id, content_hash, payload, published_at from reference_library_versions
+     where published_at <= $1 and materialized_at <= $1 and input_available_at_max <= $1
+       and input_observed_at_max <= $1 and maturity_at_max <= $1
+     order by published_at desc, version_id desc limit 1`, [at],
+  );
+  const row = res.rows[0];
+  if (row === undefined) return null;
+  const payload = row.payload as ReferenceVersionPayload;
+  const hash = canonicalSha256(payload);
+  if (hash !== row.content_hash || row.version_id !== `rl-${hash}` || payload.schemaVersion !== 1 || new Date(row.published_at).toISOString() > at ||
+      [payload.materializedAt, payload.inputAvailableAtMax, payload.inputObservedAtMax, payload.maturityAtMax].some((t) => instant(t) > at)) {
+    throw new ReferenceVersionError('REFERENCE_VERSION_CORRUPT', String(row.version_id));
+  }
+  return { versionId: String(row.version_id), contentHash: hash, publishedAt: new Date(row.published_at).toISOString(), payload };
+}
+
+export async function loadGroupLibraryRows(pool: Pool, cutoff: string): Promise<GroupStatBlock[]> {
+  return (await loadReferenceVersion(pool, cutoff))?.payload.groups ?? [];
 }

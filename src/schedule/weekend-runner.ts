@@ -198,21 +198,24 @@ export async function runWeekend(
     }
     const coreBefore = canonicalJsonString(researchCoreOf(existing));
     let outcome: SettleOutcome | EtfSettleOutcome;
-    if (c.subjectKind === 'STOCK') {
+    if (existing.businessKey.subjectKind === 'STOCK') {
       // 上面 validDispositions(STOCK) 已含跨类拒绝；收窄到个股结算空间后交 W13。
       outcome = await settleConclusion(factPool, {
-        subject: c.subject,
-        disposition: c.disposition as 'RESEARCH_OUTPERFORM' | 'RESEARCH_UNDERPERFORM' | 'ABSTAIN',
+        subject: existing.businessKey.subject,
+        disposition: existing.disposition as 'RESEARCH_OUTPERFORM' | 'RESEARCH_UNDERPERFORM' | 'ABSTAIN',
         conclusionTime: c.conclusionTime,
-        cutoff: c.cutoff,
+        benchmark: existing.evidence.benchmark,
+        cutoff: existing.businessKey.cutoff,
         ...asOfField,
         ...(opts.window === undefined ? {} : { window: opts.window }),
       });
     } else {
       outcome = await settleEtfConclusion(factPool, {
-        subject: c.subject,
-        disposition: c.disposition as 'RESEARCH_UP' | 'RESEARCH_DOWN' | 'ABSTAIN',
+        subject: existing.businessKey.subject,
+        disposition: existing.disposition as 'RESEARCH_UP' | 'RESEARCH_DOWN' | 'ABSTAIN',
+        cutoff: existing.businessKey.cutoff,
         conclusionTime: c.conclusionTime,
+        benchmark: existing.evidence.benchmark,
         ...asOfField,
         ...(opts.window === undefined ? {} : { window: opts.window }),
       });

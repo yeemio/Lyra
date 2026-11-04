@@ -6,7 +6,7 @@
  * 输入：public 生产库（lyra-pg 127.0.0.1:5433）——时点事实**只读**
  * （DAILY_BAR / ADJUST_FACTOR / INDUSTRY_CLASS_VERSION(sw@p1) / SW_INDEX_BAR 含 801020 全史），
  * 事件实例表 `events`（W14 拥有，本 CLI 只读消费，不建不改）。
- * 输出：群组统计落库 reference_group_library（自有新表，src/db/reference-migration.sql）+
+ * 输出：群组完整版本追加 reference_library_versions（src/db/reference-migration.sql，旧表只审计）+
  * data/reference-library-summary.json。
  *
  * events 表未就绪（W14 并行在建）→ 按派发如实 BLOCKED（退出码 3）并给出续跑命令，
@@ -26,7 +26,8 @@ import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Pool } from 'pg';
-import { asOfFacts } from '../pintime/facts.js';
+import type { TimePointFact } from '../contracts.js';
+import { asOfFacts, loadFact } from '../pintime/facts.js';
 import { createPool } from '../db/pool.js';
 import {
   DEFAULT_MIN_GROUP_SAMPLE,
@@ -56,7 +57,7 @@ const repoRoot = fileURLToPath(new URL('../../', import.meta.url));
 const SUMMARY_PATH = join(repoRoot, 'data', 'reference-library-summary.json');
 const SW_ADAPTER = 'sw@p1';
 const HS300_INDEX_CODE = '000300';
-const METHOD_VERSION = 'reference-library@w15.1'; // R25.1 消费口径变化（剔除回购进展）→ 版本轴提升
+const METHOD_VERSION = 'reference-library@pit-v2'; // PR1：输入/成员/成熟窗口/发布时间绑定，旧版本和冻结参数不改
 
 /** events 表列映射候选（W14 契约列名未定稿，弹性映射；失败即 BLOCKED 不猜）。 */
 const COLUMN_CANDIDATES = {
@@ -67,6 +68,8 @@ const COLUMN_CANDIDATES = {
 } as const;
 
 interface EventRow {
+  eventId: string;
+  evidenceFactId: string;
   subject: string;
   eventType: string;
   subtype: string | null;
@@ -144,6 +147,9 @@ async function main(): Promise<void> {
     if (mapping === null) {
       return await blocked('EVENTS_COLUMNS_UNMAPPED', `events 列 ${JSON.stringify(columns)} 无法映射（W15 候选 ${JSON.stringify(COLUMN_CANDIDATES)}）。`);
     }
+    if (!columns.includes('event_id') || !columns.includes('evidence_fact_id')) {
+      return await blocked('EVENTS_LINEAGE_MISSING', '不可变群组发布需要 event_id 与 evidence_fact_id');
+    }
     const eventsRes = await pool.query<Record<string, unknown>>('select * from public.events');
     let events: EventRow[] = [];
     for (const row of eventsRes.rows) {
@@ -152,7 +158,9 @@ async function main(): Promise<void> {
       const eventTime = isoOf(row[mapping.eventTime]);
       const subtypeRaw = mapping.subtype === null ? null : row[mapping.subtype];
       if (typeof subject !== 'string' || subject.length === 0 || typeof eventType !== 'string' || eventType.length === 0 || eventTime === null) continue;
+      if (typeof row.event_id !== 'string' || typeof row.evidence_fact_id !== 'string') continue;
       events.push({
+        eventId: row.event_id, evidenceFactId: row.evidence_fact_id,
         subject,
         eventType,
         subtype: typeof subtypeRaw === 'string' && subtypeRaw.length > 0 ? subtypeRaw : null,
@@ -170,25 +178,36 @@ async function main(): Promise<void> {
       return true;
     });
     console.log(`[reference-build] R25.1 消费侧过滤：BUYBACK:PROGRESS_OR_CHANGE 剔除 ${excludedProgressCount} 例（存储层超集保留，不进参照库统计）。`);
-    if (events.length === 0) {
-      const excludedNote = excludedProgressCount > 0 ? `（R25.1 剔除进展子类 ${excludedProgressCount} 例）` : '';
-      return await blocked('EVENTS_TABLE_EMPTY', `events 表存在（列 ${JSON.stringify(columns)}）但过滤后无可统计事件行${excludedNote}——按缺口回传，不产出空比例。`);
-    }
+    // 零有效事件也发布可审计空版本；不让较早非空统计在新截点继续冒充本次结果。
 
     // ---- 时点事实加载（只读；构建时刻 as-of。行情窗口为事后统计非研究输入；R4 声明随 summary）----
     const materializedAt = new Date().toISOString();
-    const asOfNow = new Date();
+    const asOfNow = new Date(materializedAt);
+    events = events.filter((e) => Date.parse(e.eventTime) <= asOfNow.getTime());
+    const inputFacts = new Map<string, TimePointFact>();
+    const load = async (query: Parameters<typeof asOfFacts>[1]): Promise<TimePointFact[]> => {
+      const facts = await asOfFacts(pool, query);
+      for (const f of facts) inputFacts.set(f.factId, f);
+      return facts;
+    };
+    for (const e of events) {
+      const f = await loadFact(pool, e.evidenceFactId);
+      if (f === null || f.subjectType !== 'STOCK' || f.subjectId !== e.subject || Date.parse(f.availableAt) > asOfNow.getTime()) {
+        return await blocked('EVENT_EVIDENCE_UNBOUND', e.eventId);
+      }
+      inputFacts.set(f.factId, f);
+    }
     const subjects = [...new Set(events.map((e) => e.subject))].sort();
     const barsBySubject = new Map<string, DailyBarInput[]>();
     const factorsBySubject = new Map<string, AdjustFactorInput[]>();
     const icvBySubject = new Map<string, Parameters<typeof industryAsOf>[0]>();
     for (const code of subjects) {
-      barsBySubject.set(code, dailyBarsFromFacts(await asOfFacts(pool, { subjectType: 'STOCK', subjectId: code, factKind: 'DAILY_BAR', asOf: asOfNow })));
-      factorsBySubject.set(code, adjustFactorsFromFacts(await asOfFacts(pool, { subjectType: 'STOCK', subjectId: code, factKind: 'ADJUST_FACTOR', asOf: asOfNow })));
+      barsBySubject.set(code, dailyBarsFromFacts(await load({ subjectType: 'STOCK', subjectId: code, factKind: 'DAILY_BAR', asOf: asOfNow })));
+      factorsBySubject.set(code, adjustFactorsFromFacts(await load({ subjectType: 'STOCK', subjectId: code, factKind: 'ADJUST_FACTOR', asOf: asOfNow })));
       icvBySubject.set(
         code,
-        (await asOfFacts(pool, { subjectType: 'STOCK', subjectId: code, factKind: 'INDUSTRY_CLASS_VERSION', asOf: asOfNow }))
-          .filter((f) => f.adapterVersion === SW_ADAPTER), // csrc@current 快照行排除（非申万轴）
+        (await load({ subjectType: 'STOCK', subjectId: code, factKind: 'INDUSTRY_CLASS_VERSION', asOf: asOfNow }))
+          .filter((f) => f.adapterVersion.startsWith('sw@')), // csrc@current 快照行排除（非申万轴）
       );
     }
 
@@ -200,9 +219,9 @@ async function main(): Promise<void> {
     )].sort();
     const indexBarsByCode = new Map<string, IndexBarInput[]>();
     for (const code of indexCodes) {
-      indexBarsByCode.set(code, swIndexBarsFromFacts(await asOfFacts(pool, { subjectType: 'INDEX', subjectId: code, factKind: 'SW_INDEX_BAR', asOf: asOfNow })));
+      indexBarsByCode.set(code, swIndexBarsFromFacts(await load({ subjectType: 'INDEX', subjectId: code, factKind: 'SW_INDEX_BAR', asOf: asOfNow })));
     }
-    const hs300Bars = dailyBarsFromFacts(await asOfFacts(pool, { subjectType: 'INDEX', subjectId: HS300_INDEX_CODE, factKind: 'DAILY_BAR', asOf: asOfNow }));
+    const hs300Bars = dailyBarsFromFacts(await load({ subjectType: 'INDEX', subjectId: HS300_INDEX_CODE, factKind: 'DAILY_BAR', asOf: asOfNow }));
 
     // ---- 市值档分界（等分位预留默认，全库统一；总股本不可得 → 成交额代理 proxy=true）----
     const settledByEvent = new Map<number, DailyBarInput>();
@@ -245,6 +264,10 @@ async function main(): Promise<void> {
       });
       for (const g of win.dataGaps) gapCounter.set(g, (gapCounter.get(g) ?? 0) + 1);
       samples.push({
+        lineage: { eventId: e.eventId, evidenceFactId: e.evidenceFactId,
+          windows: win.windows.map((w) => ({ h: w.h, status: w.status, endDate: w.endDate,
+            maturedAt: w.endDate !== null && (w.status === 'OK' || w.status === 'INDEX_GAP')
+              ? new Date(`${w.endDate}T15:00:00+08:00`).toISOString() : null })) },
         subject: e.subject,
         eventTime: e.eventTime,
         eventKey: eventKeyOf(e.eventType, e.subtype),
@@ -261,26 +284,20 @@ async function main(): Promise<void> {
     }
 
     // ---- 群组库构建 + 落库 + summary ----
+    const inputAvailableAtMax = [...inputFacts.values()].map((f) => f.availableAt).sort().at(-1) ?? null;
     const lib = buildGroupLibrary(samples, {
       minGroupSample: DEFAULT_MIN_GROUP_SAMPLE,
       methodVersion: METHOD_VERSION,
       adapterVersion: `${SW_ADAPTER};baostock@0.9.40-p1`,
-      inputAvailableAtMax: materializedAt,
+      inputAvailableAtMax,
       materializedAt,
     });
     await applyReferenceMigration(pool);
-    const saved = await saveGroupStats(pool, lib.groups);
-    // 全量重建语义 = 库与本次构建一致。saveGroupStats 为 upsert 不删旧行；R25.1 过滤使群组
-    // 集合收缩（进展块消失 + 分界重算致下限块跌破 MIN_GROUP_SAMPLE），须清除上一轮残留键。
-    const keptKeys = new Set(lib.groups.map((g) => g.groupKey));
-    const existingRows = await pool.query<{ group_key: string }>('select group_key from reference_group_library');
-    const prunedKeys = existingRows.rows.map((r) => r.group_key).filter((k) => !keptKeys.has(k)).sort();
-    for (const key of prunedKeys) {
-      await pool.query('delete from reference_group_library where group_key = $1', [key]);
-    }
-    if (prunedKeys.length > 0) {
-      console.log(`[reference-build] 残留键清理：清除上一轮构建残留的 ${prunedKeys.length} 个过期群组键：${prunedKeys.join(', ')}`);
-    }
+    const saved = await saveGroupStats(pool, lib.groups, [...inputFacts.values()], {
+      methodVersion: METHOD_VERSION, adapterVersion: `${SW_ADAPTER};baostock@0.9.40-p1`, inputAvailableAtMax, materializedAt,
+    });
+    // 旧版本及成员永不删除；本版本缺席的群组不影响旧截点读取。
+    const prunedKeys: string[] = [];
 
     const eventsByType = new Map<string, number>();
     for (const e of events) {
@@ -316,7 +333,7 @@ async function main(): Promise<void> {
       versionBinding: {
         methodVersion: METHOD_VERSION,
         adapterVersion: `${SW_ADAPTER};baostock@0.9.40-p1`,
-        inputAvailableAtMax: materializedAt,
+        inputAvailableAtMax,
         materializedAt,
       },
       summaryPath: SUMMARY_PATH,

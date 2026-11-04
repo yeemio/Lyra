@@ -1,3 +1,4 @@
+import { validateFrozenBenchmark } from '../conclusion/benchmark.js';
 /**
  * Lyra · 研究报告视图与纯文本渲染（P2 W11: code-writer-pro）。
  * 合同：docs/specs/P2-RESEARCH.md Done-when 4——结论对象扩展研究报告视图
@@ -226,6 +227,13 @@ export function renderReportText(view: ReportView): string {
     `标的：${c.businessKey.subjectKind} ${c.businessKey.subject} · 研究类型 ${c.businessKey.researchKind} · 资料截点 ${c.businessKey.cutoff}`,
   );
   out.push(`最终决定（J 裁决后）：${c.disposition} · adoption=${String(c.adoption)}（恒 false）`);
+  if (c.evidence.benchmark === undefined) {
+    out.push('冻结基准：BENCHMARK_NOT_FROZEN（旧结论缺身份，不能从当前库或池补猜）');
+  } else {
+    const b = validateFrozenBenchmark(c.evidence.benchmark, c.businessKey);
+    out.push(`冻结基准：${b.indexCode ?? '缺'} · ${b.status} · ${b.mapping.version} · hash=${b.bindingHash}`);
+    out.push(`归属事实：${b.attributionFact?.factId ?? (b.subjectKind === 'BROAD_ETF' ? '不适用（ETF 映射原件随冻结身份保存）' : '缺历史归属')} · 截点=${b.cutoff}${b.reason === null ? '' : ` · 缺口=${b.reason}`}`);
+  }
   if (c.inheritance !== null) {
     out.push(`继承来源：${c.inheritance.fromConclusionId}（hash ${c.inheritance.fromConclusionHash.slice(0, 16)}…）`);
   } else if (c.standaloneNote !== null) {

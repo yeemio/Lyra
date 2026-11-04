@@ -1,3 +1,4 @@
+import { testEtfMapping } from '../research/inputs-pit-test-helper.js';
 import { syntheticConclusionInput } from '../research/research-test-helper.js';
 /**
  * Lyra · 周末复盘真实接线单测（P3 W20: code-writer-pro）。
@@ -21,7 +22,8 @@ import type { ConclusionObject, Disposition, SubjectKind } from '../contracts.js
 import { applySchema, dropSchema } from '../db/exec.js';
 import { persistConclusion, readConclusion } from '../db/conclusion.js';
 import { createPool } from '../db/pool.js';
-import { insertFact } from '../pintime/facts.js';
+import { freezeBenchmark } from '../conclusion/benchmark.js';
+import { asOfFacts, insertFact } from '../pintime/facts.js';
 import { runWeekend, type DueConclusionView } from './weekend-runner.js';
 import type { WeekendProcessMetrics } from './weekend.js';
 
@@ -57,9 +59,11 @@ interface FixtureInput {
 
 /** 直接构造 simulated A/J（夹具构造路径，不经 runModelCall、零 permit）→ persistConclusion。 */
 async function fixtureConclusion(input: FixtureInput): Promise<ConclusionObject> {
+  const facts = input.subjectKind === 'STOCK' ? await asOfFacts(input.subject === '600201' ? isolated : admin, { subjectType: 'STOCK', subjectId: input.subject, factKind: 'INDUSTRY_CLASS_VERSION', asOf: new Date(input.cutoff) }) : [];
+  const benchmark = freezeBenchmark({ ...input, facts, ...(input.subjectKind === 'BROAD_ETF' ? { etfMapping: testEtfMapping(input.subject, '测试冻结映射(000016)') } : {}) });
   return persistConclusion(isolated, syntheticConclusionInput(
     { subjectKind: input.subjectKind, subject: input.subject, researchKind: 'WEEKLY', cutoff: input.cutoff },
-    { methodVersion: 'method@p2-v1', adapterVersion: 'data@p1', planAuthVersion: 'pa-w20-weekend-test' }));
+    { methodVersion: 'method@p2-v1', adapterVersion: 'data@p1', planAuthVersion: 'pa-w20-weekend-test' }, benchmark));
 }
 
 function dueView(c: ConclusionObject, conclusionTime: string): DueConclusionView {

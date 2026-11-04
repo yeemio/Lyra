@@ -4,6 +4,7 @@ import { KernelError, type AOutput, type JOutput, type ModelCallContract, type P
 import { validateAOutputShape, validateJOutputShape } from '../kernel/sol-transport.js';
 import { deriveChecklist, type DimensionCoveragePkg } from './checklist.js';
 import { renderInputLayers, type ResearchInputPackage } from './inputs.js';
+import { validateFrozenBenchmark } from '../conclusion/benchmark.js';
 
 function reject(code: string, detail: string): never { throw new KernelError(code, detail); }
 
@@ -31,6 +32,20 @@ export function deliveredEvidence(pkg: ResearchInputPackage): Set<string> {
         seal.cutoff !== pkg.cutoff || seal.methodVersion !== pkg.versions.methodVersion ||
         seal.adapterVersion !== pkg.versions.adapterVersion || seal.planAuthVersion !== pkg.versions.planAuthVersion) {
       reject('RESEARCH_INPUT_UNBOUND', '封存与送达包身份不符');
+    }
+  }
+  if (pkg.packageVersion >= 2 || pkg.benchmark !== undefined) {
+    const benchmark = validateFrozenBenchmark(pkg.benchmark, pkg.businessKey);
+    const material = pkg.materials.find((m) => m.materialId === 'mat:0:frozen-benchmark');
+    if (material?.kind !== 'RECORDS' || canonicalJsonString(material.records) !== canonicalJsonString([benchmark]) ||
+        !pkg.layers.l0.blocks.some((b) => b.materialId === material.materialId)) {
+      reject('BENCHMARK_NOT_DELIVERED', '基准身份必须以相同内容实际送达不可裁剪 L0');
+    }
+    const fact = benchmark.attributionFact;
+    if (fact !== null && (!pkg.seals[0]?.factIds.includes(fact.factId) ||
+        !pkg.seals[0]?.artifactRefs.some((r) => r.sha256 === fact.artifactSha256) ||
+        !material.factIds.includes(fact.factId))) {
+      reject('BENCHMARK_FACT_NOT_SEALED', fact.factId);
     }
   }
   const indexes = pkg.materials.filter((m) => m.kind === 'INDEX');

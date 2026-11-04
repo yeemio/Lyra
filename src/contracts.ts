@@ -1,3 +1,4 @@
+import type { FrozenBenchmark } from './conclusion/benchmark.js';
 /**
  * Lyra · 共享契约（P0，总控冻结 2026-10-25）。
  * 唯一共享类型源；实现模块只 import、不重复定义。字段出处：
@@ -208,6 +209,8 @@ export interface ConclusionEvidence {
   manifestHash: string;
   /** 新结论绑定实际输入及 A/清单/J 原文 CAS；旧结论缺失时不得声明已送达继承。 */
   researchTraceSha256?: string;
+  /** 新研究实际使用的基准快照；旧对象缺失时不可按当前库补写。 */
+  benchmark?: FrozenBenchmark;
 }
 
 export interface SettlementZone {

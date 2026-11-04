@@ -223,8 +223,8 @@ test('个股组装：八维 coverage、时点纪律、封存复用、程序校�
   assert.equal(canonicalJsonString(readBack), canonicalJsonString(pkg));
   assert.equal(inputBytes, artifactRef.bytes);
 
-  // 封存复用：两个 seal（标的 + 行业基准），业务键同为 WEEKLY
-  assert.equal(pkg.seals.length, 2);
+  // 封存复用：标的 + 行业基准 + 估值截面精确输入，业务键同为 WEEKLY
+  assert.equal(pkg.seals.length, 3);
   assert.equal(pkg.seals[0]?.businessKey.researchKind, 'WEEKLY');
   assert.equal(pkg.seals[0]?.businessKey.subject, '600519');
 
@@ -277,11 +277,11 @@ test('个股组装：八维 coverage、时点纪律、封存复用、程序校�
     assert.deepEqual(d4.records.map((r) => String(r.title)), ['关于控股股东部分股份解除质押的公告']);
   }
 
-  // D6：2014 体系归属（pre2014 已过期被跳过；证监会轴不参与申万基准）
+  // D6：2014 铸造行按 2021 读取窗口解释（pre2014 已过期；证监会轴不参与）
   const d6 = pkg.materials.find((m) => m.materialId === 'mat:6:industry-attribution');
   assert.ok(d6 && d6.kind === 'RECORDS');
   if (d6.kind === 'RECORDS') {
-    assert.equal((d6.records[0] as Record<string, unknown>)['体系'], '2014');
+    assert.equal((d6.records[0] as Record<string, unknown>)['体系'], '2021');
     assert.equal((d6.records[0] as Record<string, unknown>)['l1IndexCode'], '801120');
   }
 
@@ -339,16 +339,20 @@ test('L1 预算压力：超层预算材料降级并标记，不静默截断；L2
     const demotedInIndex = new Set(indexForDemoted.content.demotedMaterials.map((e) => e.materialId));
     for (const id of demoted) assert.equal(demotedInIndex.has(id), true, `降级材料 ${id} 应在 L2 降级目录`);
   }
-  // 降级材料的 factIds 不进送达引用目录
+  // 目录只能指向实际送达的材料/层；同一事实可由 L0 基准等另一材料送达。
   const index = pkg.materials.find((m) => m.kind === 'INDEX');
   assert.ok(index && index.kind === 'INDEX');
   if (index.kind === 'INDEX') {
+    const delivered = new Map([
+      ...pkg.layers.l0.blocks.map((b) => [b.materialId, 'L0'] as const),
+      ...pkg.layers.l1.blocks.map((b) => [b.materialId, 'L1'] as const),
+    ]);
+    const expectedFacts = new Set(pkg.materials.filter((m) => delivered.has(m.materialId)).flatMap((m) => m.factIds));
     const indexed = new Set(index.content.deliveredFacts.map((e) => e.factId));
-    for (const id of demoted) {
-      const material = pkg.materials.find((m) => m.materialId === id);
-      for (const factId of material?.factIds ?? []) {
-        assert.equal(indexed.has(factId), false, `降级材料 ${id} 的 ${factId} 不得出现在送达目录`);
-      }
+    assert.deepEqual(indexed, expectedFacts, '目录事实集必须恰等于实际送达材料的事实集');
+    for (const entry of index.content.deliveredFacts) {
+      assert.equal(delivered.get(entry.materialId), entry.layer, `目录不得声称降级材料 ${entry.materialId} 已送达`);
+      assert.ok(pkg.materials.find((m) => m.materialId === entry.materialId)?.factIds.includes(entry.factId));
     }
   }
   // 降级包仍能通过程序校验（coverage 与层一致）
@@ -376,6 +380,7 @@ test('ETF 组装：七维映射、跟踪指数材料、缺口声明、程序校�
   const { package: pkg } = await assembleResearchInput(pool, store, etfOpts());
   assert.deepEqual(pkg.dimensions.map((d) => d.dimension), [1, 2, 3, 4, 5, 6, 7]);
   assert.equal(pkg.seals.length, 2); // ETF + INDEX/000300
+  assert.equal(pkg.benchmark?.status, 'CURRENT_PROXY'); // 当前池在2022截点没有历史观察证明
   assert.equal(pkg.seals[1]?.businessKey.subject, '510300'); // 同业务键（selector 不同）
   const e5etf = pkg.materials.find((m) => m.materialId === 'mat:5:etf-bar-table');
   const e5idx = pkg.materials.find((m) => m.materialId === 'mat:5:tracking-index-bar-table');

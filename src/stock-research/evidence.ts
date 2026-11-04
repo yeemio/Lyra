@@ -31,6 +31,7 @@ import type { Pool } from 'pg';
 import { canonicalSha256 } from '../canonical.js';
 import type { TimePointFact } from '../contracts.js';
 import { asOfFacts } from '../pintime/facts.js';
+import { freezeBenchmark } from '../conclusion/benchmark.js';
 import { pickSwIndustryAt } from '../research/inputs.js';
 import { barsToTable, type BarTableMetaRow } from '../research/tables.js';
 import { loadReportMaterials, bindResearchPlan } from './materials.js';
@@ -57,7 +58,7 @@ export const ANNOUNCEMENT_ROWS = 60;
 export const FALLBACK_BENCHMARK_INDEX = '000300';
 
 /** 金融口径钩子：申万一级为银行/非银金融时 coverage 标注。 */
-const FINANCIAL_SW_L1 = new Set(['银行', '非银金融']);
+const FINANCIAL_SW_L1 = new Set(['801780', '801790']);
 
 /** 常见 BaoStock bsIndex 代码 → 展示名（缺省原样）。 */
 const BS_INDEX_NAMES: Record<string, string> = {
@@ -255,7 +256,7 @@ async function swL1NameOf(pool: Pool, l1IndexCode: string, asOf: Date): Promise<
     factKind: 'SW_INDEX_LIST',
     asOf,
   });
-  for (const f of facts) {
+  for (const f of [...facts].reverse()) {
     const rows = tvOf(f).rows;
     if (!Array.isArray(rows)) continue;
     for (const r of rows) {
@@ -277,9 +278,6 @@ export async function buildEvidencePack(dataPool: Pool, opts: BuildEvidenceOptio
   if (Number.isNaN(cutoffDate.getTime())) {
     throw new EvidenceError('INVALID_CUTOFF', opts.cutoff);
   }
-  const poolFile = await readPoolFile(DEFAULT_POOL_FILE);
-  const poolEntry = poolFile.stocks.find((s) => s.code === opts.subject) ?? null;
-  const poolSwL1Name = poolEntry?.swL1Name ?? null;
   const gaps: string[] = ['无一致预期数据（卖方盈利预测/目标价未入库）'];
 
   const loadStock = (factKind: string): Promise<TimePointFact[]> =>
@@ -298,10 +296,11 @@ export async function buildEvidencePack(dataPool: Pool, opts: BuildEvidenceOptio
 
   // 申万归属先行解析（金融口径钩子与基准选择共用）。
   const sw = pickSwIndustryAt(industryFacts, cutoffDate);
-  const l1IndexCode = sw?.l1IndexCode ?? poolEntry?.swL1IndexCode ?? null;
-  const swL1Name =
-    poolSwL1Name ?? (l1IndexCode === null ? null : await swL1NameOf(dataPool, l1IndexCode, cutoffDate));
-  const financialScope = swL1Name !== null && FINANCIAL_SW_L1.has(swL1Name);
+  const benchmark = freezeBenchmark({ subjectKind: 'STOCK', subject: opts.subject, cutoff: opts.cutoff, facts: industryFacts });
+  const l1IndexCode = benchmark.indexCode;
+  const swL1Name = l1IndexCode === null ? null : await swL1NameOf(dataPool, l1IndexCode, cutoffDate);
+  const financialScope = l1IndexCode !== null && FINANCIAL_SW_L1.has(l1IndexCode);
+  if (benchmark.status !== 'RESOLVED') gaps.push(`${benchmark.reason}：不以当前研究池归属回填历史`);
 
   const tables: EvidenceTable[] = [];
 
@@ -358,7 +357,7 @@ export async function buildEvidencePack(dataPool: Pool, opts: BuildEvidenceOptio
     'FINANCIAL(bsQuery=profit/growth) 按 statDate 合并（同期多版本取 as-of 可见最新）；' +
     `BALANCE 按同报告期连接（${balanceCovered}/${finPeriods.length} 期覆盖）；` +
     '金额单位元（BaoStock 原值字符串）；netProfit=来源净利润，不得改称归母或扣非；MBRevenue=来源收入字段，未核实公司/期次不得改称营业收入或营业总收入（已核实对照另列）；YOYPNI=归母净利润同比小数比例，百分数需×100；扣非累计及同比均缺失；' +
-    (financialScope ? `金融口径：申万一级「${poolSwL1Name ?? ''}」财务结构与一般制造业不可直接比较。` : '');
+    (financialScope ? `金融口径：申万一级「${swL1Name ?? l1IndexCode ?? '未知'}」财务结构与一般制造业不可直接比较。` : '');
   tables.push({
     tableId: 'fin-quarterly',
     title: `季频财务（近 ${finPeriods.length} 个报告期，含 pubDate/noticeDate）`,
@@ -489,9 +488,11 @@ export async function buildEvidencePack(dataPool: Pool, opts: BuildEvidenceOptio
   }
   const basicTv = basicFacts.length > 0 ? tvOf(basicFacts[basicFacts.length - 1] as TimePointFact) : null;
   const industryRows: (string | number | null)[][] = [
-    ['申万分类体系', sw === null ? null : sw.system, sw === null ? '无 as-of 可见申万归属（INDUSTRY_CLASS_VERSION）' : 'INDUSTRY_CLASS_VERSION 区间有效版本（体系序最末）'],
+    ['冻结基准身份哈希', benchmark.bindingHash, `${benchmark.status} / ${benchmark.mapping.version}`],
+    ['冻结归属事实', benchmark.attributionFact?.factId ?? null, benchmark.reason],
+    ['申万分类体系', sw === null ? null : sw.system, sw === null ? '无 as-of 可见申万归属（INDUSTRY_CLASS_VERSION）' : 'INDUSTRY_CLASS_VERSION 区间有效版本（读取窗口体系）'],
     ['申万一级行业指数代码', l1IndexCode, sw !== null && sw.l1IndexCode === null ? '有效归属无 l1IndexCode' : '申万 L1 指数（801xxx）'],
-    ['申万一级行业名称', swL1Name, l1IndexCode === null ? '——' : '研究池当前快照 / SW_INDEX_LIST'],
+    ['申万一级行业名称', swL1Name, l1IndexCode === null ? '——' : 'as-of SW_INDEX_LIST；缺名称不使用当前池名称'],
     ['申万行业代码（typedValue）', swTv === null ? null : cell(swTv['行业代码']), '来源原生 SW 二级行业代码'],
     ['申万计入日期', swTv === null ? null : cell(swTv['计入日期ISO']), '该归属生效（计入）日期'],
     ['证监会行业（as-of 可见）', csrc === null ? null : cell(tvOf(csrc).industry), 'INDUSTRY_CLASS_VERSION 证监会轴'],
@@ -566,7 +567,7 @@ export async function buildEvidencePack(dataPool: Pool, opts: BuildEvidenceOptio
     const benchTable = barsToTable(benchSorted);
     tables.push({
       tableId: 'index-bars',
-      title: `基准指数行情（${benchCode}${swL1Name === null ? '' : '·' + swL1Name}，最近 ${benchSorted.length} 个交易日）`,
+      title: `基准指数行情（${benchCode}${benchKind === 'SW_INDEX_BAR' ? swL1Name === null ? '' : '·' + swL1Name : '·沪深300市场代理，非行业基准'}，最近 ${benchSorted.length} 个交易日）`,
       columns: benchTable.header,
       rows: benchTable.rows,
       unitNote:
@@ -678,6 +679,10 @@ export async function buildEvidencePack(dataPool: Pool, opts: BuildEvidenceOptio
     taskId: opts.taskId,
     subject: opts.subject,
     cutoff: opts.cutoff,
+    benchmark,
+    comparisonBenchmark: { kind: benchKind === 'SW_INDEX_BAR' ? 'INDUSTRY' as const : benchCode === null ? 'MISSING' as const : 'MARKET_PROXY' as const,
+      indexCode: benchCode, industryBindingHash: benchmark.bindingHash, note: benchFallbackNote,
+      factIds: benchFacts.map((f) => f.factId), artifactHashes: [...new Set(benchFacts.map((f) => f.artifactSha256))].sort() },
     builtAt,
     tables,
     coverage,

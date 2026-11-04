@@ -1,3 +1,4 @@
+import type { FrozenBenchmark } from '../conclusion/benchmark.js';
 /**
  * Lyra · 单股研究报告产品（sr 空间）共享契约。R31，2026-10-26。
  * 依据：TASK-PACKAGE §4/§5、docs/REQUIREMENTS.md v3.0 §2–§7。
@@ -171,6 +172,9 @@ export interface EvidenceTable {
 }
 
 export interface EvidencePack {
+  benchmark?: FrozenBenchmark;
+  comparisonBenchmark?: { kind: 'INDUSTRY' | 'MARKET_PROXY' | 'MISSING'; indexCode: string | null;
+    industryBindingHash: string; note: string; factIds: string[]; artifactHashes: string[] };
   taskId: string;
   subject: string;
   cutoff: string;

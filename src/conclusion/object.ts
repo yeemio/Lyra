@@ -15,6 +15,7 @@
  *   5. settlement 初始 {state:'UNSETTLED'}；conclusionHash = canonicalSha256(除
  *      conclusionHash 外的研究字段)——settlement/createdAt 不属于研究字段，结算回填不改哈希。
  */
+import { validateFrozenBenchmark } from './benchmark.js';
 import { canonicalSha256 } from '../canonical.js';
 import {
   validDispositions,
@@ -234,6 +235,7 @@ export function buildConclusionObject(input: ConclusionInput): ConclusionObject 
     disposition,
     adoption: false, // 恒 false（类型层面字面量；此处构造唯一来源）
     evidence: {
+      benchmark: validateFrozenBenchmark(pkg.benchmark, businessKey),
       aOutputHash,
       checklistHash: input.checklist.checklistHash,
       jOutputHash: canonicalSha256(input.jOutput),

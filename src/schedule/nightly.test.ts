@@ -21,7 +21,8 @@ import { applySchema, dropSchema } from '../db/exec.js';
 import { createPool } from '../db/pool.js';
 import { persistConclusion, readConclusion } from '../db/conclusion.js';
 import { readExecutorLock } from '../kernel/lock.js';
-import { insertFact } from '../pintime/facts.js';
+import { freezeBenchmark } from '../conclusion/benchmark.js';
+import { asOfFacts, insertFact } from '../pintime/facts.js';
 import { validatePostEventContext } from '../research/inheritance.js';
 import type { ResearchTrace } from '../research/validation.js';
 import { runNightly, SKELETON_PLAN_AUTH_VERSION, type NightlyEntryResult } from './nightly.js';
@@ -314,9 +315,11 @@ test('commit（transport=real）：P5_PROTOCOL_FROZEN，在计划/准入/permit 
 
 test('settle-due：到期结论结算回填（SETTLED），新结论未到期不预测性回填', async () => {
   // 600101 老结论：四周前周一 12:00+08 完成，次日参考价，20 个交易日窗口到本周一走完。
+  const fixtureKey = { subjectKind: 'STOCK' as const, subject: '600101', researchKind: 'WEEKLY' as const, cutoff: `${fixtureDay(-28)}T02:00:00.000Z` };
+  const benchmark = freezeBenchmark({ ...fixtureKey, facts: await asOfFacts(pool, { subjectType: 'STOCK', subjectId: '600101', factKind: 'INDUSTRY_CLASS_VERSION', asOf: new Date(fixtureKey.cutoff) }) });
   const fixture = await persistConclusion(pool, syntheticConclusionInput(
-    { subjectKind: 'STOCK', subject: '600101', researchKind: 'WEEKLY', cutoff: `${fixtureDay(-28)}T02:00:00.000Z` },
-    { methodVersion: 'method@p2-v1', adapterVersion: 'data@p1', planAuthVersion: 'pa-w27-settle-test' }));
+    fixtureKey,
+    { methodVersion: 'method@p2-v1', adapterVersion: 'data@p1', planAuthVersion: 'pa-w27-settle-test' }, benchmark));
   await pool.query('update conclusion set created_at = $1 where conclusion_id = $2', [`${fixtureDay(-28)}T04:00:00Z`, fixture.conclusionId]);
 
   const out = await runNightly(deps(), {
