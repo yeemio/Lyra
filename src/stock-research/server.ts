@@ -30,11 +30,10 @@ import { getQuotaUsage, recordUsageEvent, refundQuota, reserveQuota } from './qu
 import {
   claimQueuedTask,
   createTask,
-  getChatThread,
+  findThreadForReport,
   getReportById,
   getTask,
-  listChatMessages,
-  listReportVersions,
+  listReportVersionSummaries,
   listSteps,
   listTasks,
   srBootRecovery,
@@ -45,6 +44,8 @@ import {
 import { askReportQuestion, classifyQuestion, runSrTask } from './engine.js';
 import { loadResearchPool, findSubject } from './evidence.js';
 import { renderReportPdf } from './pdf.js';
+import { loadReportMaterials, materialTables } from './report-artifacts.js';
+import { verifiedChatMessages } from './chat-evidence.js';
 import {
   renderAdminPage,
   renderDashboard,
@@ -367,66 +368,46 @@ const handleTaskPage: Handler = async (ctx) => {
   const task = await getTask(ctx.deps.srPool, taskId, auth.accountId);
   if (!task) return send(ctx.res, 404, renderErrorPage(404, '任务不存在或不属于当前账户。'));
   const steps = await listSteps(ctx.deps.srPool, taskId);
-  const reports = await listReportVersions(ctx.deps.srPool, taskId);
+  const reports = await listReportVersionSummaries(ctx.deps.srPool, taskId);
   send(ctx.res, 200, renderTaskPage({ task, steps, reports, account: { username: auth.username, role: auth.role, displayName: (await getAccount(ctx.deps.srPool, auth.accountId))?.displayName ?? auth.username } }));
 };
+
+export function parseReportVersion(value: unknown, required = false): number | undefined {
+  if ((value === null || value === undefined) && !required) return undefined;
+  if (typeof value !== 'string' || !/^[1-9][0-9]*$/.test(value) || !Number.isSafeInteger(Number(value)) || Number(value) > 2_147_483_647) {
+    throw new Error('REPORT_VERSION_INVALID');
+  }
+  return Number(value);
+}
 
 const handleReportPage: Handler = async (ctx) => {
   const auth = requireAuth(ctx);
   if (!auth) return;
   const reportId = ctx.url.pathname.split('/')[2] ?? '';
-  const vParam = Number(ctx.url.searchParams.get('v') ?? '0');
-  const report = await getReportById(ctx.deps.srPool, reportId, auth.accountId);
-  if (!report) return send(ctx.res, 404, renderErrorPage(404, '报告不存在或不属于当前账户。'));
-  const versions = await listReportVersions(ctx.deps.srPool, report.taskId);
-  const version = vParam > 0 ? versions.find((r) => r.version === vParam) ?? report : report;
-  // 证据/计算表从任务输出目录读回（与引擎同一来源）
-  const tablesById: Record<string, { title: string; columns: string[]; rows: (string | number | null)[][]; note: string | null }> = {};
-  const dir = join(ctx.deps.outputDir ?? SR_OUTPUT_DIR, 'tasks', report.taskId);
-  try {
-    const pack = JSON.parse(await readFile(join(dir, 'evidence.json'), 'utf8'));
-    for (const t of pack.tables ?? []) tablesById[t.tableId] = { title: t.title, columns: t.columns, rows: t.rows, note: t.unitNote };
-  } catch { /* 缺失如实呈现 */ }
-  try {
-    const computed = JSON.parse(await readFile(join(dir, 'computed.json'), 'utf8'));
-    for (const t of computed.tables ?? []) tablesById[t.tableId] = { title: t.title, columns: t.columns, rows: t.rows, note: t.formula ?? null };
-  } catch { /* 同上 */ }
-  const threadId = await listChatThreadForReport(ctx.deps, report.reportId, auth.accountId);
-  const thread = threadId ? await getChatThread(ctx.deps.srPool, threadId) : null;
-  const messages = thread ? await listChatMessages(ctx.deps.srPool, thread.threadId) : [];
+  let version: number | undefined;
+  try { version = parseReportVersion(ctx.url.searchParams.get('v')); }
+  catch { return send(ctx.res, 400, renderErrorPage(400, 'REPORT_VERSION_INVALID')); }
+  const report = await getReportById(ctx.deps.srPool, reportId, auth.accountId, version);
+  if (!report) return send(ctx.res, 404, renderErrorPage(404, '所选报告版本不存在或不属于当前账户。'));
+  const versions = await listReportVersionSummaries(ctx.deps.srPool, report.taskId);
+  const { pack, computed } = await loadReportMaterials(ctx.deps.outputDir ?? SR_OUTPUT_DIR, report);
+  const tablesById = materialTables(pack, computed);
+  const thread = await findThreadForReport(ctx.deps.srPool, report.reportId, auth.accountId, report.version);
+  const messages = thread ? (await verifiedChatMessages(ctx.deps.srPool, ctx.deps.outputDir ?? SR_OUTPUT_DIR, report, thread.threadId)).messages : [];
   send(ctx.res, 200, renderReportPage({ report, versions, tablesById, messages, csrf: auth.csrfToken, account: { username: auth.username, role: auth.role, displayName: (await getAccount(ctx.deps.srPool, auth.accountId))?.displayName ?? auth.username } }));
 };
-
-async function listChatThreadForReport(deps: SrServerDeps, reportId: string, accountId: string): Promise<string | null> {
-  const t = await deps.srPool.query<{ thread_id: string }>(
-    `select t.thread_id from sr_chat_thread t
-     join sr_task k on k.task_id = (select task_id from sr_report where report_id = $1::uuid)
-     where t.report_id = $1::uuid and k.account_id = $2::uuid limit 1`,
-    [reportId, accountId],
-  );
-  return t.rows[0]?.thread_id ?? null;
-}
 
 const handleReportPdf: Handler = async (ctx) => {
   const auth = requireAuth(ctx);
   if (!auth) return;
   const reportId = ctx.url.pathname.split('/')[2] ?? '';
-  const vParam = Number(ctx.url.searchParams.get('v') ?? '0');
-  const latest = await getReportById(ctx.deps.srPool, reportId, auth.accountId);
-  if (!latest) return send(ctx.res, 404, renderErrorPage(404, '报告不存在或不属于当前账户。'));
-  const versions = await listReportVersions(ctx.deps.srPool, latest.taskId);
-  const report = vParam > 0 ? versions.find((r) => r.version === vParam) ?? latest : latest;
-  const tablesById: Record<string, { title: string; columns: string[]; rows: (string | number | null)[][]; note: string | null }> = {};
-  const dir = join(ctx.deps.outputDir ?? SR_OUTPUT_DIR, 'tasks', report.taskId);
-  try {
-    const pack = JSON.parse(await readFile(join(dir, 'evidence.json'), 'utf8'));
-    for (const t of pack.tables ?? []) tablesById[t.tableId] = { title: t.title, columns: t.columns, rows: t.rows, note: t.unitNote };
-  } catch { /* 缺失如实呈现 */ }
-  try {
-    const computed = JSON.parse(await readFile(join(dir, 'computed.json'), 'utf8'));
-    for (const t of computed.tables ?? []) tablesById[t.tableId] = { title: t.title, columns: t.columns, rows: t.rows, note: t.formula ?? null };
-  } catch { /* 同上 */ }
-  const buf = await renderReportPdf(report, tablesById);
+  let version: number | undefined;
+  try { version = parseReportVersion(ctx.url.searchParams.get('v')); }
+  catch { return send(ctx.res, 400, renderErrorPage(400, 'REPORT_VERSION_INVALID')); }
+  const report = await getReportById(ctx.deps.srPool, reportId, auth.accountId, version);
+  if (!report) return send(ctx.res, 404, renderErrorPage(404, '所选报告版本不存在或不属于当前账户。'));
+  const { pack, computed } = await loadReportMaterials(ctx.deps.outputDir ?? SR_OUTPUT_DIR, report);
+  const buf = await renderReportPdf(report, materialTables(pack, computed));
   ctx.res.writeHead(200, {
     'content-type': 'application/pdf',
     'content-disposition': `attachment; filename="lyra-${report.subject}-v${report.version}.pdf"`,
@@ -444,7 +425,10 @@ const handleChatPost: Handler = async (ctx) => {
     send(ctx.res, 429, renderErrorPage(429, '提问过于频繁，请稍后再试。'));
     return;
   }
-  const report = await getReportById(ctx.deps.srPool, reportId, auth.accountId);
+  let version: number | undefined;
+  try { version = parseReportVersion(body.report_version, true); }
+  catch { return send(ctx.res, 400, renderErrorPage(400, 'REPORT_VERSION_INVALID')); }
+  const report = await getReportById(ctx.deps.srPool, reportId, auth.accountId, version);
   if (!report) return send(ctx.res, 404, renderErrorPage(404, '报告不存在或不属于当前账户。'));
   const question = String(body.question ?? '').trim().slice(0, 2000);
   if (!question) return send(ctx.res, 400, renderErrorPage(400, '问题不能为空。'));
@@ -458,11 +442,6 @@ const handleChatPost: Handler = async (ctx) => {
     }
   }
   const deps = ctx.deps;
-  const dir = join(deps.outputDir ?? SR_OUTPUT_DIR, 'tasks', report.taskId);
-  let pack: unknown = null;
-  let computed: unknown = null;
-  try { pack = JSON.parse(await readFile(join(dir, 'evidence.json'), 'utf8')); } catch { /* 缺失则空 */ }
-  try { computed = JSON.parse(await readFile(join(dir, 'computed.json'), 'utf8')); } catch { /* 同上 */ }
   try {
     const { askReportQuestion } = await import('./engine.js');
     await askReportQuestion(
@@ -479,8 +458,6 @@ const handleChatPost: Handler = async (ctx) => {
         reportVersion: report.version,
         question,
         questionKind: classifyQuestion(question),
-        pack: pack as never,
-        computed: computed as never,
       },
     );
   } catch (err) {
@@ -497,7 +474,10 @@ const handleRevisePost: Handler = async (ctx) => {
   const reportId = ctx.url.pathname.split('/')[2] ?? '';
   const body = await readBody(ctx.req);
   if (!requireCsrf(ctx, body)) return;
-  const report = await getReportById(ctx.deps.srPool, reportId, auth.accountId);
+  let version: number | undefined;
+  try { version = parseReportVersion(body.report_version, true); }
+  catch { return send(ctx.res, 400, renderErrorPage(400, 'REPORT_VERSION_INVALID')); }
+  const report = await getReportById(ctx.deps.srPool, reportId, auth.accountId, version);
   if (!report) return send(ctx.res, 404, renderErrorPage(404, '报告不存在或不属于当前账户。'));
   const emphasis = String(body.emphasis ?? '').trim().slice(0, 500) || null;
   const useNewCutoff = String(body.new_cutoff ?? '') === '1';

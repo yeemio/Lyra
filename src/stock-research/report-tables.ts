@@ -20,7 +20,7 @@ const LABELS: Record<string, string> = {
   routeRevenueCny: '航线收入（元）', revenueDeltaCny: '收入变化（元）', profit: '利润', cashFlow: '现金流',
   operatingRevenueCny: '营业收入（元）', parentNetProfitCny: '归母净利（元）', operatingCashFlowCny: '经营现金流（元）',
   cashCapexCny: '购建支出（元）', ocfLessCashCapexCny: '经营现金流减购建支出（元）', cashEquivalentsCny: '现金等价物（元）',
-  MBRevenue: '来源营业收入', netProfit: '来源净利润', epsTTM: '每股收益 TTM', roeAvg: '平均 ROE', gpMargin: '毛利率原值', npMargin: '净利率原值',
+  MBRevenue: '来源收入字段 MBRevenue', netProfit: '来源净利润', epsTTM: '每股收益 TTM', roeAvg: '平均 ROE', gpMargin: '毛利率原值', npMargin: '净利率原值',
   totalShare: '总股本', liqaShare: '流通股本', YOYNI: '来源净利同比', YOYPNI: '归母净利同比', YOYAsset: '资产同比', YOYEquity: '权益同比', YOYEPSBasic: '每股收益同比',
   balanceReportType: '报表类型', balanceNoticeDate: '资产表公告日', TOTAL_PARENT_EQUITY: '归母权益', SHARE_CAPITAL: '股本', TOTAL_ASSETS: '总资产', TOTAL_LIABILITIES: '总负债', MONETARYFUNDS: '货币资金', GOODWILL: '商誉', MINORITY_EQUITY: '少数股东权益',
   operatingRevenue: '营业收入', parentNetProfit: '归母净利润', deductedParentNetProfit: '扣非归母净利润', consolidatedNetProfit: '合并净利润',
@@ -32,9 +32,26 @@ const LABELS: Record<string, string> = {
   priceMultiplier: '价格倍数', peTtm: 'PE TTM', pb: 'PB', source: '依据',
   sourceMBRevenueRaw: '来源收入原值', officialOperatingRevenue: '官方营业收入', officialTotalRevenue: '官方总收入', sourceRevenueScope: '来源收入口径', sourceNetProfitRaw: '来源净利原值', officialConsolidatedNetProfit: '官方合并净利', officialParentNetProfit: '官方归母净利', officialDeductedParentNetProfit: '官方扣非净利', sourceProfitScope: '来源净利口径', sourceNpMarginRaw: '来源净利率原值', verifiedMarginDenominator: '已核分母',
   questionId: '问题编号', question: '研究问题', horizon: '期限', requiredTables: '所需证据', materialGaps: '材料缺口', countercase: '反证',
+  endDate: '个股末日', benchmarkEndDate: '参照末日', comparisonReason: '不可比原因', sourceSubject: '来源公司',
 };
 export function tableLabel(value: string): string { return LABELS[value] ?? value; }
 export function tableCell(value: string | number | null | undefined): string { return value == null ? '—' : String(value); }
+
+/** 只陈述本版所给材料元数据；缺列/缺行不能推断公司尚未披露某季报。 */
+export function materialDateSummary(tables: Record<string, ReportTable>): string {
+  const values = (ids: string[], column: string): string[] => [...new Set(ids.flatMap((id) => {
+    const t = tables[id];
+    const index = t?.columns.indexOf(column) ?? -1;
+    return index < 0 ? [] : t!.rows.map((r) => r[index]).filter((v) => v !== null && v !== undefined && String(v).trim()).map(String);
+  }))].sort();
+  const periods = values(['official-financials', 'report-excerpts'], 'reportPeriod');
+  const freight = values(['freight-snapshot'], 'date');
+  const market = values(['market-snapshot'], 'observedAt');
+  const daily = values(['bars-daily'], 'date');
+  return `实际材料日期（本版所给表）：官方财报期次 ${periods.join('、') || '元数据未提供'}；` +
+    `运价快照 ${freight.join('、') || '未提供'}；行情快照 ${market.join('、') || '未提供'}；` +
+    `历史日线截至 ${daily.at(-1) ?? '未知'}。快照不拼接历史日线；材料缺口见来源与研究边界。`;
+}
 
 export function readableTable(t: ReportTable): { columns: string[]; rows: string[][]; sources: string[] } {
   const meta = new Set(['publishedDate', 'retrievedAt', 'sourceUrl', 'pages', 'sha256']);

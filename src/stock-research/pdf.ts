@@ -6,7 +6,7 @@
 import { accessSync } from 'node:fs';
 import pdfkit from 'pdfkit';
 import type { ReportDocument } from './contracts.js';
-import { readableTable, tableBands } from './report-tables.js';
+import { readableTable, tableBands, materialDateSummary } from './report-tables.js';
 
 interface FontSpec { path: string; psName?: string | undefined }
 
@@ -153,6 +153,7 @@ function mdToPdf(doc: Doc, md: string): void {
 }
 
 interface PdfOptions {
+  materialDates?: string;
   evidenceOnly?: boolean;
   evidencePages?: Record<string, { start: number; end: number }>;
   tablePages?: Record<string, { start: number; end: number }>;
@@ -191,7 +192,7 @@ export async function renderReportPdf(
         : '生成身份：执行者协作样板',
     { size: 11, align: 'center', gap: 2 });
   text(doc, report.changeSummary ?? '', { size: 10, align: 'center', gap: 2 });
-  if (tablesById['market-snapshot']) text(doc, '材料日期：2025年报、2026半年报；运价2026-10-23；行情快照2026-10-28 15:34:59；历史日线2026-10-19。无三季报原件，半年不年化，行情不拼接。', { size: 9.5, align: 'center', gap: 4 });
+  text(doc, options.materialDates ?? materialDateSummary(tablesById), { size: 9.5, align: 'center', gap: 4 });
   if (report.gate) {
     text(doc,
       report.gate.passed ? `发布门：通过（必经 J 裁决完成，无承重未解项）` : `发布门：未过——受限发布（${report.gate.decisionBearingUnresolved.length} 项承重未解项，报告内具名展示）`,
@@ -335,11 +336,12 @@ export async function renderReportPdfBundle(
   report: ReportDocument,
   tablesById: Parameters<typeof renderReportPdf>[1],
 ): Promise<{ reportPdf: Buffer; evidencePdf: Buffer; evidencePages: Record<string, { start: number; end: number }> }> {
+  const materialDates = materialDateSummary(tablesById);
   const denseIds = new Set(['bars-daily', 'index-bars', 'margin-series', 'holder-count', 'pledge', 'announcements-recent', 'fin-quarterly', 'growth-quarterly', 'margins-roe']);
   const denseTables = Object.fromEntries(Object.entries(tablesById).filter(([id]) => denseIds.has(id)));
   const evidencePages: Record<string, { start: number; end: number }> = {};
   const evidenceReport = { ...report, sections: [{ ...report.sections[0]!, tables: Object.keys(denseTables) }] };
-  const evidencePdf = await renderReportPdf(evidenceReport, denseTables, { evidenceOnly: true, tablePages: evidencePages });
-  const reportPdf = await renderReportPdf(report, tablesById, { evidencePages });
+  const evidencePdf = await renderReportPdf(evidenceReport, denseTables, { materialDates, evidenceOnly: true, tablePages: evidencePages });
+  const reportPdf = await renderReportPdf(report, tablesById, { materialDates, evidencePages });
   return { reportPdf, evidencePdf, evidencePages };
 }

@@ -93,6 +93,17 @@ export interface SrStep {
   note: string | null; // SKIPPED 原因 / 摘要
   startedAt: string | null;
   finishedAt: string | null;
+  outputArtifact?: SrArtifactRef | null; // 已接受步骤产物；旧行无绑定不得从工作文件猜配
+}
+
+export interface SrArtifactRef { sha256: string; bytes: number }
+export interface SrReportArtifacts {
+  format: 1;
+  assemblyStepId: string;
+  steps: {
+    stepId: string; stepKind: SrStepKind; sectionKey: string | null; sequence: number;
+    artifact: SrArtifactRef;
+  }[];
 }
 
 // ===== 调用（sr 空间 permit）=====
@@ -169,6 +180,7 @@ export interface EvidenceTable {
   unitNote: string | null;
   locators: EvidenceLocator[]; // 行级来源（与行对齐或整体来源说明）
   cutoff: string;
+  priceBasis?: 'UNADJUSTED_PRICE'; // 仅经来源字段确认的未复权价格；缺失不猜测指数口径
 }
 
 export interface EvidencePack {
@@ -252,6 +264,7 @@ export interface Citation {
   label: string; // 展示：如「财务指标 2026Q2」
   locator: EvidenceLocator | { kind: 'SECTION'; sectionKey: string };
   quote?: string; // 截断引用
+  delivery?: { reportId: string; version: number; contentHash: string; tableId: string; tableHash: string };
 }
 
 export interface ScenarioRow {
@@ -284,6 +297,7 @@ export interface ReportEvidenceRefs {
   aOutputHash: string; // A 全部产物（分段+终稿）canonical 哈希
   checklistHash: string; // 程序清单哈希
   jOutputHash: string; // J 裁决输出哈希
+  artifacts?: SrReportArtifacts; // 新发布报告的不可变完整材料引用；旧记录不自动补签
 }
 
 /**
@@ -324,6 +338,10 @@ export interface ReportDocument {
   contentHash: string; // canonicalSha256(除 contentHash 外)
 }
 
+export type ReportVersionSummary = Pick<ReportDocument, 'reportId' | 'version' | 'status' | 'createdAt' | 'publishedAt'> & {
+  unavailableReason?: string | null; // 仅导航元数据；不可验证的旧版不阻断其他版本
+};
+
 // ===== 对话 =====
 
 export type ChatQuestionKind =
@@ -350,6 +368,7 @@ export interface ChatThread {
   threadId: string;
   reportId: string;
   accountId: string;
+  reportVersion: number; // 一条线程只消费一个不可变报告版本
   createdAt: string;
 }
 

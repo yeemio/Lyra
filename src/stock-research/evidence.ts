@@ -389,6 +389,7 @@ export async function buildEvidencePack(dataPool: Pool, opts: BuildEvidenceOptio
     title: `日线行情（最近 ${barsSorted.length} 个交易日，OHLCV+成交额+复权因子连接列）`,
     columns: barsTable.header,
     rows: barsTable.rows,
+    ...(barsSorted.length > 0 && barsSorted.every((f) => String(tvOf(f).adjustflag) === '3') ? { priceBasis: 'UNADJUSTED_PRICE' as const } : {}),
     unitNote:
       'BaoStock DAILY_BAR 原始值（adjustflag=3 不复权，字符串原样保留）；amount 单位元、volume 单位股。' +
       `adjustFactor 列 = dividOperateDate≤当行日期的最近一次后复权因子（ADJUST_FACTOR 按日期连接；` +
@@ -570,6 +571,7 @@ export async function buildEvidencePack(dataPool: Pool, opts: BuildEvidenceOptio
       title: `基准指数行情（${benchCode}${benchKind === 'SW_INDEX_BAR' ? swL1Name === null ? '' : '·' + swL1Name : '·沪深300市场代理，非行业基准'}，最近 ${benchSorted.length} 个交易日）`,
       columns: benchTable.header,
       rows: benchTable.rows,
+      ...(benchKind === 'INDEX_DAILY_BAR' && benchSorted.length > 0 && benchSorted.every((f) => String(tvOf(f).adjustflag) === '3') ? { priceBasis: 'UNADJUSTED_PRICE' as const } : {}),
       unitNote:
         `基准=${benchKind === 'SW_INDEX_BAR' ? `申万一级行业指数 ${benchCode}（SW_INDEX_BAR）` : `沪深300 ${benchCode}（INDEX DAILY_BAR）`}${benchFallbackNote}；` +
         (benchKind === 'SW_INDEX_BAR'

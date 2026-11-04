@@ -606,12 +606,11 @@ describe('sr 引擎：C4 差集验收点', () => {
     assert.equal(first.report!.status, 'PUBLISHED_RESTRICTED');
     const callsAfterFirst = (await callRows()).length;
 
-    // 模拟 ASSEMBLE 本地暂态失败后的善后状态：步骤置 FAILED、报告行删除，QA_CHECK 保持 SUCCEEDED 落盘
+    // 模拟组装后工作文件写失败：保留已经插入的报告，重入同一步骤不增版。
     await srPool.query(`update sr_step set status='FAILED', finished_at=null where task_id=$1::uuid and step_kind='ASSEMBLE'`, [task.taskId]);
-    await srPool.query(`delete from sr_report where task_id=$1::uuid`, [task.taskId]);
     await srPool.query(`update sr_task set status='FAILED', error=null, completed_at=null where task_id=$1::uuid`, [task.taskId]);
 
-    // 恢复：QA 结论从落盘重载（或确定性重算），阻断必须保持，模型调用零新增
+    // 恢复：QA 结论从绑定的 CAS 原件重载，阻断必须保持，模型调用零新增。
     const second = await runSrTask(depsWith(inner), task.taskId);
     assert.equal(second.task.status, 'PARTIAL', `恢复后仍 PARTIAL（实际 ${second.task.status}，error=${JSON.stringify(second.task.error)}）`);
     assert.ok(second.task.error && second.task.error.code === 'PUBLISH_GATE_BLOCKED', '恢复后仍是发布门阻断');
@@ -619,6 +618,8 @@ describe('sr 引擎：C4 差集验收点', () => {
     assert.ok(!second.report!.gate!.passed, '门未过');
     assert.ok(second.report!.gate!.reason.includes('BLOCKING') || second.report!.gate!.reason.includes('质检'), `门原因含质检阻断（${second.report!.gate!.reason}）`);
     assert.equal((await callRows()).length, callsAfterFirst, '恢复零模型重发');
+    assert.equal(second.report!.contentHash, first.report!.contentHash, '重入保留首次报告正文与版本');
+    assert.equal((await listReportVersions(srPool, task.taskId)).length, 1, '不凭空增版');
   });
 });
 

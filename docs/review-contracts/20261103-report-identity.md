@@ -1,6 +1,6 @@
 # 修复报告版本、不可变证据、对齐计算与追问引用
 
-状态：修复合同；当前仅建立 Draft PR，尚无修复接受。
+状态：R1 源码候选，待总控对准确提交验收；不自行宣告 ACCEPT_SOURCE。
 
 审查候选：[`6c7cd196f20a4222d1f97708de7402b2c50ebeb0`](https://github.com/yeemio/Lyra/tree/6c7cd196f20a4222d1f97708de7402b2c50ebeb0)，tree `843eb5b97617ffda179ebb06e2ee2adf03bf19fc`。PR base=`main@6c7cd196f20a4222d1f97708de7402b2c50ebeb0`；head=`review-20261103/report-identity`，初始合同提交身份见 PR。
 
@@ -40,3 +40,38 @@ Owner 已授权这批经核对的问题修复、验证、对应分支提交/推�
 适用验证在稳定候选完成后运行：项目 typecheck、受影响行为/调用链回归、diff检查；使用公开合成输入/隔离数据库。不是严格 TDD 授权，不强制先写失败测试。每条通过必须附实际命令、输出、环境与准确 head；未运行列明原因，不把报告原93测试当新候选证明。UI/PDF变动须提供与候选绑定的实际呈现证据。
 
 停止条件：每个问题的完整行为出口成立，提供稳定 head、完整 changed paths/diff 与适用验证；当前总控接收。若无 GitHub 写工具，完整可发布补丁/文件即本次传输出口。一个初始结果加一次具名窄返工后先由总控重评，不自动无限重试或改换作者。源码接受不自动等于安装、整体L2、真实A/J或效果接受。
+
+## R1 实施与依赖边界
+
+本候选以初始 PR5 合同提交 `a62e6857b0f053d49edd2d95f57b89b8526ea01b` 为分支起点，显式合入已接受的 PR1 `c5964ee9e7a2c11541ed7f3ef1148f81cdda827d`（其历史包含 PR3 `9b3714e2eff3a6bd12b71cc1c2950639a8a98507`）。合并提交 `4061592cfb09eadc879d74adc32867d2eb7af7d4` 的两个 parent 按顺序即前述 PR5 合同、PR1；本批源码提交以该合并为 parent。没有合入 PR2、PR6、PR7，也没有改写其已接受身份。相对已接受 PR1，合并本身只带入本 PR 的原合同。
+
+| 问题 | 本次行为出口 |
+|---|---|
+| I-17 | 统一规范化报告正文、ISO 时间与哈希；DB 写入被签入的同一时间，读回必须复算。步骤产物写入带任务/步骤身份的 CAS，绑定引用只可首次写入；报告签入全部十个主链产物引用。恢复及 HTML/PDF/追问读取 CAS 并核包、A、清单、J、QA，不读取固定 JSON 副本。工作文件覆盖不会改旧版；原件缺失/损坏具名拒绝。 |
+| I-18 | ASSEMBLE 按任务行锁与组装步骤身份幂等；首次写盘失败后重入返回原版本，正文不同拒绝。读报告明确 `(reportId, version)`，未指定才按降序取最新；错误显式版本不得回退。表单、线程、PDF、回答均绑定所选版本。导航把不可验旧版标为不可用，不让旧坏正文阻断有效版。传统结论列表两处链接均携原 `conclusionId`。 |
+| I-19 | 所有股票共用逐窗口日期序列/同原始价格口径检查：首尾及中间日期、重复/非法日期、缺行、非正/空价、未知口径均不能计算基准比较值和超额。每个不可比较窗口保留具名原因；本标的独立有效收益可保留。 |
+| I-20 | CHAT 输入包含所选报告身份和本次实际发送表的内容哈希/定位。校验引用的 tableId、hash、版本；原证据保持 FACT/FILE 类型，计算表才标 COMPUTED。答案绑定成功 callId；CAS 保存原始发送 JSON 字节与接受输出，读取页面和复用已成功答案时复核调用输入哈希、状态及消息正文。无证据允许空引用。 |
+| M-02 | HTML、正文 PDF 与证据附册共用实际包表行的财报期次、行情观察时间、运价日和日线末日；缺元数据明确缺失，不再推断“无三季报”。 |
+| M-03 | 通用列名保持“来源收入字段 MBRevenue”。官方对照追加来源公司身份，只有同公司同期间数值核对才使用具名科目；其他公司或期次不能借用该结论。 |
+
+### 最小联动与兼容性
+
+`src/db/sr-migration.sql` 是本次必要的源 SQL 联动：增加步骤 `output_artifact` 及不可覆盖触发器、报告 `(report_id,version)` 唯一索引、线程 `report_version` 与版本唯一索引。理由是引用不可变性和线程版本不能只靠页面参数或内存保证。沿用原迁移入口，不新增安装/部署流程；未向业务库执行。旧线程不猜配版本；旧报告 hash 或产物证明不足时不重签、不从当前工作文件补配，导航明确不可验证。
+
+`materials.ts` 为官方对照表增加 `sourceSubject`；`evidence.ts` 仅在适配器已给出 `adjustflag=3` 的全表事实中声明原始价格口径。SW 序列未证明此价格口径时保留不可比原因，不因同日期就默认为同口径。这里检查的是已提供的观测日期序列和原始价格收益，不证明交易所日历完整、分红总收益、严格历史 PIT，也不改变 I-05/P5 停牌或结算窗口。
+
+### 检查与待验门
+
+纯行为/近调用者命令（公开合成输入；字体通过 `LYRA_PDF_FONT` 指向可用中文字体）：
+
+```sh
+npm run typecheck
+node --import tsx --test --test-concurrency=1 src/stock-research/report-identity.test.ts src/stock-research/report-calculation.test.ts src/stock-research/compute.test.ts src/stock-research/sr-real-transport.test.ts src/stock-research/render.test.ts src/stock-research/pdf.test.ts src/web/pages.test.ts src/stock-research/evidence-pit.test.ts
+git diff --check
+```
+
+`evidence-pit.test.ts` 的内存查询端口只验证证据组装行为，不作为 SQL 通过。PDF 测试实际生成、由 `pdftotext` 校核；`LYRA_REPAIR_PDF_DIR` 可另外保存两份公开合成 PDF，以 `pdftoppm` 渲染后逐页检查。准确运行输出、文件哈希、视觉观察与最终 head 一同在交付记录，网页内容断言不等于网页视觉接受。
+
+独立实际 PG 门：显式指定仅回环地址的 `LYRA_REPAIR_TEST_PG` 后运行 `node --import tsx --test src/stock-research/report-identity.pg.test.ts`。门使用随机专用 schema、两个连接池、临时 CAS、合成账户和注入模拟通道；验证源 DDL 幂等/不可覆盖、DB 往返、并发组装、真实 EISDIR 后恢复、HTML/PDF/版本线程与回答调用收据，结束清理 schema/CAS。未提供环境变量时仅跳过，不能记为通过。本 Chat 当前无 PostgreSQL/容器运行时，实际 PG 门为 NOT_RUN，由总控在准确候选补验；既有依赖接受不替代此门。
+
+本次不把主链调用完成到步骤落位之间的崩溃恢复、待处理/UNKNOWN 追问重发与并发请求键、执行租约/预算称为已修；它们仍属 PR4 I-09/I-10/I-11/I-12/I-13/I-16。本次恢复保证覆盖已经 SUCCEEDED 且有绑定产物的步骤、已落报告的 ASSEMBLE 重入及终态材料核验。无真实模型/账户/采集、私有材料、业务库或 P5 操作；自然语言质量、严格 PIT、安装、效果、PR1/PR7 与本批网页视觉均不提升接受层。
