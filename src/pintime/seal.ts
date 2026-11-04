@@ -17,6 +17,8 @@ export interface SealInput {
   businessKey: ResearchBusinessKey;
   cutoff: string; // 资料截点 knowledge_cutoff_at，ISO-8601
   factSelector: FactSelector;
+  /** 派生材料的精确输入子集；每项仍须通过 selector 与 as-of 可见性验证。 */
+  selectedFactIds?: readonly string[];
   gaps: string[]; // 显式缺口列表：可空数组，不可缺省（POINT-IN-TIME §7）
   methodVersion: MethodVersionId;
   adapterVersion: AdapterVersionId;
@@ -101,7 +103,12 @@ export async function buildSeal(pool: Pool, store: ArtifactStore, input: SealInp
   requireNonEmpty(input.adapterVersion, 'adapterVersion');
   requireNonEmpty(input.planAuthVersion, 'planAuthVersion');
 
-  const facts = await asOfFacts(pool, { ...input.factSelector, asOf: cutoffDate });
+  const visible = await asOfFacts(pool, { ...input.factSelector, asOf: cutoffDate });
+  const selected = input.selectedFactIds === undefined ? null : new Set(input.selectedFactIds);
+  const facts = selected === null ? visible : visible.filter((f) => selected.has(f.factId));
+  if (selected !== null && facts.length !== selected.size) {
+    throw new PintimeError('SEAL_INPUT_FACT_NOT_VISIBLE', '派生输入须全部命中 selector 与精确 cutoff');
+  }
 
   const hashes = [...new Set(facts.map((fact) => fact.artifactSha256))].sort();
   const artifactRefs: ArtifactRef[] = [];

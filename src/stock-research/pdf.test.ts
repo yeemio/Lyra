@@ -5,6 +5,8 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import type { ReportDocument } from './contracts.js';
 import { renderReportPdf } from './pdf.js';
+import { materialDateSummary } from './report-tables.js';
+import { renderReportPage } from './render.js';
 
 const doc: ReportDocument = {
   reportId: 'c1c1c1c1-1111-1111-1111-111111111111',
@@ -31,6 +33,44 @@ const doc: ReportDocument = {
   publishedAt: '2026-10-26T00:00:00.000Z',
   contentHash: '0'.repeat(64),
 };
+
+it('PR5：不同版本的财报/行情元数据在实际 PDF 与 HTML 同步；不再写死旧材料日期', async () => {
+  const { execFileSync } = await import('node:child_process');
+  const { renderReportPdfBundle } = await import('./pdf.js');
+  const tables = {
+    'official-financials': { title: '合成财报', columns: ['reportPeriod', 'MBRevenue'], rows: [['2026-09-30', '123']], note: '公开合成资料' },
+    'market-snapshot': { title: '合成行情', columns: ['observedAt'], rows: [['2026-10-30T07:00:00Z']], note: null },
+    'freight-snapshot': { title: '合成运价', columns: ['date'], rows: [['2026-10-29']], note: null },
+    'bars-daily': { title: '合成日线', columns: ['date'], rows: [['2026-10-28']], note: null },
+  };
+  const first = { ...doc, cutoff: '2026-11-01T00:00:00.000Z', sections: [
+    { ...doc.sections[0]!, narrative: '公开合成资料：本版含三季度期次及独立行情快照，用于检查材料日期与来源字段标签。', tables: Object.keys(tables) },
+  ] };
+  const extract = (b: Buffer) => execFileSync('pdftotext', ['-', '-'], { input: b, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 }).replace(/\s/g, '');
+  const firstPdf = await renderReportPdf(first, tables);
+  const text = extract(firstPdf);
+  const html = renderReportPage({ report: first, versions: [first], tablesById: tables, messages: [], csrf: 'synthetic' });
+  assert.ok(text.includes(materialDateSummary(tables).replace(/\s/g, '')));
+  assert.ok(html.includes(materialDateSummary(tables)));
+  assert.ok(!text.includes('无三季报') && !html.includes('未取得三季报'));
+  const next = structuredClone(tables); next['market-snapshot'].rows[0]![0] = '2026-10-31T07:00:00Z';
+  const second = { ...first, version: 3, sections: [{ ...first.sections[0]!, narrative: '第二版公开合成结论' }] };
+  const secondPdf = await renderReportPdf(second, next);
+  const updated = extract(secondPdf);
+  assert.ok(updated.includes('2026-10-31T07:00:00Z') && !updated.includes('2026-10-30T07:00:00Z'));
+  const bundle = await renderReportPdfBundle(first, tables);
+  assert.ok(extract(bundle.evidencePdf).includes(materialDateSummary(tables).replace(/\s/g, '')), '附册保留全包的日期摘要');
+  const hostile = structuredClone(tables); hostile['official-financials'].rows[0]![0] = '<script>fixture</script>';
+  const safe = renderReportPage({ report: first, versions: [first], tablesById: hostile, messages: [], csrf: 'synthetic' });
+  assert.ok(!safe.includes('<script>fixture</script>') && safe.includes('&lt;script&gt;fixture&lt;/script&gt;'));
+  if (process.env.LYRA_REPAIR_PDF_DIR) {
+    const { mkdir, writeFile } = await import('node:fs/promises');
+    const { join } = await import('node:path');
+    await mkdir(process.env.LYRA_REPAIR_PDF_DIR, { recursive: true });
+    await writeFile(join(process.env.LYRA_REPAIR_PDF_DIR, 'pr5-version-2.pdf'), firstPdf);
+    await writeFile(join(process.env.LYRA_REPAIR_PDF_DIR, 'pr5-version-3.pdf'), secondPdf);
+  }
+});
 
 describe('PDF 导出', () => {
   it('生成合法 PDF：头标识、内嵌字体、多页、版本号页脚', async () => {

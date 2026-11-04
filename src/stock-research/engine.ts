@@ -15,7 +15,7 @@
  * - 生成身份：报告 generatedBy 由通道 describe().simulated 决定，不得手工改写。
  */
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, writeFile, readFile } from 'node:fs/promises';
+import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { KernelError } from '../contracts.js';
 import { runPermittedCall, type PermittedCallSuccess } from '../kernel/executor.js';
@@ -37,7 +37,6 @@ import {
   type SrTransportDescribe,
 } from './contracts.js';
 import {
-  listChatMessages,
   SR_PERMIT_SPACE,
   srCallHasReceipt,
   srFindCallByStep,
@@ -46,9 +45,9 @@ import {
   findThreadForReport,
   getReportByTaskAndVersion,
   getTask,
-  insertReport,
+  insertAssembledReport,
   insertStep,
-  listReportVersions,
+  getLatestReportForTask,
   listSteps,
   srRecordCallMeta,
   updateStep,
@@ -78,8 +77,11 @@ import {
   type SynthOutput,
 } from './transport.js';
 import { selectAnalysisTables } from './materials.js';
-import { buildEvidencePack, applyPlanToEvidence, loadResearchPool } from './evidence.js';
+import { buildEvidencePack, applyPlanToEvidence } from './evidence.js';
 import { computeMetrics } from './compute.js';
+import { signReport } from './report-identity.js';
+import { chatCitations, verifiedChatMessages } from './chat-evidence.js';
+import { loadReportMaterials, readStepArtifact, reportArtifacts, saveStepArtifact } from './report-artifacts.js';
 
 /** ANALYZE 分组：三组覆盖十章中的九章（summary 由 SYNTHESIZE 生成、sources 由组装生成）。 */
 const ANALYZE_GROUPS: { key: string; sections: string[] }[] = [
@@ -173,6 +175,7 @@ async function taskDir(deps: SrEngineDeps, taskId: string): Promise<string> {
 }
 
 async function writeStepOutput(deps: SrEngineDeps, step: SrStep, value: unknown): Promise<string> {
+  await saveStepArtifact(deps.srPool, deps.outputDir, step, value);
   const dir = await taskDir(deps, step.taskId);
   const rel = join('steps', `${String(step.sequence).padStart(2, '0')}-${step.stepKind}${step.sectionKey ? '-' + step.sectionKey : ''}.json`);
   await mkdir(join(dir, 'steps'), { recursive: true });
@@ -180,10 +183,8 @@ async function writeStepOutput(deps: SrEngineDeps, step: SrStep, value: unknown)
   return rel;
 }
 
-async function readStepOutput<T>(deps: SrEngineDeps, taskId: string, rel: string): Promise<T> {
-  const dir = await taskDir(deps, taskId);
-  const raw = await readFile(join(dir, rel), 'utf8');
-  return JSON.parse(raw) as T;
+async function readStepOutput<T>(deps: SrEngineDeps, step: SrStep): Promise<T> {
+  return readStepArtifact<T>(deps.outputDir, step, step.outputArtifact);
 }
 
 // ===== 模型调用（唯一发送路径）=====
@@ -277,7 +278,6 @@ async function callModel(
 interface RunContext {
   deps: SrEngineDeps;
   task: SrTask;
-  pool: Awaited<ReturnType<typeof loadResearchPool>>;
   plan?: PlanOutput;
   pack?: EvidencePack;
   computed?: ComputeResult;
@@ -295,13 +295,12 @@ async function runOneStep(ctx: RunContext, step: SrStep): Promise<void> {
   try {
     switch (step.stepKind) {
       case 'PLAN': {
-        const subject = ctx.pool.stocks.find((s) => s.code === task.subject);
         const preflight = await buildEvidencePack(deps.dataPool, { taskId: task.taskId, subject: task.subject, cutoff: task.cutoff, focus: task.focus, outputDir: deps.outputDir });
         ctx.pack = preflight.pack;
         const input: PlanInput = {
           subject: task.subject,
           subjectName: task.subjectName,
-          swL1: subject?.swL1 ?? '未知',
+          swL1: preflight.pack.coverage.industry.swL1 ?? '历史归属/名称缺失',
           focus: task.focus,
           horizon: task.horizon,
           emphasis: task.emphasis,
@@ -311,7 +310,7 @@ async function runOneStep(ctx: RunContext, step: SrStep): Promise<void> {
         };
         const out = validatePlanOutput(await callModel(deps, task, step, 'PLAN', input, validatePlanOutput));
         ctx.plan = out;
-        await writeStepOutput(deps, step, { input, output: out });
+        await writeStepOutput(deps, step, { inputJson: JSON.stringify(input, null, 1), input, output: out });
         await updateStep(deps.srPool, step.stepId, { status: 'SUCCEEDED', note: `${out.questions.length} 个研究问题`, finished: true });
         return;
       }
@@ -327,7 +326,7 @@ async function runOneStep(ctx: RunContext, step: SrStep): Promise<void> {
         built.pack = applyPlanToEvidence(built.pack, ctx.plan, task.horizon);
         ctx.pack = built.pack;
         await writeFile(join(await taskDir(deps, task.taskId), 'evidence.json'), JSON.stringify(built.pack, null, 1), 'utf8');
-        await writeStepOutput(deps, step, { packRef: 'evidence.json', coverage: built.pack.coverage, packHash: built.pack.packHash });
+        await writeStepOutput(deps, step, { pack: built.pack });
         await updateStep(deps.srPool, step.stepId, { status: 'SUCCEEDED', note: `${built.pack.tables.length} 张证据表，缺口 ${built.pack.coverage.gaps.length} 项`, finished: true });
         return;
       }
@@ -337,7 +336,7 @@ async function runOneStep(ctx: RunContext, step: SrStep): Promise<void> {
         ctx.computed = result;
         const dir = await taskDir(deps, task.taskId);
         await writeFile(join(dir, 'computed.json'), JSON.stringify(result, null, 1), 'utf8');
-        await writeStepOutput(deps, step, { computedRef: 'computed.json', checks: result.checks });
+        await writeStepOutput(deps, step, { computed: result });
         await updateStep(deps.srPool, step.stepId, { status: 'SUCCEEDED', note: `${result.tables.length} 张计算表`, finished: true });
         return;
       }
@@ -361,7 +360,7 @@ async function runOneStep(ctx: RunContext, step: SrStep): Promise<void> {
         };
         const out = validateAnalyzeOutput(await callModel(deps, task, step, 'ANALYZE', input, (v) => validateAnalyzeOutput(v, input)), input);
         ctx.analyze.set(step.sectionKey ?? '', out);
-        await writeStepOutput(deps, step, { input, output: out });
+        await writeStepOutput(deps, step, { inputJson: JSON.stringify(input, null, 1), input, output: out });
         await updateStep(deps.srPool, step.stepId, { status: 'SUCCEEDED', note: `${out.sections.length} 章`, finished: true });
         return;
       }
@@ -383,7 +382,7 @@ async function runOneStep(ctx: RunContext, step: SrStep): Promise<void> {
         };
         const out = validateAFinalOutput(await callModel(deps, task, step, 'A_FINAL', input, (v) => validateAFinalOutput(v)));
         ctx.aFinal = out;
-        await writeStepOutput(deps, step, { input, output: out });
+        await writeStepOutput(deps, step, { inputJson: JSON.stringify(input, null, 1), input, output: out });
         await updateStep(deps.srPool, step.stepId, { status: 'SUCCEEDED', note: `结论+${out.decisiveLinks.length} 条决定性连接+反证`, finished: true });
         return;
       }
@@ -421,7 +420,7 @@ async function runOneStep(ctx: RunContext, step: SrStep): Promise<void> {
           { deliveredTableIds: deliveredIds, aConclusion: ctx.aFinal.conclusion },
         );
         ctx.judge = out;
-        await writeStepOutput(deps, step, { input, output: out });
+        await writeStepOutput(deps, step, { inputJson: JSON.stringify(input, null, 1), input, output: out });
         const unresolved = out.verdicts.filter((v) => v.verdict === 'UNRESOLVED').length;
         await updateStep(deps.srPool, step.stepId, { status: 'SUCCEEDED', note: `${out.verdicts.length} 项裁决，${unresolved} 项未解，证据 ${evidenceBundle.length} 表`, finished: true });
         return;
@@ -437,7 +436,7 @@ async function runOneStep(ctx: RunContext, step: SrStep): Promise<void> {
       case 'ASSEMBLE': {
         const report = await assembleReport(ctx, step);
         const dir = await taskDir(deps, task.taskId);
-        await writeFile(join(dir, 'report.md'), renderReportMarkdown(report, ctx), 'utf8');
+        await writeFile(join(dir, 'report.md'), renderReportMarkdown(report, await loadReportMaterials(deps.outputDir, report)), 'utf8');
         await writeStepOutput(deps, step, { reportId: report.reportId, version: report.version, contentHash: report.contentHash });
         await updateStep(deps.srPool, step.stepId, { status: 'SUCCEEDED', note: `v${report.version}`, finished: true });
         return;
@@ -671,11 +670,10 @@ function generatedBy(ctx: RunContext): ReportDocument['generatedBy'] {
   return ctx.deps.transport.describe().simulated ? 'PRODUCT_SIMULATED' : 'PRODUCT_REAL';
 }
 
-async function assembleReport(ctx: RunContext, _step: SrStep): Promise<ReportDocument> {
+async function assembleReport(ctx: RunContext, step: SrStep): Promise<ReportDocument> {
   const { deps, task } = ctx;
-  const existing = await listReportVersions(deps.srPool, task.taskId);
-  const version = existing.length + 1;
-  const reportId = existing[0]?.reportId ?? randomUUID();
+  const version = 1; // 实际版本在持有任务行锁的 insertAssembledReport 中确定
+  const reportId = randomUUID();
   const sections: ReportSection[] = [];
 
   // 〔C3〕发布门评估（共用函数）
@@ -689,6 +687,7 @@ async function assembleReport(ctx: RunContext, _step: SrStep): Promise<ReportDoc
     aOutputHash: canonicalSha256({ sections: aSections, aFinal }),
     checklistHash: ctx.checklist?.checklistHash ?? '(缺失)',
     jOutputHash: judge ? canonicalSha256(judge) : '(J 未完成)',
+    artifacts: reportArtifacts(await listSteps(deps.srPool, task.taskId), step.stepId),
   };
 
   // summary（A 摘要 + J 终局对齐——〔C4/R0d〕摘要不得先于裁决呈现旧结论）
@@ -770,7 +769,7 @@ async function assembleReport(ctx: RunContext, _step: SrStep): Promise<ReportDoc
     key: 'sources',
     title: SECTION_TITLES.sources,
     narrative:
-      `${genNote}\n\n资料截点：${task.cutoff}；方法版本 ${task.methodVersion}；报告版本 v${version}。\n\n` +
+      `${genNote}\n\n资料截点：${task.cutoff}；方法版本 ${task.methodVersion}。\n\n` +
       `研究链：A 分节分析 + A 终稿 → 程序清单（${ctx.checklist?.items.length ?? 0} 项，机械抽取）→ 必经 J 裁决 → 发布门${gate.passed ? '（通过）' : '（未过——受限发布）'}。\n\n` +
       `${verdictSummary}\n\n` +
       `证据绑定（可整链核验）：证据包 ${evidenceRefs.packHash.slice(0, 16)}… / A 输出 ${evidenceRefs.aOutputHash.slice(0, 16)}… / 清单 ${evidenceRefs.checklistHash.slice(0, 16)}… / J 输出 ${evidenceRefs.jOutputHash.slice(0, 16)}…。\n\n` +
@@ -806,7 +805,8 @@ async function assembleReport(ctx: RunContext, _step: SrStep): Promise<ReportDoc
     createdAt: (deps.now?.() ?? new Date()).toISOString(),
     publishedAt: (deps.now?.() ?? new Date()).toISOString(),
   };
-  return insertReport(deps.srPool, base);
+  await loadReportMaterials(deps.outputDir, signReport(base));
+  return insertAssembledReport(deps.srPool, base);
 }
 
 /** 报告的 markdown 归档形态（与网页/PDF 同源）。 */
@@ -875,7 +875,8 @@ export async function runSrTask(deps: SrEngineDeps, taskId: string): Promise<SrT
   if (!task) throw new KernelError('TASK_NOT_FOUND', `任务不存在：${taskId}`);
   // FAILED 可续跑（中断恢复只续未完成步骤；已完成模型步骤复用落盘输出，零重发）。
   if (['COMPLETED', 'PARTIAL', 'CANCELLED'].includes(task.status)) {
-    const report = await getReportByTaskAndVersion(deps.srPool, taskId, 1);
+    const report = await getLatestReportForTask(deps.srPool, taskId);
+    if (report) await loadReportMaterials(deps.outputDir, report);
     return { task, report: report ?? null };
   }
   await updateTask(deps.srPool, taskId, { status: 'RUNNING', error: null });
@@ -894,41 +895,22 @@ export async function runSrTask(deps: SrEngineDeps, taskId: string): Promise<SrT
   const ctx: RunContext = {
     deps,
     task,
-    pool: await loadResearchPool(),
     analyze: new Map(),
   };
-
-  // 产物读回（恢复路径：已完成步骤的落盘输出）
-  const dir = await taskDir(deps, taskId);
-  for (const step of steps) {
-    if (step.status !== 'SUCCEEDED') continue;
-    if (step.stepKind === 'EVIDENCE') {
-      try { ctx.pack = JSON.parse(await readFile(join(dir, 'evidence.json'), 'utf8')) as EvidencePack; } catch { /* 重建 */ }
-    } else if (step.stepKind === 'COMPUTE') {
-      try { ctx.computed = JSON.parse(await readFile(join(dir, 'computed.json'), 'utf8')) as ComputeResult; } catch { /* 重建 */ }
-    }
-  }
 
   try {
     for (const step of steps) {
       if (step.status === 'SUCCEEDED') {
-        // 落盘产物读回到内存上下文
+        // 只读首次绑定的 CAS 产物；工作目录缺失/覆盖不改变恢复材料。
+        if (step.stepKind === 'EVIDENCE') ctx.pack = (await readStepOutput<{ pack: EvidencePack }>(deps, step)).pack;
+        if (step.stepKind === 'COMPUTE') ctx.computed = (await readStepOutput<{ computed: ComputeResult }>(deps, step)).computed;
         if (step.stepKind === 'PLAN') ctx.plan = await reloadPlan(deps, taskId, step);
         if (step.stepKind === 'ANALYZE' && step.sectionKey) ctx.analyze.set(step.sectionKey, await reloadAnalyze(deps, taskId, step));
         if (step.stepKind === 'SYNTHESIZE' || step.stepKind === 'A_FINAL') ctx.aFinal = await reloadAFinal(deps, taskId, step);
-        if (step.stepKind === 'CHECKLIST') ctx.checklist = await readStepOutput<SrChecklist>(deps, taskId, stepOutputRel(step));
+        if (step.stepKind === 'CHECKLIST') ctx.checklist = await readStepOutput<SrChecklist>(deps, step);
         if (step.stepKind === 'JUDGE') ctx.judge = await reloadJudge(deps, taskId, step);
-        // 〔C5/C4-03〕QA_CHECK 已完成时恢复其结论：发布门依赖 ctx.qa——
-        // 缺失会使 evaluatePublishGate 把质检视为无阻断（C4-03 反例）。优先读回落盘；
-        // 读回失败则确定性重算（runQaChecks 无模型调用），两种路径都不重发任何模型调用。
         if (step.stepKind === 'QA_CHECK') {
-          try {
-            const saved = await readStepOutput<{ findings: ReportQaFinding[] }>(deps, taskId, stepOutputRel(step));
-            ctx.qa = saved.findings;
-          } catch {
-            ctx.qa = runQaChecks(ctx);
-            await writeStepOutput(deps, step, { findings: ctx.qa });
-          }
+          ctx.qa = (await readStepOutput<{ findings: ReportQaFinding[] }>(deps, step)).findings;
         }
         continue;
       }
@@ -965,7 +947,7 @@ export async function runSrTask(deps: SrEngineDeps, taskId: string): Promise<SrT
           : null,
       completed: true,
     });
-    const report = await getReportByTaskAndVersion(deps.srPool, taskId, 1);
+    const report = await getLatestReportForTask(deps.srPool, taskId);
     return { task: finalTask, report: report ?? null };
   } catch (err) {
     const code = err instanceof KernelError ? err.code : 'STEP_FAILED';
@@ -980,29 +962,25 @@ export async function runSrTask(deps: SrEngineDeps, taskId: string): Promise<SrT
 }
 
 async function reloadPlan(deps: SrEngineDeps, taskId: string, step: SrStep): Promise<PlanOutput> {
-  const v = await readStepOutput<{ output: PlanOutput }>(deps, taskId, stepOutputRel(step));
+  const v = await readStepOutput<{ output: PlanOutput }>(deps, step);
   return v.output;
 }
 async function reloadAnalyze(deps: SrEngineDeps, taskId: string, step: SrStep): Promise<AnalyzeOutput> {
-  const v = await readStepOutput<{ output: AnalyzeOutput }>(deps, taskId, stepOutputRel(step));
+  const v = await readStepOutput<{ output: AnalyzeOutput }>(deps, step);
   return v.output;
 }
 async function reloadSynth(deps: SrEngineDeps, taskId: string, step: SrStep): Promise<SynthOutput> {
-  const v = await readStepOutput<{ output: SynthOutput }>(deps, taskId, stepOutputRel(step));
+  const v = await readStepOutput<{ output: SynthOutput }>(deps, step);
   return v.output;
 }
 async function reloadAFinal(deps: SrEngineDeps, taskId: string, step: SrStep): Promise<AFinalOutput> {
-  const v = await readStepOutput<{ output: AFinalOutput }>(deps, taskId, stepOutputRel(step));
+  const v = await readStepOutput<{ output: AFinalOutput }>(deps, step);
   return v.output;
 }
 async function reloadJudge(deps: SrEngineDeps, taskId: string, step: SrStep): Promise<JOutput> {
-  const v = await readStepOutput<{ output: JOutput }>(deps, taskId, stepOutputRel(step));
+  const v = await readStepOutput<{ output: JOutput }>(deps, step);
   return v.output;
 }
-function stepOutputRel(step: SrStep): string {
-  return join('steps', `${String(step.sequence).padStart(2, '0')}-${step.stepKind}${step.sectionKey ? '-' + step.sectionKey : ''}.json`);
-}
-
 // ===== 追问（CHAT_ANSWER 步骤 + 调用）=====
 
 export interface AskOptions {
@@ -1010,8 +988,8 @@ export interface AskOptions {
   reportVersion: number;
   question: string;
   questionKind: ChatMessage['kind'];
-  pack: EvidencePack;
-  computed: ComputeResult;
+  pack?: EvidencePack; // 兼容调用者：如提供，必须与绑定原件逐字相符
+  computed?: ComputeResult;
 }
 
 export async function askReportQuestion(
@@ -1024,19 +1002,19 @@ export async function askReportQuestion(
   const report = await getReportByTaskAndVersion(deps.srPool, opts.taskId, opts.reportVersion);
   if (!report) throw new KernelError('REPORT_NOT_FOUND', `报告不存在：${opts.taskId}/v${opts.reportVersion}`);
 
-  let thread = await findThreadForReport(deps.srPool, report.reportId, accountId);
-  if (!thread) thread = await createChatThread(deps.srPool, report.reportId, accountId);
-
-  // 〔C3 补〕追问同文本幂等：同线程同问题的既有回答直接返回（零新调用）——
-  // 与任务幂等键同义，防止逐字重发绕过一次发送语义（复核建议项）。
-  const existing = await listChatMessages(deps.srPool, thread.threadId);
-  for (let i = 0; i < existing.length - 1; i++) {
-    const m = existing[i]!;
-    const next = existing[i + 1]!;
-    if (m.role === 'USER' && m.content === opts.question && next.role === 'ASSISTANT') {
-      return next;
-    }
+  const { pack, computed } = await loadReportMaterials(deps.outputDir, report);
+  if ((opts.pack && canonicalSha256(opts.pack) !== canonicalSha256(pack)) ||
+      (opts.computed && canonicalSha256(opts.computed) !== canonicalSha256(computed))) {
+    throw new KernelError('SR_ARTIFACT_BINDING_MISMATCH', '追问材料不属于所选报告版本');
   }
+  let thread = await findThreadForReport(deps.srPool, report.reportId, accountId, report.version);
+  if (!thread) thread = await createChatThread(deps.srPool, report.reportId, accountId, report.version);
+
+  // 只复用同版本下已验证成功的回答。待处理/UNKNOWN 及并发请求键仍属 PR4，
+  // 此处不能代替调用身份与一次发送保证。
+  const verified = await verifiedChatMessages(deps.srPool, deps.outputDir, report, thread.threadId);
+  const existing = verified.messages.find((m) => m.role === 'ASSISTANT' && m.callId && verified.questionByCallId.get(m.callId) === opts.question);
+  if (existing) return existing;
 
   await addChatMessage(deps.srPool, {
     threadId: thread.threadId,
@@ -1050,7 +1028,7 @@ export async function askReportQuestion(
 
   // 问题路由：关键词与显式分类结合
   const kind = opts.questionKind !== 'OTHER' ? opts.questionKind : classifyQuestion(opts.question);
-  const tablesForQuestion = selectTablesForQuestion(opts.pack, opts.computed, opts.question, kind);
+  const tablesForQuestion = selectTablesForQuestion(pack, computed, opts.question, kind);
 
   const step = await insertStep(deps.srPool, {
     taskId: task.taskId,
@@ -1063,20 +1041,36 @@ export async function askReportQuestion(
     questionKind: kind,
     subject: task.subject,
     cutoff: report.cutoff,
+    reportIdentity: { reportId: report.reportId, version: report.version, contentHash: report.contentHash },
     reportExcerpt: report.sections.slice(0, 4).map((s) => ({ sectionKey: s.key, narrative: s.narrative.slice(0, 400), tables: s.tables })),
-    tables: tablesForQuestion.map((t) => ({ tableId: t.tableId, title: t.title, columns: t.columns, rows: t.rows.slice(-30) })),
+    tables: tablesForQuestion.map((t) => {
+      const body = { tableId: t.tableId, title: t.title, columns: t.columns, rows: t.rows.slice(-30),
+        kind: ('formula' in t ? 'COMPUTED' : 'EVIDENCE') as 'COMPUTED' | 'EVIDENCE',
+        locators: t.locators.length === t.rows.length ? t.locators.slice(-30) : t.locators };
+      return { ...body, tableHash: canonicalSha256(body) };
+    }),
   };
+  const inputJson = JSON.stringify(input, null, 1);
   await updateStep(deps.srPool, step.stepId, { status: 'RUNNING', started: true });
   try {
-    const out = validateChatOutput(await callModel(deps, task, step, 'CHAT_ANSWER', input, validateChatOutput)) as ChatOutput;
+    const result = await callSrModel(deps, {
+      contract: { taskId: task.taskId, stepId: step.stepId, methodVersion: task.methodVersion,
+        planAuthVersion: deps.budget.planAuthVersion,
+        deadline: new Date((deps.now?.() ?? new Date()).getTime() + SR_CALL_WINDOW_MS).toISOString() },
+      modelStep: 'CHAT_ANSWER', input, validate: (v) => validateChatOutput(v, input),
+      afterValidated: async (output, permit) => {
+        await saveStepArtifact(deps.srPool, deps.outputDir, step, { inputJson, input, output, callId: permit.callId });
+      },
+    });
+    const out = result.output;
     await updateStep(deps.srPool, step.stepId, { status: 'SUCCEEDED', finished: true });
     const msg = await addChatMessage(deps.srPool, {
       threadId: thread.threadId,
       role: 'ASSISTANT',
       kind,
       content: out.answer,
-      citations: out.citations.map((c) => ({ label: c.label, locator: { kind: 'COMPUTED' as const, tableId: c.tableId } })),
-      callId: null,
+      citations: chatCitations(input, out),
+      callId: result.permit.callId,
       suggestedAction: out.suggestedAction ?? null,
     });
     return msg;

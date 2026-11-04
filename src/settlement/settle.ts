@@ -21,9 +21,12 @@
  * 跨类 disposition 具名拒绝（R18），未实现边界登记于交付回传。
  */
 import type { Pool } from 'pg';
+import { canonicalSha256 } from '../canonical.js';
+import { loadFact } from '../pintime/facts.js';
+import { BenchmarkError, requireResolvedBenchmark, type FrozenBenchmark } from '../conclusion/benchmark.js';
 import { LimitRuleError } from '../rules/limit.js';
 import { SettlementError, decCmp, decFromString, decFrom, decMax, decMin, decNeg, decToString, type Dec } from './decimal.js';
-import { excessSeries, industryBenchmarkAt, type ExcessDay, type ExcessSeriesResult, type FactorEvent, type IndustryBenchmark, type SuspensionGap } from './excess.js';
+import { excessSeries, type ExcessDay, type ExcessSeriesResult, type FactorEvent, type IndustryBenchmark, type SuspensionGap } from './excess.js';
 import { referenceOpen, type ReferenceOpenResult } from './reference.js';
 import { classifyTradability, type TradabilityResult } from './tradability.js';
 import type { SettlementZone } from '../contracts.js';
@@ -42,6 +45,8 @@ export interface SettleArgs {
   conclusionTime: string | Date;
   /** 资料截点（SR-3.5 行业基准身份冻结时点；结论 businessKey.cutoff）。 */
   cutoff: string | Date;
+  /** 研究阶段冻结并存入原结论；缺省不允许按当前库补猜。 */
+  benchmark?: FrozenBenchmark | undefined;
   /** 事实读取 as-of（默认当前时刻；只消费窗口内各日事实）。 */
   asOf?: Date;
   /** 窗口长度（默认 20；测试注入用）。 */
@@ -134,13 +139,11 @@ export async function settleConclusion(pool: Pool, args: SettleArgs): Promise<Se
       return { state: 'UNSETTLED', reason: 'REFERENCE_NOT_DUE', detail: reference.detail, reference };
     }
     // 2) 行业基准身份（SR-3.5 截点冻结；缺失 = 具名结算异常，不用替代基准）
-    const industry = await industryBenchmarkAt(pool, { subject: args.subject, cutoff });
-    if (industry === null) {
-      return {
-        state: 'ANOMALY',
-        code: 'INDUSTRY_BENCHMARK_MISSING',
-        detail: `${args.subject} 资料截点 ${cutoff.toISOString()} 无可解析申万一级行业指数身份（无区间含截点的申万轴行 / pre2014 窗口 / 前缀无核验映射），SR-3.5`,
-      };
+    const binding = requireResolvedBenchmark(args.benchmark, { subjectKind: 'STOCK', subject: args.subject, cutoff });
+    const industry = binding.industry!;
+    const original = await loadFact(pool, industry.factId);
+    if (original === null || canonicalSha256(original) !== canonicalSha256(binding.attributionFact)) {
+      throw new BenchmarkError('BENCHMARK_FACT_MISMATCH', industry.factId);
     }
     // 3) 逐日累计超额序列（SR-3.3/3.4）
     const series: ExcessSeriesResult = await excessSeries(pool, {
@@ -234,7 +237,7 @@ export async function settleConclusion(pool: Pool, args: SettleArgs): Promise<Se
     };
     return { state: 'SETTLED', zone, diagnostics };
   } catch (error) {
-    if (error instanceof SettlementError) {
+    if (error instanceof SettlementError || error instanceof BenchmarkError) {
       return { state: 'ANOMALY', code: error.code, detail: error.message };
     }
     if (error instanceof LimitRuleError) {

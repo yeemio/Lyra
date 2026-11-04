@@ -17,6 +17,7 @@ import { SECTION_TITLES, defaultTrialQuota, type SrModelTransport } from './cont
 import { SimSrTransport } from './transport.js';
 import { createSrServer, type SrFullDeps } from './server.js';
 import { createTask, insertReport } from './store.js';
+import { reportFixture } from './report-identity-test-helper.js';
 
 const schema = `sr_h_${Date.now().toString(36)}_${randomUUID().replaceAll('-', '').slice(0, 8)}`;
 let admin: Pool;
@@ -73,15 +74,8 @@ before(async () => {
     methodVersion: 'sr-m1', adapterVersion: 'pool-frozen-1', planAuthVersion: 'sr-auth-1',
   })).task;
   taskA = task.taskId;
-  const report = await insertReport(srPool, {
-    reportId: randomUUID(), taskId: task.taskId, version: 1, status: 'PUBLISHED',
-    subject: '002384', subjectName: '东山精密', focus: 'FULL', horizon: 'MID_TERM',
-    cutoff: task.cutoff, methodVersion: 'sr-m1', adapterVersion: 'pool-frozen-1', planAuthVersion: 'sr-auth-1',
-    generatedBy: 'PRODUCT_SIMULATED',
-    sections: [{ key: 'summary', title: SECTION_TITLES.summary, narrative: '测试摘要——个人研究记录，非投资建议。', findings: [], tables: [], citations: [], gaps: [] }],
-    qaFindings: [], evidenceRefs: null, gate: null, changeSummary: null,
-    createdAt: new Date().toISOString(), publishedAt: new Date().toISOString(),
-  });
+  const fixture = await reportFixture(outDir, { taskId: task.taskId, subject: task.subject, cutoff: task.cutoff });
+  const report = await insertReport(srPool, fixture.report);
   reportA = report.reportId;
 
   const deps: SrFullDeps = {
@@ -144,7 +138,7 @@ describe('sr HTTP：跨账户隔离（B 不能碰 A 的对象）', () => {
   it('B 对 A 的报告追问 → 404（写路径同样隔离）', async () => {
     const html = await (await get('/', cookieB)).text();
     const csrfB = csrfOf(html);
-    const r = await post(`/reports/${reportA}/chat`, { question: '为什么不给我看', _csrf: csrfB }, cookieB);
+    const r = await post(`/reports/${reportA}/chat`, { question: '为什么不给我看', report_version: '1', _csrf: csrfB }, cookieB);
     assert.equal(r.status, 404);
   });
 

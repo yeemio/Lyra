@@ -227,7 +227,7 @@ function minimalProtocolOutputs(): Record<Step, () => unknown> {
       conclusionRuling: { finalConclusion: '同A结论', changedFromA: false, changeReason: null, conditions: ['c'] },
       unresolvedDisposition: [], limitations: [],
     }),
-    CHAT_ANSWER: () => ({ answer: 'a', citations: [], missingData: [], suggestedAction: null }),
+    CHAT_ANSWER: () => ({ reportIdentity: { reportId: 'fixture-report', version: 1, contentHash: '1'.repeat(64) }, answer: 'a', citations: [], missingData: [], suggestedAction: null }),
   };
 }
 
@@ -360,8 +360,8 @@ describe('C8 本地业务保证：wire nullable 之外的权威校验（两层�
     // PLAN 缺 materialPriorities/emphasisNotes（协议层 required 同拒——服务形状与本地一致的非条件面）
     assert.throws(() => validatePlanOutput({ questions: ['q'] }), /materialPriorities/);
     // 基线合法性（防过度收紧）
-    validateChatOutput({ answer: 'a', citations: [], missingData: [], suggestedAction: null });
-    validateChatOutput({ answer: 'a', citations: [], missingData: [], suggestedAction: { type: 'NEW_TASK', cutoff: '2026-10-27', emphasis: null } });
+    validateChatOutput({ reportIdentity: { reportId: 'fixture-report', version: 1, contentHash: '1'.repeat(64) }, answer: 'a', citations: [], missingData: [], suggestedAction: null });
+    validateChatOutput({ reportIdentity: { reportId: 'fixture-report', version: 1, contentHash: '1'.repeat(64) }, answer: 'a', citations: [], missingData: [], suggestedAction: { type: 'NEW_TASK', cutoff: '2026-10-27', emphasis: null } });
   });
 });
 
@@ -379,7 +379,7 @@ describe('C5-03 协议必填一致性（最小响应双向验证）', () => {
 
   it('CHAT_ANSWER 最小响应 {answer, citations, missingData, suggestedAction} 通过校验；缺数组/动议在协议层即被拒', async () => {
     const { validateChatOutput, srOutputSchema } = await import('./transport.js');
-    validateChatOutput({ answer: 'a', citations: [], missingData: [], suggestedAction: null });
+    validateChatOutput({ reportIdentity: { reportId: 'fixture-report', version: 1, contentHash: '1'.repeat(64) }, answer: 'a', citations: [], missingData: [], suggestedAction: null });
     const schema = srOutputSchema('CHAT_ANSWER') as { required?: string[] };
     for (const f of ['answer', 'citations', 'missingData', 'suggestedAction']) assert.ok(schema.required?.includes(f), `CHAT required 缺 ${f}`);
   });

@@ -1,6 +1,6 @@
 /**
  * Lyra · Web 看板页面模板单测（W47: code-writer-pro）。
- * 纯函数测试（零网络零 DB）：escapeHtml、disposition 语义映射、Metis 布局骨架
+ * 纯函数与正常路由合成查询端口测试（零网络零 DB）：escapeHtml、disposition 语义映射、Metis 布局骨架
  * （.metis-app / sidebar / topbar / app-footer）、三个页面渲染器（数据对象 → HTML）、
  * 标的页标签页与证据抽屉（:target）、注入转义（XSS 防护）、合规标注恒在、无 JS。
  */
@@ -343,7 +343,7 @@ function conclusionsFixture(): ConclusionsPageData {
   return {
     rows: [
       {
-        conclusionId: 'cc-1',
+        conclusionId: 'cc-111111111111111111111111',
         subject: '601318',
         subjectKind: 'STOCK',
         researchKind: 'WEEKLY',
@@ -355,7 +355,7 @@ function conclusionsFixture(): ConclusionsPageData {
         createdAt: '2026-10-25T15:55:20.552Z',
       },
       {
-        conclusionId: 'cc-2',
+        conclusionId: 'cc-222222222222222222222222',
         subject: '002384',
         subjectKind: 'STOCK',
         researchKind: 'WEEKLY',
@@ -385,7 +385,9 @@ test('renderConclusionsHtml：表行、筛选选中态、分页链接、合规�
   assert.ok(html.includes('value="UNSETTLED" selected'));
   assert.ok(html.includes('命中'));
   assert.ok(html.includes('0.031200000000'));
-  assert.ok(html.includes('href="/subject/601318"'));
+  for (const c of conclusionsFixture().rows) {
+    assert.ok(html.includes(`href="/subject/${c.subject}?c=${encodeURIComponent(c.conclusionId)}"`));
+  }
   assert.ok(html.includes('个人研究记录，非投资建议'));
 });
 
@@ -394,6 +396,53 @@ test('renderConclusionsHtml：已结算筛选 → 历史导航态', () => {
   data.filters = { kind: null, disposition: null, settlement: 'SETTLED' };
   const html = renderConclusionsHtml(data);
   assert.ok(html.includes('已结算历史'));
+});
+
+test('I-18 历史列表两种链接经正常路由选择原结论，同股新结论不替换旧报告（合成查询端口，非 SQL 验证）', async () => {
+  const { handleRequest } = await import('./server.js');
+  const older = { ...fakeConclusion(), conclusionId: 'cc-111111111111111111111111' };
+  const latest = { ...fakeConclusion({ cutoff: '2026-10-30T07:00:00.000Z' }),
+    conclusionId: 'cc-222222222222222222222222', createdAt: '2026-11-01T00:00:00.000Z' };
+  const rows = [latest, older].map((c) => ({
+    conclusion_id: c.conclusionId, business_key: c.businessKey, method_version: c.methodVersion,
+    adapter_version: c.adapterVersion, plan_auth_version: c.planAuthVersion, disposition: c.disposition,
+    adoption: false, evidence: c.evidence, inheritance: c.inheritance, standalone_note: c.standaloneNote,
+    change_reason: c.changeReason, settlement: c.settlement, created_at: new Date(c.createdAt), conclusion_hash: c.conclusionHash,
+    subject: c.businessKey.subject, subject_kind: 'STOCK', research_kind: 'WEEKLY', settlement_state: 'UNSETTLED',
+    direction_hit: null, excess_return: null, tradability: null,
+  }));
+  const selectedIds: string[] = [];
+  const deps = {
+    pool: { query: async (sql: string, values: unknown[] = []) => {
+      if (sql.includes('from conclusion where conclusion_id = $1')) {
+        selectedIds.push(String(values[0])); return { rows: rows.filter((r) => r.conclusion_id === values[0]) };
+      }
+      if (sql.includes('count(*)::text as n from conclusion')) return { rows: [{ n: '2' }] };
+      if (sql.includes('from conclusion')) return { rows };
+      if (sql.includes('count(*)::text as n from pintime_fact')) return { rows: [{ n: '0' }] };
+      if (sql.includes('from pintime_fact') || sql.includes('from st_status_timeline')) return { rows: [] };
+      throw new Error(`Unsupported synthetic query: ${sql}`);
+    } },
+    poolInfo: { version: 'synthetic', frozenAt: '2026-10-01', stocks: [{ code: '600519', name: '公开合成公司', swL1Name: '未验证' }], etfs: [] },
+    invocations: { sourcesFor: async () => ({ aByHash: new Map(), jByHash: new Map() }) },
+    packages: { boundPackage: async () => null },
+  } as unknown as import('./server.js').WebDeps;
+  const list = await handleRequest(deps, 'GET', '/conclusions');
+  assert.equal(list.status, 200);
+  const hrefs = [...list.body.matchAll(/href="(\/subject\/600519\?c=cc-[a-zA-Z0-9]+)"/g)].map((m) => m[1]!);
+  assert.equal(hrefs.length, 4, '每行股票和报告两个入口');
+  const oldLinks = hrefs.filter((href) => href.endsWith(older.conclusionId));
+  assert.equal(oldLinks.length, 2);
+  for (const href of oldLinks) {
+    const report = await handleRequest(deps, 'GET', href);
+    assert.equal(report.status, 200);
+    assert.ok(report.body.includes(`研究报告 · 结论 ${older.conclusionId} · 资料截点 ${older.businessKey.cutoff}`));
+    assert.ok(!report.body.includes(`研究报告 · 结论 ${latest.conclusionId}`));
+  }
+  assert.deepEqual(selectedIds, [older.conclusionId, older.conclusionId]);
+  const defaultReport = await handleRequest(deps, 'GET', '/subject/600519');
+  assert.equal(defaultReport.status, 200);
+  assert.ok(defaultReport.body.includes(`研究报告 · 结论 ${latest.conclusionId}`));
 });
 
 test('renderConclusionsHtml：无匹配如实呈现', () => {
