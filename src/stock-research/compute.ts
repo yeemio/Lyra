@@ -217,10 +217,10 @@ export function computeMetrics(pack: EvidencePack, opts: { operatingScenarios?: 
   const official = findTable(pack, 'official-financials');
   if (official !== null) {
     const getOfficial = (period: string, metric: string): string | number | null => {
-      const r = official.rows.find((r) => r[colOf(official, 'reportPeriod')] === period && r[colOf(official, 'metric')] === metric);
+      const r = official.rows.find((r) => r[colOf(official, 'sourceSubject')] === pack.subject && r[colOf(official, 'reportPeriod')] === period && r[colOf(official, 'metric')] === metric);
       return r?.[colOf(official, 'value')] ?? null;
     };
-    const reconciliationRows = slices.filter((s) => getOfficial(s.period, 'operatingRevenue') !== null).map((s) => {
+    const reconciliationRows = slices.map((s) => {
       const operatingRaw = getOfficial(s.period, 'operatingRevenue');
       const totalRaw = getOfficial(s.period, 'totalRevenue');
       const consolidatedRaw = getOfficial(s.period, 'consolidatedNetProfit');
@@ -234,12 +234,12 @@ export function computeMetrics(pack: EvidencePack, opts: { operatingScenarios?: 
       const ratioTotal = div(num(consolidatedRaw), num(totalRaw));
       const ratioMatches = (r: number | null): boolean => sourceMargin !== null && r !== null && Math.abs(sourceMargin - r) <= 0.00000051;
       const marginDenominator = ratioMatches(ratioOp) ? '营业收入（同期间合并净利/营业收入与来源npMargin在6位小数精度吻合）' : ratioMatches(ratioTotal) ? '营业总收入（同期间数值核对吻合）' : '未核实；npMargin仅保留来源原值，不据MBRevenue反推';
-      const origin = official.rows.find((r) => r[colOf(official, 'reportPeriod')] === s.period);
+      const origin = official.rows.find((r) => r[colOf(official, 'sourceSubject')] === pack.subject && r[colOf(official, 'reportPeriod')] === s.period);
       return [s.period, fin === null ? null : cellAt(fin, s.rowIdx, colOf(fin, 'MBRevenue')), operatingRaw, totalRaw, incomeScope, fin === null ? null : cellAt(fin, s.rowIdx, colOf(fin, 'netProfit')), consolidatedRaw, parentRaw, deductedRaw, profitScope, fin === null ? null : cellAt(fin, s.rowIdx, colOf(fin, 'npMargin')), marginDenominator, origin?.[colOf(official, 'sourceUrl')] ?? null, origin?.[colOf(official, 'pages')] ?? null];
     });
     tables.push({ tableId: 'financial-source-reconciliation', title: '来源字段与同期间官方科目核对（不推广到其他公司/期次）', columns: ['period', 'sourceMBRevenueRaw', 'officialOperatingRevenue', 'officialTotalRevenue', 'sourceRevenueScope', 'sourceNetProfitRaw', 'officialConsolidatedNetProfit', 'officialParentNetProfit', 'officialDeductedParentNetProfit', 'sourceProfitScope', 'sourceNpMarginRaw', 'verifiedMarginDenominator', 'sourceUrl', 'pages'], rows: reconciliationRows,
       unitNote: '人民币元；原值字符串保留。两个收入分母分列；npMargin为来源小数原值，仅在同期间原件数值吻合时注明分母，不把MBRevenue默认为净利率分母。',
-      formula: '按报告期连接；来源收入/净利原值分别与官方科目核对；npMargin比对合并净利/营业收入及合并净利/营业总收入（容差0.51×10^-6，仅反映来源6位小数精度）；未匹配则未核实，不重写原字段。', inputs: ['fin-quarterly', 'official-financials'], locators: locatorsOf(['fin-quarterly', 'official-financials']), cutoff: pack.cutoff });
+      formula: '按来源公司与报告期连接；来源收入/净利原值分别与官方科目核对；npMargin比对合并净利/营业收入及合并净利/营业总收入（容差0.51×10^-6，仅反映来源6位小数精度）；未匹配则未核实，不重写原字段。', inputs: ['fin-quarterly', 'official-financials'], locators: locatorsOf(['fin-quarterly', 'official-financials']), cutoff: pack.cutoff });
   }
 
   // ---- quarterly-single：近 4 期单季拆分 ----
@@ -328,7 +328,7 @@ export function computeMetrics(pack: EvidencePack, opts: { operatingScenarios?: 
     if (series.length < n) return null;
     const last = series[series.length - 1];
     const base = series[series.length - n];
-    if (last === undefined || last === null || base === undefined || base === null || base === 0) return null;
+    if (last === undefined || last === null || base === undefined || base === null || base <= 0 || last <= 0) return null;
     return (last / base - 1) * 100;
   };
   const windowAvgAmount = (n: number): number | null => {
@@ -341,9 +341,30 @@ export function computeMetrics(pack: EvidencePack, opts: { operatingScenarios?: 
     const v = series.rows[series.rows.length - fromEnd]?.[dateColIdx];
     return v === undefined || v === null ? null : String(v);
   };
+  const windowIssue = (table: EvidenceTable | null, dateIndex: number, closeIndex: number, n: number): string | null => {
+    if (!table || table.rows.length < n) return 'WINDOW_TOO_SHORT';
+    const rows = table.rows.slice(-n);
+    const dates = rows.map((r) => String(r[dateIndex] ?? ''));
+    if (dates.some((d) => !/^\d{4}-\d{2}-\d{2}$/.test(d) || !Number.isFinite(Date.parse(d)) || new Date(d).toISOString().slice(0, 10) !== d)) return 'DATE_INVALID';
+    if (dates.some((d, i) => i > 0 && d <= dates[i - 1]!)) return 'DATE_ORDER_OR_DUPLICATE';
+    if (rows.some((r) => num(r[closeIndex] ?? null) === null || num(r[closeIndex] ?? null)! <= 0)) return 'PRICE_INVALID';
+    return null;
+  };
+  const basisKnown = (table: EvidenceTable | null, n: number): boolean => {
+    if (!table || table.priceBasis !== 'UNADJUSTED_PRICE') return false;
+    const flag = colOf(table, 'adjustflag');
+    return flag < 0 || table.rows.slice(-n).every((r) => String(r[flag]) === '3');
+  };
   const priceRows = PRICE_WINDOWS.map((n) => {
-    const stockRet = windowReturn(closes, n);
-    const benchRet = windowReturn(benchCloses, n);
+    const stockIssue = windowIssue(bars, dateCol, closeCol, n);
+    const benchIssue = windowIssue(bench, benchDateCol, benchCloseCol, n);
+    const stockRet = stockIssue ? null : windowReturn(closes, n);
+    const sameDates = bars?.rows.slice(-n).every((r, i) => r[dateCol] === bench?.rows.slice(-n)[i]?.[benchDateCol]) ?? false;
+    const reason = stockIssue ? `STOCK_${stockIssue}` : benchIssue ? `BENCHMARK_${benchIssue}`
+      : !sameDates ? 'DATE_WINDOW_MISMATCH'
+      : !basisKnown(bars, n) || !basisKnown(bench, n) ? 'PRICE_BASIS_UNVERIFIED' : null;
+    const benchRet = reason ? null : windowReturn(benchCloses, n);
+    checks.push({ name: `price-comparison-${n}`, ok: reason === null, detail: reason ?? '所给两组日期序列一致，均为已声明的未复权价格；未据此证明交易日历完整或总收益' });
     return [
       n,
       stockRet,
@@ -352,21 +373,24 @@ export function computeMetrics(pack: EvidencePack, opts: { operatingScenarios?: 
       windowAvgAmount(n),
       closes.length >= n ? barDateOf(bars, dateCol, n) : null,
       benchCloses.length >= n ? barDateOf(bench, benchDateCol, n) : null,
+      barDateOf(bars, dateCol, 1),
+      barDateOf(bench, benchDateCol, 1),
+      reason,
     ];
   });
   tables.push({
     tableId: 'price-performance',
     title: `价格表现与超额（窗口 ${PRICE_WINDOWS.join('/')} 个交易日）`,
-    columns: ['windowDays', 'stockReturnPct', 'benchmarkReturnPct', 'excessPct', 'avgAmount', 'baseDate', 'benchmarkBaseDate'],
+    columns: ['windowDays', 'stockReturnPct', 'benchmarkReturnPct', 'excessPct', 'avgAmount', 'baseDate', 'benchmarkBaseDate', 'endDate', 'benchmarkEndDate', 'comparisonReason'],
     rows: priceRows,
     unitNote:
       '收益/超额单位 %；avgAmount 单位元/日（窗口内非空成交额的算术平均）。' +
-      'K 线不足 N 根 → 该窗口 null（如实，不外推）。基准为 index-bars 所载指数（口径见证据包 unitNote）。',
+      'K 线不足、所给日期序列不一致或价格口径未证实 → 基准比较及超额为 null，原因逐窗口列示。只比较未复权价格，不含分红，不证明交易日历完整。基准为 index-bars 所载指数。',
     locators: locatorsOf(['bars-daily', 'index-bars']),
     cutoff: pack.cutoff,
     formula:
       '窗口收益% = (窗口末根收盘 ÷ 窗口首根收盘 − 1) × 100（窗口=最近 N 根 K 线，含首尾）；' +
-      '超额% = 个股窗口收益 − 基准同窗口收益；两列基准日期列为窗口首根日期。',
+      '超额百分点 = 个股窗口收益 − 基准同窗口收益，仅在全部对应日期与未复权价格口径一致时成立。',
     inputs: ['bars-daily', 'index-bars'],
   });
   const lastBarDate = barDateOf(bars, dateCol, 1);
@@ -380,7 +404,7 @@ export function computeMetrics(pack: EvidencePack, opts: { operatingScenarios?: 
     detail:
       `个股末根 ${lastBarDate ?? '无'}，基准末根 ${lastBenchDate ?? '无'}；` +
       (lastBarDate !== null && lastBenchDate !== null && lastBarDate !== lastBenchDate
-        ? '末根日期不一致（超额仍按各自窗口计算，差异如实呈现）'
+        ? '末根日期不一致，基准比较及超额置 null'
         : '末根日期一致'),
   });
 
@@ -469,8 +493,7 @@ export function computeMetrics(pack: EvidencePack, opts: { operatingScenarios?: 
       t.title = `历史行情口径（截至${lastBarDate ?? '未知'}）：${t.title}`;
       t.unitNote += ' 历史日线未延伸至资料截点，不代表当前技术信号；当前行情快照及官方期次估值见 shipping-snapshot-valuation，不拼接两类行情。';
       if (t.tableId === 'price-performance') {
-        for (const r of t.rows) if (lastBarDate !== lastBenchDate || r[5] !== r[6]) { r[2] = null; r[3] = null; }
-        t.unitNote += ` 个股末日${lastBarDate ?? '未知'}，基准末日${lastBenchDate ?? '未知'}；起止日不一致的基准比较与超额列置null。`;
+        t.unitNote += ` 个股末日${lastBarDate ?? '未知'}，基准末日${lastBenchDate ?? '未知'}；比较沿用所有公司的同一日期与价格口径校验。`;
       }
     }
     const alignment = checks.find((c) => c.name === 'bars-benchmark-last-date-aligned');

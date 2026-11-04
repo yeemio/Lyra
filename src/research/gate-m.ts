@@ -18,10 +18,8 @@
  * 真实模型的输入就是 prompt 本身；preparePermit 据此做超预算阻断。
  */
 import type { Pool } from 'pg';
-import { canonicalJsonString, canonicalSha256 } from '../canonical.js';
 import {
   KernelError,
-  validDispositions,
   type AOutput,
   type ConclusionObject,
   type JOutput,
@@ -35,26 +33,24 @@ import { runModelCall } from '../kernel/executor.js';
 import type { ModelTransport } from '../kernel/transport.js';
 import {
   SolTransport,
-  aOutputWireSchema,
-  jOutputWireSchema,
   type SolInvocationPlan,
   type SolTransportConfig,
 } from '../kernel/sol-transport.js';
-import { A_INSTRUCTIONS, J_DUTIES, METHOD_P2_VERSION } from '../method/text.js';
-import { persistConclusion } from '../db/conclusion.js';
+import { RESEARCH_REPAIR_METHOD_VERSION } from './indicators.js';
 import {
   assembleResearchInput,
-  renderInputLayers,
   validateResearchInputPackage,
   type AssembledResearchInput,
   type AssembleVersions,
   type InputBudget,
-  type LayerBlockView,
   type PackageValidationSummary,
   type ResearchInputPackage,
 } from './inputs.js';
 import { deriveChecklist, type DimensionCoveragePkg } from './checklist.js';
 import { simulatedModelA } from './simulated.js';
+import { renderAPrompt, renderJPrompt, buildARequest, buildJRequest, researchMaterial, assertAssembledIdentity } from './requests.js';
+import { validateResearchA, validateResearchJ, researchJInputHash } from './validation.js';
+import { persistResearchConclusion } from './trace.js';
 import { buildReportView, renderReportText, type ReportView } from './report.js';
 
 // ===== Gate-M 冻结缺省（R27 / GATE-M-APPLICATION）=====
@@ -74,9 +70,9 @@ export const GATE_M_PLAN_BUDGET: PlanAuthBudget = {
   maxInFlight: 2,
 };
 
-/** Gate-M 版本轴（方法 = 冻结正文；数据 = P1 面；授权 = Gate-M 单）。 */
+/** 修复后普通研究方法身份；旧方法正文仍保留，P5 不自动切换或借用旧接受。 */
 export const GATE_M_VERSIONS: AssembleVersions = {
-  methodVersion: METHOD_P2_VERSION,
+  methodVersion: RESEARCH_REPAIR_METHOD_VERSION,
   adapterVersion: 'data@p1',
   planAuthVersion: GATE_M_PLAN_BUDGET.planAuthVersion,
 };
@@ -97,6 +93,8 @@ export interface GateMDeps {
   store: ArtifactStore;
   /** 真跑的模型通道（SolTransport；干跑不触碰）。 */
   transport: ModelTransport;
+  /** 组装依赖注入，隔离测试供给公开合成包；生产缺省仍读实际事实/封存。 */
+  assembleInput?: typeof assembleResearchInput;
 }
 
 export interface GateMOptions {
@@ -119,7 +117,7 @@ export interface GateMOptions {
   /** argv/prompt 预览用的 Sol 配置（预览实例恒 dryRun，绝不 spawn）。 */
   solTransportConfig?: Partial<SolTransportConfig>;
   poolInfoFile?: string;
-  /** 打捞路径（R28 缺陷处置）：复用一次已发生的真实 A 调用产物（final.txt 路径）。校验 inputHash 绑定后跳过 A 的 permit 调用，仅执行 J——A 的历史 FAILED permit 保留不改，输出作为与输入绑定的真实模型产物使用。 */
+  /** 旧打捞参数保留为具名拒绝入口；未绑定原 permit/送达包时不猜文件名和封存。 */
   aFrom?: string;
 }
 
@@ -161,94 +159,7 @@ export type GateMOutcome =
 
 // ===== prompt 渲染 =====
 
-const SECTION = '='.repeat(72);
-
-function renderBlock(layer: 'L0' | 'L1' | 'L2', block: LayerBlockView): string {
-  return `### [${layer}] ${block.materialId} · ${block.title}（${String(block.bytes)} 字节）\n${canonicalJsonString(block.payload)}`;
-}
-
-function renderCoverage(pkg: ResearchInputPackage): string {
-  const lines = [
-    'coverage 声明（RM §5：送达/降级/缺口三态。被降级材料只作为限制进入 limitations，不得假装读过；缺口不得当作无风险）',
-  ];
-  for (const d of pkg.dimensions) {
-    const demoted = d.demoted.length > 0 ? ` [${d.demoted.join(', ')}]` : '';
-    const gaps = d.gap.length > 0 ? `：${d.gap.join('；')}` : '';
-    lines.push(
-      `- 维度${d.dimension} ${d.code}（${d.name}）：送达 ${d.delivered.length} 件 [${d.delivered.join(', ')}]；降级 ${d.demoted.length} 件${demoted}；缺口 ${d.gap.length} 条${gaps}`,
-    );
-  }
-  const { l0, l1, l2 } = pkg.layers;
-  lines.push(
-    `分层字节（canonical JSON UTF-8 真实字节）：L0 ${l0.bytes}/${l0.budget} · L1 ${l1.bytes}/${l1.budget} · L2 ${l2.bytes}/${l2.budget}`,
-  );
-  return lines.join('\n');
-}
-
-/** A prompt：方法正文 A_INSTRUCTIONS 全文 + 分层渲染（L0+L1 文本 + L2 目录）+ coverage + 输出 schema 说明。 */
-export function renderAPrompt(pkg: ResearchInputPackage): string {
-  const view = renderInputLayers(pkg);
-  const space = validDispositions(pkg.businessKey.subjectKind);
-  return [
-    A_INSTRUCTIONS,
-    SECTION,
-    '研究输入（本轮封存、按分层实际送达；证据引用只能指向 L2 索引目录中出现的事实与原件）',
-    '',
-    '—— L0（背景，不可裁剪）——',
-    ...view.l0.map((b) => renderBlock('L0', b)),
-    '',
-    '—— L1（会改变判断的证据）——',
-    ...view.l1.map((b) => renderBlock('L1', b)),
-    '',
-    '—— L2（索引目录）——',
-    ...view.l2.map((b) => renderBlock('L2', b)),
-    '',
-    SECTION,
-    renderCoverage(pkg),
-    SECTION,
-    [
-      '输出要求（结构有效性由程序校验，缺任一项即结构无效，本轮无有效 A）',
-      '- 只输出一个 JSON 对象：无 markdown 代码围栏、无前后解释文字；',
-      `- 绑定字段：inputHash 必须原样回抄本值 required_input_hash = "${pkg.inputHash}"；`,
-      `- candidate 只能取自本标的（${pkg.businessKey.subjectKind}）选项空间：${space.join(' / ')}（跨类无效，R18）；`,
-      '- decisiveLinks 至少 2 条；每条 evidenceArtifactSha256 必须是本轮 L2 索引 deliveredFacts[].artifactSha256 或封存 seals[].artifactRefs[].sha256 中实际出现的 64 位十六进制原件哈希；',
-      '- simulated 是通道自声明字段（R28）：本调用为真实模型通道，输出 false；',
-      '- 完整形状（JSON Schema，逐字段约束，字段集封闭不得增删）：',
-      JSON.stringify(aOutputWireSchema(pkg.businessKey.subjectKind), null, 1),
-    ].join('\n'),
-  ].join('\n');
-}
-
-/** J prompt：J_DUTIES 全文 + A 输出全文 + 清单全文 + 输入绑定 + 输出 schema 说明。 */
-export function renderJPrompt(
-  subjectKind: SubjectKind,
-  aOutput: AOutput,
-  checklist: ProgramChecklist,
-  jInputHash: string,
-): string {
-  const space = validDispositions(subjectKind);
-  return [
-    J_DUTIES,
-    SECTION,
-    'A 输出全文（本轮分析者输出；程序已按其机械抽取下列清单）',
-    canonicalJsonString(aOutput),
-    SECTION,
-    '程序清单全文（程序机械抽取，程序无独立意见；你必须逐项裁决恰好一次）',
-    canonicalJsonString(checklist),
-    SECTION,
-    [
-      '输入绑定与输出要求（结构有效性由程序校验）',
-      `- required_input_hash = "${jInputHash}"；输出 inputHash 字段必须原样回抄该值，不回抄或回抄不一致即输出无效；`,
-      '- 只输出一个 JSON 对象：无 markdown 代码围栏、无前后解释文字；',
-      `- verdicts 必须恰好覆盖清单全部 checklistId 各一次（清单共 ${checklist.items.length} 项：${checklist.items.map((i) => i.checklistId).join(', ')}），不得跳项、合并或重复；`,
-      `- finalDisposition 只能取自本标的（${subjectKind}）选项空间：${space.join(' / ')}（跨类无效，R18）；`,
-      '- changedFromA 为 true 时 changeReason 必填非空；',
-      '- simulated 是通道自声明字段（R28）：本调用为真实模型通道，输出 false；',
-      '- 完整形状（JSON Schema，逐字段约束，字段集封闭不得增删）：',
-      JSON.stringify(jOutputWireSchema(subjectKind), null, 1),
-    ].join('\n'),
-  ].join('\n');
-}
+export { renderAPrompt, renderJPrompt } from './requests.js';
 
 // ===== prompt 组装（干跑与真跑共用）=====
 
@@ -260,11 +171,11 @@ export interface GateMPromptBundle {
 
 /** 组装真实输入包 + 渲染 A prompt（组装器/校验器复用，W11 既有公开 API）。 */
 export async function buildGateMPrompts(
-  deps: Pick<GateMDeps, 'dataPool' | 'store'>,
+  deps: Pick<GateMDeps, 'dataPool' | 'store' | 'assembleInput'>,
   opts: GateMOptions,
 ): Promise<GateMPromptBundle> {
   const subjectKind: SubjectKind = opts.subjectKind ?? 'STOCK';
-  const assembled = await assembleResearchInput(deps.dataPool, deps.store, {
+  const assembled = await (deps.assembleInput ?? assembleResearchInput)(deps.dataPool, deps.store, {
     subjectKind,
     subject: opts.subject,
     cutoff: opts.cutoff,
@@ -272,7 +183,7 @@ export async function buildGateMPrompts(
     versions: opts.versions ?? GATE_M_VERSIONS,
     ...(opts.poolInfoFile === undefined ? {} : { poolInfoFile: opts.poolInfoFile }),
   });
-  const aPrompt = renderAPrompt(assembled.package);
+  const aPrompt = renderAPrompt(assembled.package, false);
   return { assembled, aPrompt, aPromptBytes: Buffer.byteLength(aPrompt, 'utf8') };
 }
 
@@ -281,11 +192,7 @@ export async function buildGateMPrompts(
 function estimateJPrompt(
   pkg: ResearchInputPackage,
 ): { jPrompt: string; jPromptBytes: number; jInputHash: string; checklist: ProgramChecklist } {
-  const material = {
-    artifactSha256s: pkg.seals.flatMap((s) => s.artifactRefs.map((r) => r.sha256)).slice(0, 12),
-    factCount: pkg.seals.reduce((n, s) => n + s.factIds.length, 0),
-    gaps: pkg.dimensions.flatMap((c) => c.gap),
-  };
+  const material = researchMaterial(pkg);
   const simulatedA = simulatedModelA({
     inputHash: pkg.inputHash,
     subjectKind: pkg.businessKey.subjectKind,
@@ -293,8 +200,8 @@ function estimateJPrompt(
     material,
   });
   const checklist = deriveChecklist(simulatedA, pkg.seals[0]?.manifestHash ?? '00'.repeat(32));
-  const jInputHash = canonicalSha256({ a: simulatedA, checklist });
-  const jPrompt = renderJPrompt(pkg.businessKey.subjectKind, simulatedA, checklist, jInputHash);
+  const jInputHash = researchJInputHash(pkg, simulatedA, checklist);
+  const jPrompt = renderJPrompt(pkg, simulatedA, checklist, jInputHash);
   return { jPrompt, jPromptBytes: Buffer.byteLength(jPrompt, 'utf8'), jInputHash, checklist };
 }
 
@@ -318,13 +225,18 @@ function coveragePkgOf(pkg: ResearchInputPackage): DimensionCoveragePkg {
 }
 
 export async function runGateM(deps: GateMDeps, opts: GateMOptions): Promise<GateMOutcome> {
+  if (opts.aFrom !== undefined) throw new KernelError('SALVAGE_A_UNBOUND', '旧 aFrom 仅凭文件名/时间猜封存，缺少原 permit 与送达包证明；可信恢复由 PR#4 单独处理');
   const subjectKind: SubjectKind = opts.subjectKind ?? 'STOCK';
   const budget = opts.budget ?? GATE_M_PLAN_BUDGET;
   const versions = opts.versions ?? GATE_M_VERSIONS;
+  if (versions.planAuthVersion !== budget.planAuthVersion) throw new KernelError('RESEARCH_INPUT_UNBOUND', '材料包与执行预算的授权版本不符');
 
   // 1) 组装 + A prompt（真实数据；组装器自带分层预算闸与 coverage）。
   const bundle = await buildGateMPrompts(deps, { ...opts, subjectKind });
-  const { assembled, aPrompt, aPromptBytes } = bundle;
+  const { assembled } = bundle;
+  assertAssembledIdentity(assembled, { subjectKind, subject: opts.subject, cutoff: opts.cutoff, researchKind: 'WEEKLY' }, versions);
+  const aPrompt = renderAPrompt(assembled.package, opts.execute === true && deps.transport.describe().simulated);
+  const aPromptBytes = Buffer.byteLength(aPrompt, 'utf8');
   const pkg = assembled.package;
   const businessKey = pkg.businessKey; // 组装器规范化后的业务键（send-once 键）
 
@@ -368,74 +280,22 @@ export async function runGateM(deps: GateMDeps, opts: GateMOptions): Promise<Gat
   }
 
   // ---- 真跑：恰两次模型调用（授权 2；任一环失败即停，无重试）----
-  if (opts.aFrom !== undefined) {
-    // 打捞（R28 缺陷处置）：复用已发生的真实 A 产物；inputHash 强绑定；不再产生 A permit。
-    const { readFile } = await import('node:fs/promises');
-    const salvaged = JSON.parse(await readFile(opts.aFrom, 'utf8')) as AOutput;
-    if (salvaged.stage !== 'A' || salvaged.subjectKind !== subjectKind) throw new KernelError('SALVAGE_A_UNBOUND', '打捞 A 的 stage/subjectKind 不符');
-    // 材料绑定证明（v2，强于 prompt 比对）：从 seal_manifest 取回 A 产物当时的原始封存（不可变行），
-    // 校验打捞 A 的全部证据哈希 ⊆ 原始封存原件集；结论绑定原始 manifest；当前组装仅作报告展示。
-    const stamp = opts.aFrom.match(/sol-(\d{4})-(\d{2})-(\d{2})T(\d{2})(\d{2})(\d{2})/);
-    if (stamp === null) throw new KernelError('SALVAGE_A_UNBOUND', 'aFrom 路径无法解析 invocation 时间戳');
-    const invAt = `${stamp[1]}-${stamp[2]}-${stamp[3]}T${stamp[4]}:${stamp[5]}:${stamp[6]}.000Z`;
-    const sealRows = await deps.dataPool.query(
-      `select seal_id, business_key, cutoff, artifact_refs, fact_ids, gaps, method_version, adapter_version, plan_auth_version, created_at, manifest_hash
-         from seal_manifest
-        where business_key->>'subject' = $1 and business_key->>'researchKind' = 'WEEKLY' and business_key->>'subjectKind' = $2
-          and cutoff = $3 and created_at <= $4::timestamptz
-        order by created_at asc limit 2`,
-      [businessKey.subject, subjectKind, businessKey.cutoff, invAt],
-    );
-    if (sealRows.rows.length < 1) throw new KernelError('SALVAGE_A_UNBOUND', '未找到 A 产物当时的原始封存');
-    type SealRow = { seal_id: string; business_key: unknown; cutoff: Date; artifact_refs: unknown; fact_ids: unknown; gaps: unknown; method_version: string; adapter_version: string; plan_auth_version: string; created_at: Date; manifest_hash: string };
-    const toManifest = (r: SealRow) => ({
-      sealId: r.seal_id, businessKey: JSON.parse(JSON.stringify(r.business_key)), cutoff: new Date(r.cutoff).toISOString(),
-      artifactRefs: JSON.parse(JSON.stringify(r.artifact_refs)), factIds: JSON.parse(JSON.stringify(r.fact_ids)),
-      gaps: JSON.parse(JSON.stringify(r.gaps)), methodVersion: r.method_version, adapterVersion: r.adapter_version,
-      planAuthVersion: r.plan_auth_version, createdAt: new Date(r.created_at).toISOString(), manifestHash: r.manifest_hash,
-    });
-    const originalSeals = sealRows.rows.map((r) => toManifest(r as SealRow));
-    const originalManifest = originalSeals[0]!;
-    const originalArtifactSet = new Set(originalSeals.flatMap((seal) => seal.artifactRefs.map((r: { sha256: string }) => r.sha256)));
-    const unboundEvidence = salvaged.decisiveLinks.map((l) => l.evidenceArtifactSha256).filter((h) => !originalArtifactSet.has(h));
-    if (unboundEvidence.length > 0) throw new KernelError('SALVAGE_A_UNBOUND', `打捞 A 存在原始封存之外证据：${unboundEvidence.join(',').slice(0, 120)}`);
-    if (!validDispositions(subjectKind).includes(salvaged.candidate)) throw new KernelError('SALVAGE_A_UNBOUND', `打捞 A 候选越界：${salvaged.candidate}`);
-    if (!Array.isArray(salvaged.decisiveLinks) || salvaged.decisiveLinks.length < 2) throw new KernelError('SALVAGE_A_UNBOUND', '打捞 A 决定性连接不足 2 条');
-    const manifest0 = originalManifest;
-    const checklist0 = deriveChecklist(salvaged, manifest0.manifestHash, coveragePkgOf(pkg));
-    const jInputHash0 = canonicalSha256({ a: salvaged, checklist: checklist0 });
-    const jPrompt0 = renderJPrompt(subjectKind, salvaged, checklist0, jInputHash0);
-    const j0 = await runModelCall<JOutput>(deps.execPool, {
-      contract: { businessKey, stage: 'J', inputHash: jInputHash0, inputBytes: Buffer.byteLength(jPrompt0, 'utf8'), methodVersion: versions.methodVersion, planAuthVersion: budget.planAuthVersion, deadline: deadlineOf() },
-      budget,
-      modelFn: async (ctx) => (await deps.transport.dispatch(ctx.contract, { inputHash: jInputHash0, subjectKind, prompt: jPrompt0, expectedChecklistIds: checklist0.items.map((i) => i.checklistId) })) as JOutput,
-      simulated: deps.transport.describe().simulated,
-      ...(opts.holderId === undefined ? {} : { holderId: opts.holderId }),
-    });
-    const conclusion0 = await persistConclusion(deps.execPool, {
-      businessKey,
-      methodVersion: versions.methodVersion, adapterVersion: versions.adapterVersion, planAuthVersion: budget.planAuthVersion,
-      aOutput: salvaged, checklist: checklist0, jOutput: j0.output, manifest: manifest0,
-      checklistCoverage: coveragePkgOf(pkg),
-      inheritance: null, changeReason: j0.output.changedFromA ? j0.output.changeReason : null,
-    });
-    const reportView0 = buildReportView(conclusion0, pkg, salvaged, checklist0, j0.output);
-    return { mode: 'execute', assembled, validation, prompts: { aPrompt, aPromptBytes, jPrompt: jPrompt0, jPromptBytes: Buffer.byteLength(jPrompt0, 'utf8'), jPromptBasis: 'real-a-output' }, permits: { a: null, aSalvagedFrom: opts.aFrom, j: j0.permit }, conclusion: conclusion0, reportView: reportView0, reportText: renderReportText(reportView0) };
-  }
+  const simulated = deps.transport.describe().simulated;
+  const aRequest = buildARequest(pkg, simulated);
   // A：contract.inputBytes = prompt 真实字节数（预算闸 EK-4.4 用真实口径）。
   const a = await runModelCall<AOutput>(deps.execPool, {
     contract: {
       businessKey,
       stage: 'A',
-      inputHash: assembled.inputHash,
-      inputBytes: aPromptBytes,
+      inputHash: aRequest.inputHash,
+      inputBytes: aRequest.inputBytes,
       methodVersion: versions.methodVersion,
       planAuthVersion: budget.planAuthVersion,
       deadline: deadlineOf(),
     },
     budget,
     modelFn: async (ctx) =>
-      (await deps.transport.dispatch(ctx.contract, { inputHash: assembled.inputHash, subjectKind, prompt: aPrompt })) as AOutput,
+      validateResearchA(await deps.transport.dispatch(ctx.contract, aRequest.payload), pkg, simulated),
     simulated: deps.transport.describe().simulated,
     ...(opts.holderId === undefined ? {} : { holderId: opts.holderId }),
   });
@@ -444,10 +304,11 @@ export async function runGateM(deps: GateMDeps, opts: GateMOptions): Promise<Gat
   const manifest = pkg.seals[0];
   if (manifest === undefined) throw new KernelError('SEAL_MISSING', '输入包无封存 manifest');
   const checklist = deriveChecklist(a.output, manifest.manifestHash, coveragePkgOf(pkg));
-  const jInputHash = canonicalSha256({ a: a.output, checklist });
+  const jRequest = buildJRequest(pkg, a.output, checklist, simulated);
+  const jInputHash = jRequest.inputHash;
 
   // J：prompt = J_DUTIES + A 输出全文 + 清单全文 + 绑定与 schema 说明。
-  const jPrompt = renderJPrompt(subjectKind, a.output, checklist, jInputHash);
+  const jPrompt = jRequest.payload.prompt;
   const jPromptBytes = Buffer.byteLength(jPrompt, 'utf8');
   const j = await runModelCall<JOutput>(deps.execPool, {
     contract: {
@@ -461,23 +322,19 @@ export async function runGateM(deps: GateMDeps, opts: GateMOptions): Promise<Gat
     },
     budget,
     modelFn: async (ctx) =>
-      (await deps.transport.dispatch(ctx.contract, {
-        inputHash: jInputHash,
-        subjectKind,
-        prompt: jPrompt,
-        expectedChecklistIds: checklist.items.map((i) => i.checklistId),
-      })) as JOutput,
+      validateResearchJ(await deps.transport.dispatch(ctx.contract, jRequest.payload), pkg, a.output, checklist, simulated, coveragePkgOf(pkg)),
     simulated: deps.transport.describe().simulated,
     ...(opts.holderId === undefined ? {} : { holderId: opts.holderId }),
   });
 
   // 结论落库（STANDALONE 周度；J 改判 A 候选时 changeReason 必填由构造器校验）。
-  const conclusion = await persistConclusion(deps.execPool, {
+  const conclusion = await persistResearchConclusion(deps.execPool, deps.store, {
     businessKey,
     methodVersion: versions.methodVersion,
     adapterVersion: versions.adapterVersion,
     planAuthVersion: budget.planAuthVersion,
     aOutput: a.output,
+    researchInput: pkg,
     checklist,
     jOutput: j.output,
     manifest,

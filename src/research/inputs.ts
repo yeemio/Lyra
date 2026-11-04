@@ -35,12 +35,15 @@ import { asOfFacts, loadFact } from '../pintime/facts.js';
 import { buildSeal, sealManifestContent } from '../pintime/seal.js';
 import { SW2014_GAP, SW_CLASS_SOURCE_GAP } from '../adapters/swclass.js';
 import { SW_CLASS_SOURCE_GAP_CLOSED } from '../adapters/sw.js';
+import { EMUNLOCK_ADAPTER_VERSION, unlockEventFields } from '../adapters/emunlock.js';
 import { loadStockPESamples, industryMedianPE, stockPEOf, pePercentileOf } from './industry-valuation.js';
-import { decFromString } from '../settlement/decimal.js';
-import { computeIndicators } from './indicators.js';
+import { decFromString, decToString } from '../settlement/decimal.js';
+import { computeIndicators, indicatorVersionForMethod, EMA_INDICATOR_VERSION, type IndicatorVersion } from './indicators.js';
 import { qualityIndicators } from './quality.js';
 import { industryMomentumTable, type IndustryMomentumTable } from './rotation.js';
 import { assertRoundTrip, barsToTable, type BarTable } from './tables.js';
+import { loadReferenceVersion } from '../reference/library.js';
+import { etfMappingContent, freezeBenchmark, selectIndustryBenchmark, trackingIndexCode, validateFrozenBenchmark, type FrozenBenchmark } from '../conclusion/benchmark.js';
 
 /** 组装器具名错误（超预算除外——超预算按 EK-4.4 用 KernelError('INPUT_OVER_BUDGET')）。 */
 export class ResearchInputError extends Error {
@@ -52,8 +55,8 @@ export class ResearchInputError extends Error {
 
 // ===== 冻结常量（规则表随包携带并哈希钉扎）=====
 
-export const ASSEMBLER_RULES_VERSION = 'research-inputs@p2-v1';
-export const PACKAGE_VERSION = 1;
+export const ASSEMBLER_RULES_VERSION = 'research-inputs@pit-v2';
+export const PACKAGE_VERSION = 2;
 
 /** 维度材料映射规则（可验收条款）。priority 小者先装填 L1。 */
 export interface DimensionRule {
@@ -164,9 +167,6 @@ export const RECENT_BARS = 120;
 /** 财务近报告期数（D1）。 */
 export const RECENT_REPORT_PERIODS = 8;
 
-/** 申万体系序（D6 规则：多版本并存取体系序最末）。 */
-const SW_SYSTEM_RANK: Record<string, number> = { pre2014: 0, '2014': 1, '2021': 2 };
-
 // ===== 池信息 =====
 
 export interface PoolSubjectEntry {
@@ -206,8 +206,7 @@ function findPoolSubject(info: PoolInfo, kind: SubjectKind, subject: string): Po
 
 /** 跟踪指数代码：池文件 tracks 形如 "沪深300(000300)"。 */
 export function trackingIndexOf(tracks: string): string | null {
-  const m = /(\d{6})/.exec(tracks);
-  return m === null ? null : (m[1] as string);
+  return trackingIndexCode(tracks);
 }
 
 // ===== 材料 / 层 / 包对象 =====
@@ -218,6 +217,8 @@ export interface MaterialBase {
   /** 维度号；0 = 非维度材料（L0 身份/规则/回执、L2 索引）。 */
   dimension: number;
   factIds: string[];
+  /** 按封存事实构造的精确配对；旧归档可缺，新的可执行包必须携带。 */
+  evidenceRefs?: { factId: string; artifactSha256: string }[];
 }
 
 export interface BarTableMaterial extends MaterialBase {
@@ -267,11 +268,11 @@ export type Material = BarTableMaterial | RecordsMaterial | NoteMaterial | Index
 export function modelPayloadOf(material: Material): Record<string, unknown> {
   switch (material.kind) {
     case 'BAR_TABLE':
-      return { title: material.title, header: material.table.header, rows: material.table.rows };
+      return { title: material.title, header: material.table.header, rows: material.table.rows, ...(material.evidenceRefs === undefined ? {} : { evidenceRefs: material.evidenceRefs }) };
     case 'RECORDS':
-      return { title: material.title, records: material.records };
+      return { title: material.title, records: material.records, ...(material.evidenceRefs === undefined ? {} : { evidenceRefs: material.evidenceRefs }) };
     case 'NOTE':
-      return { title: material.title, text: material.text };
+      return { title: material.title, text: material.text, ...(material.evidenceRefs === undefined ? {} : { evidenceRefs: material.evidenceRefs }) };
     case 'INDEX':
       return {
         title: material.title,
@@ -320,6 +321,8 @@ export interface ResearchInputPackage {
   packageKind: 'RESEARCH_INPUT';
   packageVersion: number;
   assemblerRulesVersion: string;
+  /** v2 必填；v1 旧包不补写，以保留原哈希。 */
+  benchmark?: FrozenBenchmark;
   businessKey: ResearchBusinessKey;
   cutoff: string;
   pool: { file: string; frozenAt: string; subject: PoolSubjectEntry };
@@ -433,36 +436,12 @@ interface SwAttribution {
   l1IndexCode: string | null;
 }
 
-/** 截点当时有效申万归属（D6 规则：区间含截点；体系序最末；同序 validFrom 最新）。 */
+/** 截点当时有效申万归属；与结算共用窗口体系、区间与确定性选择规则。 */
 export function pickSwIndustryAt(facts: TimePointFact[], cutoff: Date): SwAttribution | null {
-  const valid = facts.filter((f) => {
-    if (f.factKind !== 'INDUSTRY_CLASS_VERSION') return false;
-    const system = tv(f).体系;
-    if (typeof system !== 'string') return false; // 证监会轴（classVersion）不参与申万基准选择
-    const from = f.validFrom === null ? null : new Date(f.validFrom).getTime();
-    const to = f.validTo === null ? null : new Date(f.validTo).getTime();
-    const c = cutoff.getTime();
-    if (from !== null && from > c) return false;
-    if (to !== null && to <= c) return false;
-    return true;
-  });
-  if (valid.length === 0) return null;
-  valid.sort((a, b) => {
-    const ra = SW_SYSTEM_RANK[String(tv(a).体系)] ?? -1;
-    const rb = SW_SYSTEM_RANK[String(tv(b).体系)] ?? -1;
-    if (ra !== rb) return ra - rb;
-    const fa = new Date(a.validFrom ?? a.availableAt).getTime();
-    const fb = new Date(b.validFrom ?? b.availableAt).getTime();
-    if (fa !== fb) return fa - fb;
-    return a.factId < b.factId ? -1 : 1;
-  });
-  const fact = valid[valid.length - 1] as TimePointFact;
-  const l1 = tv(fact).l1IndexCode;
-  return {
-    fact,
-    system: String(tv(fact).体系),
-    l1IndexCode: typeof l1 === 'string' && l1.length > 0 ? l1 : null,
-  };
+  const subject = facts.find((f) => f.subjectType === 'STOCK' && f.factKind === 'INDUSTRY_CLASS_VERSION')?.subjectId;
+  if (subject === undefined) return null;
+  const selected = selectIndustryBenchmark(facts, subject, cutoff);
+  return selected === null ? null : { fact: selected.fact, system: selected.system, l1IndexCode: selected.industry?.industryIndexCode ?? null };
 }
 
 function countByKind(facts: TimePointFact[]): Record<string, number> {
@@ -487,7 +466,8 @@ function buildStockDimensions(
   poolSubject: PoolSubjectEntry,
   cutoff: Date,
   sw: SwAttribution | null,
-inquiryEvents?: InquiryEventRow[], referenceGroups?: ReferenceGroupRow[], rotationTable?: IndustryMomentumTable | null, industryValuation?: { table: ReturnType<typeof industryMedianPE>; stockPE: string | null; stockIndustryPercentile: string | null } | null): DimensionBuild[] {
+  indicatorVersion: IndicatorVersion,
+inquiryEvents?: InquiryEventRow[], referenceGroups?: ReferenceGroupSet, rotationTable?: IndustryMomentumTable | null, industryValuation?: IndustryValuationMaterial | null): DimensionBuild[] {
   const builds: DimensionBuild[] = [];
   const windowStart = cutoff.getTime() - RECENT_QUARTERS_WINDOW_DAYS * 86_400_000;
   const gapsOf = (dim: number, list: string[]): string[] => list.map((g) => `D${dim}: ${g}`);
@@ -589,11 +569,11 @@ inquiryEvents?: InquiryEventRow[], referenceGroups?: ReferenceGroupRow[], rotati
     if (industryValuation !== null && industryValuation !== undefined) {
       d2Materials.push({
         materialId: 'mat:2:industry-valuation-cross-section',
-        title: `估值：行业估值截面表（自算中位 PE，as-of ${industryValuation.table.asOf}；口径=行业成分股 close/epsTTM 中位数，覆盖 n<5 标 lowCoverage——代表性受限，随财务覆盖扩展自动改善；缺失行业：${industryValuation.table.missingIndustries.length} 个）${industryValuation.stockPE !== null ? `；本股 PE=${industryValuation.stockPE}` : ''}${industryValuation.stockIndustryPercentile !== null ? `，本股行业截面分位=${industryValuation.stockIndustryPercentile}` : ''}`,
+        title: `估值：行业估值截面表（自算中位 PE，上海业务日 ${industryValuation.table.asOf}，精确截点 ${industryValuation.cutoffIso}；口径=行业成分股 close/epsTTM 中位数，覆盖 n<5 标 lowCoverage——代表性受限，随财务覆盖扩展自动改善；缺失行业：${industryValuation.table.missingIndustries.length} 个）${industryValuation.stockPE !== null ? `；本股 PE=${industryValuation.stockPE}` : ''}${industryValuation.stockIndustryPercentile !== null ? `，本股行业截面分位=${industryValuation.stockIndustryPercentile}` : ''}`,
         dimension: 2,
         kind: 'RECORDS',
         records: industryValuation.table.rows.map((r) => ({ 行业代码: r.industryIndexCode, 行业名称: r.name, n: r.n, medianPE: r.medianPE, lowCoverage: r.lowCoverage, 非正剔除: r.excludedNonPositive })),
-        factIds: [],
+        factIds: industryValuation.inputFacts.map((f) => f.factId),
       });
     }
     builds.push({
@@ -638,13 +618,12 @@ inquiryEvents?: InquiryEventRow[], referenceGroups?: ReferenceGroupRow[], rotati
   if (unlockDetails.length > 0) {
     d4Materials.push({
       materialId: 'mat:4:unlock-detail',
-      title: `公司事件：限售解禁明细（最近 ${String(unlockDetails.length)} 批次，东财 emunlock@p1；availableAt=解禁日次日——**明细节点为事后核实口径，前瞻请以解禁类公告标题为准**；解禁数量股/市值元/占总市值比例；全流通无解禁记录的股票不在此列）`,
+      title: `公司事件：限售解禁明细（最近 ${String(unlockDetails.length)} 批次，字段策略 ${EMUNLOCK_ADAPTER_VERSION}；availableAt=解禁日次日——明细为当前修订回填，非严格PIT；前瞻请以解禁公告为准；事后收益不属于事件字段）`,
       dimension: 4,
       kind: 'RECORDS',
       records: unlockDetails.map((f) => {
-        const row = { factId: f.factId, artifactSha256: f.artifactSha256, ...tv(f) } as Record<string, unknown>;
-        delete row['序号'];
-        return row;
+        return { ...unlockEventFields(tv(f)), unlockDateISO: tv(f).unlockDateISO,
+          code: tv(f).code, factId: f.factId, artifactSha256: f.artifactSha256 };
       }),
       factIds: unlockDetails.map((f) => f.factId),
     });
@@ -770,13 +749,13 @@ inquiryEvents?: InquiryEventRow[], referenceGroups?: ReferenceGroupRow[], rotati
       try {
         const sortedBars = [...bars].sort((a, b) => (String(tv(a).date ?? '') < String(tv(b).date ?? '') ? -1 : 1));
         const closes = sortedBars.map((f) => ({ date: String(tv(f).date ?? ''), close: String(tv(f).close ?? '') })).filter((x) => x.close !== '');
-        const ind = computeIndicators(closes, cutoff.toISOString().slice(0, 10));
+        const ind = computeIndicators(closes, cutoff.toISOString().slice(0, 10), indicatorVersion);
         materials.push({
           materialId: 'mat:5:technical-indicators',
           title: `资金与价格行为：技术指标（程序复算，未复权 close 口径与行情表一致；MA5/20/60、RSI14（Wilder）、MACD(12,26,9) 柱=2×(DIF−DEA)；数据不足项为 null）`,
           dimension: 5,
           kind: 'NOTE',
-          text: JSON.stringify(ind, null, 1),
+          text: JSON.stringify(indicatorVersion === EMA_INDICATOR_VERSION ? { indicatorVersion, ...ind } : ind, null, 1),
           factIds: [],
         });
       } catch { /* 指标计算失败不阻断 */ }
@@ -810,8 +789,9 @@ inquiryEvents?: InquiryEventRow[], referenceGroups?: ReferenceGroupRow[], rotati
         records: [{
           factId: sw.fact.factId,
           artifactSha256: sw.fact.artifactSha256,
-          体系: v.体系,
-          l1IndexCode: v.l1IndexCode ?? null,
+          体系: sw.system,
+          铸造体系: v.体系 ?? null,
+          l1IndexCode: sw.l1IndexCode,
           行业代码: v.行业代码 ?? null,
           计入日期ISO: v.计入日期ISO ?? null,
           更新日期ISO: v.更新日期ISO ?? null,
@@ -831,7 +811,7 @@ inquiryEvents?: InquiryEventRow[], referenceGroups?: ReferenceGroupRow[], rotati
       } else {
         materials.push({
           materialId: 'mat:6:benchmark-index-table',
-          title: `行业景气：申万一级行业指数 ${sw.l1IndexCode ?? ''}${poolSubject.swL1Name ? '（' + poolSubject.swL1Name + '）' : ''} 无损表格（最近 ${bench.length} 个交易日）`,
+          title: `行业景气：申万一级行业指数 ${sw.l1IndexCode ?? ''} 无损表格（最近 ${bench.length} 个交易日）`,
           dimension: 6,
           kind: 'BAR_TABLE',
           table: barsToTable(bench),
@@ -968,16 +948,20 @@ inquiryEvents?: InquiryEventRow[], referenceGroups?: ReferenceGroupRow[], rotati
 
   // ---- D8 历史参照（P4 已建库，W 面接线：群组统计块 + 判断义务框架声明）----
   {
-    const groups = referenceGroups ?? [];
+    const groups = referenceGroups?.rows ?? [];
     const industryCode = sw === null ? null : sw.l1IndexCode;
-    const materials8: Material[] = [];
+    const materials8: Material[] = [{ materialId: 'mat:8:reference-version', dimension: 8, kind: 'RECORDS',
+      title: '历史参照发布身份（空版本与无可见版本分列）', factIds: [],
+      records: [referenceGroups?.version === null || referenceGroups === undefined
+        ? { status: 'REFERENCE_VERSION_NOT_VISIBLE', cutoff: cutoff.toISOString() }
+        : { ...referenceGroups.version, status: groups.length === 0 ? 'REFERENCE_VERSION_EMPTY' : 'REFERENCE_VERSION_BOUND' }] }];
     if (groups.length > 0) {
       materials8.push({
         materialId: 'mat:8:reference-group-stats',
-        title: `历史事件参照：群组统计块（${String(groups.length)} 块 = 全事件基础层 + 六类事件类型层${industryCode === null ? '' : ` + 本股所属行业（${industryCode}）层`}；样本期 2015–2026 池内事件，R4 修订口径随行；统计为描述性关联，非预测）`,
+        title: `历史事件参照：群组统计块（${String(groups.length)} 块 = 全事件基础层 + 六类事件类型层${industryCode === null ? '' : ` + 本股所属行业（${industryCode}）层`}；样本期 2015–2026 池内事件，R4 修订口径随行；统计为描述性关联，非预测；完整成员/窗口见绑定的不可变版本）`,
         dimension: 8,
         kind: 'RECORDS',
-        records: groups.map((g) => ({ groupKey: g.groupKey, sampleCount: g.sampleCount, baseRatio: g.baseRatio, stats: g.stats, 嵌套声明: g.nestedDeclaration })),
+        records: groups.map((g) => ({ ...g, 嵌套声明: g.nestedDeclaration })),
         factIds: [],
       });
     }
@@ -997,7 +981,7 @@ inquiryEvents?: InquiryEventRow[], referenceGroups?: ReferenceGroupRow[], rotati
     builds.push({
       materials: materials8,
       gaps: gapsOf(8, [
-        ...(groups.length === 0 ? ['历史参照群组块不可得（参照库未建或行业层无匹配）'] : []),
+        ...(groups.length === 0 ? [referenceGroups?.version != null ? 'REFERENCE_VERSION_EMPTY：本可见完整版本无匹配群组' : 'REFERENCE_VERSION_NOT_VISIBLE：截点前无可见参照发布（或尚未迁移）'] : []),
         ...(industryCode === null ? ['本股 as-of 申万行业归属不可得，行业层参照缺失'] : []),
       ]),
     });
@@ -1012,8 +996,11 @@ function buildEtfDimensions(
   etfFacts: TimePointFact[],
   indexFacts: TimePointFact[],
   poolSubject: PoolSubjectEntry,
-  trackingIndex: string | null,
+  benchmark: FrozenBenchmark,
 ): DimensionBuild[] {
+  const trackingIndex = benchmark.indexCode;
+  const indexRole = benchmark.status === 'RESOLVED' ? '冻结跟踪指数'
+    : benchmark.status === 'CURRENT_PROXY' ? '当前映射代理指数（非截点已证实基准）' : '映射缺失的指数';
   const gapsOf = (dim: number, list: string[]): string[] => list.map((g) => `E${dim}: ${g}`);
   const etfBars = recentBarFacts(etfFacts, RECENT_BARS);
   const indexBars = recentBarFacts(indexFacts, RECENT_BARS);
@@ -1035,7 +1022,7 @@ function buildEtfDimensions(
   if (indexBars.length > 0 && trackingIndex !== null) {
     e5Materials.push({
       materialId: 'mat:5:tracking-index-bar-table',
-      title: `价格行为与市场宽度：跟踪指数 ${trackingIndex}（${poolSubject.tracks ?? ''}）行情无损表格（最近 ${indexBars.length} 个交易日）`,
+      title: `价格行为与市场宽度：${indexRole} ${trackingIndex}（${poolSubject.tracks ?? ''}）行情无损表格（最近 ${indexBars.length} 个交易日）`,
       dimension: 5,
       kind: 'BAR_TABLE',
       table: barsToTable(indexBars),
@@ -1048,7 +1035,8 @@ function buildEtfDimensions(
       '市场宽度数据未入库',
       ...(etfBars.length === 0 ? ['ETF 无 as-of 可见行情事实'] : []),
       ...(trackingIndex === null ? ['冻结池 tracks 字段无法解析跟踪指数代码'] : []),
-      ...(trackingIndex !== null && indexBars.length === 0 ? [`跟踪指数 ${trackingIndex} 无 as-of 可见行情事实`] : []),
+      ...(benchmark.status !== 'RESOLVED' ? [`${benchmark.reason}：${benchmark.status === 'CURRENT_PROXY' ? '当前映射仅为代理' : '缺可解析的指数映射'}，不具备正式结算资格`] : []),
+      ...(trackingIndex !== null && indexBars.length === 0 ? [`${indexRole} ${trackingIndex} 无 as-of 可见行情事实`] : []),
     ]),
   };
 
@@ -1089,7 +1077,7 @@ function buildEtfDimensions(
   if (valuations.length > 0) {
     e1Materials.push({
       materialId: 'mat:1:index-valuation-series',
-      title: `估值分位：跟踪指数 PE/PB 序列（最近 ${String(valuations.length)} 期，月末频率为主（legulegu 全史）+ 日频近 20 日（中证官方）并存——不得混频，typedValue 带来源/频率标记，valuation@p1，R4 声明随行）`,
+      title: `估值分位：${indexRole} PE/PB 序列（最近 ${String(valuations.length)} 期，月末频率为主（legulegu 全史）+ 日频近 20 日（中证官方）并存——不得混频，typedValue 带来源/频率标记，valuation@p1，R4 声明随行）`,
       dimension: 1,
       kind: 'RECORDS',
       records: valuations.map((f) => ({ factId: f.factId, artifactSha256: f.artifactSha256, ...tv(f) })),
@@ -1111,7 +1099,7 @@ function buildEtfDimensions(
   const e1: DimensionBuild = {
     materials: e1Materials,
     gaps: gapsOf(1, [
-      ...(valuations.length === 0 ? ['跟踪指数估值（PE/PB）as-of 不可见（截点早于首个月末次日）——估值分位不可计算'] : []),
+      ...(valuations.length === 0 ? [`${indexRole}估值（PE/PB）as-of 不可见——估值分位不可计算`] : []),
     ]),
   };
 
@@ -1122,7 +1110,7 @@ function buildEtfDimensions(
       title: '风格相对：计算说明（不输出相对强弱值）',
       dimension: 6,
       kind: 'NOTE',
-      text: '风格相对（相对其他宽基指数的强弱）需要可比指数序列进入本轮封存；本轮只封存本标的跟踪指数，可比序列未纳入。不输出相对强弱值；待调度合同扩展封存范围后启用。',
+      text: `风格相对（相对其他宽基指数的强弱）需要可比指数序列进入本轮封存；本轮${trackingIndex === null ? '缺可解析的指数映射' : `仅封存${indexRole} ${trackingIndex}`}，可比序列未纳入。不输出相对强弱值；待调度合同扩展封存范围后启用。`,
       factIds: [],
     }],
     gaps: gapsOf(6, ['可比指数序列未纳入本轮封存，风格相对强弱不计算']),
@@ -1176,7 +1164,7 @@ function stockDecisionContractText(poolSubject: PoolSubjectEntry): string {
     '- RESEARCH_UNDERPERFORM：预期负超额收益；含义为回避或减持，不是做空（A 股融券受限）；',
     '- ABSTAIN：不表达方向判断；仍产生结论对象并进入复盘分母的放弃分类。',
     '参考价：研究完成后的下一交易日开盘价（T+1 下最现实的可成交价）；结算周期 20 个交易日（诊断周期 5/60 日只记录不参与决策）。',
-    `行业基准：截点当时申万分类版本归属（随维度 6 材料送达）；冻结池当前快照 ${poolSubject.swL1IndexCode ?? '缺'}（仅参考，以时点归属为准）。`,
+    '行业基准：只以 L0 冻结基准身份为准；缺历史归属具名缺口，结算不重新解析当前库或池。',
     '选项空间互不通用：个股结论不得出现 UP/DOWN；宽基结论不得出现 OUTPERFORM/UNDERPERFORM（程序校验）。',
   ].join('\n');
 }
@@ -1187,7 +1175,7 @@ function etfDecisionContractText(poolSubject: PoolSubjectEntry): string {
     '- RESEARCH_UP：预期跟踪指数未来 20 个交易日绝对收益为正；',
     '- RESEARCH_DOWN：预期绝对收益为负；含义为回避或减持，不是做空；',
     '- ABSTAIN：同个股。',
-    `跟踪指数：${poolSubject.tracks ?? '（池文件未解析）'}；宽基无行业基准，方向比较的"同一行业基准"改为"同一跟踪指数"。`,
+    `池配置说明：${poolSubject.tracks ?? '（池文件未解析）'}；跟踪指数身份与资格只以 L0 冻结基准为准，CURRENT_PROXY 不表示历史映射已证实，不能正式结算。宽基无行业基准，方向比较的"同一行业基准"改为"同一跟踪指数"。`,
     '参考价与结算周期同个股口径；选项空间互不通用（不得出现 OUTPERFORM/UNDERPERFORM）。',
   ].join('\n');
 }
@@ -1245,7 +1233,7 @@ function buildL0FixedMaterials(
   return [identity, contract, statements, rulesNote];
 }
 
-function buildCoverageReceiptMaterial(
+export function buildCoverageReceiptMaterial(
   dimensions: DimensionCoverage[],
   usage: {
     l0FixedBytes: number;
@@ -1302,19 +1290,25 @@ async function loadInquiryEvents(pool: Pool, subject: string, cutoff: string): P
 
 
 /** 参照库群组块行（assembleResearchInput 预查询传入，保持维度构建纯函数）。 */
-interface ReferenceGroupRow { groupKey: string; sampleCount: number; baseRatio: unknown; stats: unknown; nestedDeclaration: string }
-async function loadReferenceGroups(pool: Pool, industryIndexCode: string | null): Promise<ReferenceGroupRow[]> {
+interface ReferenceVersionIdentity { versionId: string; contentHash: string; publishedAt: string; materializedAt: string;
+  inputAvailableAtMax: string; inputObservedAtMax: string; maturityAtMax: string }
+interface ReferenceGroupRow extends ReferenceVersionIdentity { groupKey: string; sampleCount: number; baseRatio: unknown; stats: unknown;
+  nestedDeclaration: string; revisionNotice: string; memberCount: number; membersHash: string }
+interface ReferenceGroupSet { version: ReferenceVersionIdentity | null; rows: ReferenceGroupRow[] }
+export async function loadReferenceGroups(pool: Pool, industryIndexCode: string | null, cutoff: string): Promise<ReferenceGroupSet> {
   try {
-    const likeIndustry = industryIndexCode === null ? '' : `or group_key like '%|${industryIndexCode.replace(/'/g, "''")}'`;
-    const q = await pool.query(
-      `select group_key as "groupKey", sample_count as "sampleCount", base_ratio as "baseRatio", stats, nested_declaration as "nestedDeclaration"
-         from reference_group_library
-        where group_key = 'all-events' or group_key like 'type:%' ${likeIndustry}
-        order by group_key`,
-    );
-    return q.rows.map((r: Record<string, unknown>) => ({ groupKey: String(r.groupKey), sampleCount: Number(r.sampleCount), baseRatio: r.baseRatio, stats: r.stats, nestedDeclaration: String(r.nestedDeclaration) }));
-  } catch {
-    return [];
+    const version = await loadReferenceVersion(pool, cutoff);
+    if (version === null) return { version: null, rows: [] };
+    const identity = { versionId: version.versionId, contentHash: version.contentHash, publishedAt: version.publishedAt,
+      materializedAt: version.payload.materializedAt, inputAvailableAtMax: version.payload.inputAvailableAtMax,
+      inputObservedAtMax: version.payload.inputObservedAtMax, maturityAtMax: version.payload.maturityAtMax };
+    return { version: identity, rows: version.payload.groups.filter((g) => g.groupKey === 'all-events' || g.path.length === 1 ||
+      (industryIndexCode !== null && g.path.some((p) => p.endsWith(`:${industryIndexCode}`) || p === industryIndexCode)))
+      .map((g) => ({ ...identity, groupKey: g.groupKey, sampleCount: g.sampleCount, baseRatio: g.baseRatio, stats: g.stats,
+        nestedDeclaration: g.nestedDeclaration, revisionNotice: g.revisionNotice, memberCount: g.members.length, membersHash: canonicalSha256(g.members) })) };
+  } catch (error) {
+    if ((error as { code?: string }).code === '42P01') return { version: null, rows: [] };
+    throw error;
   }
 }
 
@@ -1340,8 +1334,8 @@ async function loadRotationTable(pool: Pool, cutoff: string): Promise<IndustryMo
     }
     let names: Map<string, string> | undefined;
     try {
-      const listRows = await pool.query(`select typed_value from pintime_fact where fact_kind = 'SW_INDEX_LIST' limit 1`);
-      const industries = (listRows.rows[0]?.typed_value as { rows?: Array<Record<string, unknown>> } | undefined)?.rows;
+      const listRows = await asOfFacts(pool, { factKind: 'SW_INDEX_LIST', asOf: new Date(cutoff) });
+      const industries = (listRows.at(-1)?.typedValue as { rows?: Array<Record<string, unknown>> } | undefined)?.rows;
       if (Array.isArray(industries)) {
         names = new Map(
           industries
@@ -1358,26 +1352,43 @@ async function loadRotationTable(pool: Pool, cutoff: string): Promise<IndustryMo
 
 
 /** 预计算行业估值截面（W36 纯函数 + DB 装载；任何失败返回 null，D2 回退纯说明模式）。 */
-async function loadIndustryValuation(pool: Pool, subject: string, cutoff: string): Promise<{ table: ReturnType<typeof industryMedianPE>; stockPE: string | null; stockIndustryPercentile: string | null } | null> {
+interface IndustryValuationMaterial {
+  table: ReturnType<typeof industryMedianPE>;
+  stockPE: string | null;
+  stockIndustryPercentile: string | null;
+  cutoffIso: string;
+  inputFacts: TimePointFact[];
+}
+export async function loadIndustryValuation(pool: Pool, subject: string, cutoff: string): Promise<IndustryValuationMaterial | null> {
   try {
-    const asOf = cutoff.slice(0, 10);
-    const load = await loadStockPESamples(pool, asOf);
+    const load = await loadStockPESamples(pool, cutoff);
+    const asOf = load.asOf;
     if (load.samples.length === 0) return null;
-    const table = industryMedianPE(load.samples, asOf);
+    const table = industryMedianPE(load.samples, asOf, load.names === null ? undefined : { names: load.names });
     const own = load.samples.find((x) => x.code === subject) ?? null;
     const stockPEDec = own === null ? null : stockPEOf(own, asOf);
-    const stockPE = stockPEDec === null ? null : String(stockPEDec);
+    const stockPE = stockPEDec === null ? null : decToString(stockPEDec);
     let stockIndustryPercentile: string | null = null;
     if (own !== null && stockPE !== null) {
       const ownRow = own === null ? undefined : table.rows.find((r) => r.industryIndexCode === own.industryIndexCode);
       if (ownRow !== undefined && ownRow.peSeries.length >= 2 && stockPEDec !== null) {
-        stockIndustryPercentile = String(pePercentileOf(stockPEDec, ownRow.peSeries.map((x) => decFromString(x))));
+        stockIndustryPercentile = decToString(pePercentileOf(stockPEDec, ownRow.peSeries.map((x) => decFromString(x))));
       }
     }
-    return { table, stockPE, stockIndustryPercentile };
+    return { table, stockPE, stockIndustryPercentile, cutoffIso: load.cutoffIso, inputFacts: load.inputFacts };
   } catch {
     return null;
   }
+}
+
+async function factsFromSeal(pool: Pool, seal: SealManifest): Promise<TimePointFact[]> {
+  return Promise.all(seal.factIds.map(async (id) => {
+    const fact = await loadFact(pool, id);
+    if (fact === null || !seal.artifactRefs.some((r) => r.sha256 === fact.artifactSha256)) {
+      throw new ResearchInputError('SEALED_FACT_MISSING', id);
+    }
+    return fact;
+  }));
 }
 
 export async function assembleResearchInput(
@@ -1386,6 +1397,8 @@ export async function assembleResearchInput(
   opts: AssembleResearchInputOptions,
 ): Promise<AssembledResearchInput> {
   validateBudget(opts.budget);
+  // 方法分流在任何读取/封存写入前明确，不让未知版本静默沿用旧公式。
+  if (opts.subjectKind === 'STOCK') indicatorVersionForMethod(opts.versions.methodVersion);
   const cutoffDate = parseDateStrict(opts.cutoff, 'cutoff');
   const cutoff = cutoffDate.toISOString();
   const researchKind: ResearchKind = opts.researchKind ?? 'WEEKLY';
@@ -1429,7 +1442,15 @@ export async function assembleResearchInput(
     ...sealInput,
     factSelector: { subjectType, subjectId: opts.subject },
   });
-  const subjectFacts = await asOfFacts(pool, { subjectType, subjectId: opts.subject, asOf: cutoffDate });
+  const subjectFacts = await factsFromSeal(pool, subjectSeal);
+  // 配置自述 frozenAt 不是历史存在证明。按内容入 CAS，首次观察时间随同哈希保留。
+  const etfMapping = opts.subjectKind !== 'BROAD_ETF' || poolSubject.tracks === undefined ? undefined : {
+    frozenAt: poolInfo.frozenAt, tracks: poolSubject.tracks,
+    observation: await store.put(new TextEncoder().encode(canonicalJsonString(etfMappingContent(opts.subject,
+      { frozenAt: poolInfo.frozenAt, tracks: poolSubject.tracks }))), 'application/json', new Date().toISOString()),
+  };
+  const benchmark = freezeBenchmark({ subjectKind: opts.subjectKind, subject: opts.subject, cutoff, facts: subjectFacts,
+    ...(etfMapping === undefined ? {} : { etfMapping }) });
 
   // ---- 封存：基准 seal（个股=行业指数；ETF=跟踪指数）----
   // 包内 seals 一律剥离 reused 调用期标记（W26）：inputHash 与包原件内容只含封存内容身份。
@@ -1446,11 +1467,11 @@ export async function assembleResearchInput(
       });
       seals.push(sealManifestContent(seal));
       sealSubjects.push(`INDEX/${sw.l1IndexCode}`);
-      benchmarkFacts = await asOfFacts(pool, { subjectType: 'INDEX', subjectId: sw.l1IndexCode, asOf: cutoffDate });
+      benchmarkFacts = await factsFromSeal(pool, seal);
       sealFactSets.push(benchmarkFacts);
     }
   } else {
-    const tracking = poolSubject.tracks === undefined ? null : trackingIndexOf(poolSubject.tracks);
+    const tracking = benchmark.indexCode;
     if (tracking !== null) {
       const seal = await buildSeal(pool, store, {
         ...sealInput,
@@ -1458,28 +1479,45 @@ export async function assembleResearchInput(
       });
       seals.push(sealManifestContent(seal));
       sealSubjects.push(`INDEX/${tracking}`);
-      benchmarkFacts = await asOfFacts(pool, { subjectType: 'INDEX', subjectId: tracking, asOf: cutoffDate });
+      benchmarkFacts = await factsFromSeal(pool, seal);
       sealFactSets.push(benchmarkFacts);
     }
   }
 
   // ---- 维度材料 ----
   const sw = opts.subjectKind === 'STOCK' ? pickSwIndustryAt(subjectFacts, cutoffDate) : null;
+  const industryValuation = opts.subjectKind === 'STOCK' ? await loadIndustryValuation(pool, opts.subject, cutoff) : null;
+  if (industryValuation !== null) {
+    const valuationSeal = await buildSeal(pool, store, {
+      ...sealInput, factSelector: {}, selectedFactIds: industryValuation.inputFacts.map((f) => f.factId),
+    });
+    seals.push(sealManifestContent(valuationSeal));
+    sealSubjects.push('DERIVED/industry-valuation');
+    industryValuation.inputFacts = await factsFromSeal(pool, valuationSeal);
+    sealFactSets.push(industryValuation.inputFacts);
+  }
   const builds =
     opts.subjectKind === 'STOCK'
-      ? buildStockDimensions(subjectFacts, benchmarkFacts, poolSubject, cutoffDate, sw, await loadInquiryEvents(pool, opts.subject, cutoff), await loadReferenceGroups(pool, sw === null ? null : sw.l1IndexCode), await loadRotationTable(pool, cutoff), await loadIndustryValuation(pool, opts.subject, cutoff))
+      ? buildStockDimensions(subjectFacts, benchmarkFacts, poolSubject, cutoffDate, sw, indicatorVersionForMethod(opts.versions.methodVersion), await loadInquiryEvents(pool, opts.subject, cutoff), await loadReferenceGroups(pool, sw === null ? null : sw.l1IndexCode, cutoff), await loadRotationTable(pool, cutoff), industryValuation)
       : buildEtfDimensions(
           subjectFacts,
           benchmarkFacts,
           poolSubject,
-          poolSubject.tracks === undefined ? null : trackingIndexOf(poolSubject.tracks),
+          benchmark,
         );
 
   // ---- L1 装填（按维度优先级；超层预算降级并标记）----
+  const artifactOf = new Map<string, string>();
+  for (const facts of sealFactSets) for (const f of facts) artifactOf.set(f.factId, f.artifactSha256);
   const dimMaterials: Material[] = [];
   const dimOfMaterial = new Map<string, number>();
   for (const build of builds) {
     for (const material of build.materials) {
+      material.evidenceRefs = material.factIds.map((factId) => {
+        const artifactSha256 = artifactOf.get(factId);
+        if (artifactSha256 === undefined) throw new ResearchInputError('FACT_NOT_IN_SEAL', factId);
+        return { factId, artifactSha256 };
+      });
       dimMaterials.push(material);
       dimOfMaterial.set(material.materialId, material.dimension);
     }
@@ -1521,14 +1559,15 @@ export async function assembleResearchInput(
 
   // ---- L0（固定材料）----
   const l0Fixed = buildL0FixedMaterials(businessKey, cutoff, poolMeta, opts.versions, rules);
+  const attribution = benchmark.attributionFact;
+  l0Fixed.push({ materialId: 'mat:0:frozen-benchmark', title: '冻结基准身份（缺历史映射/当前代理不具备正式结算资格）',
+    dimension: 0, kind: 'RECORDS', records: [benchmark as unknown as Record<string, unknown>],
+    factIds: attribution === null ? [] : [attribution.factId],
+    evidenceRefs: attribution === null ? [] : [{ factId: attribution.factId, artifactSha256: attribution.artifactSha256 }] });
   const l0FixedBlocks = l0Fixed.map((m) => ({ materialId: m.materialId, bytes: materialBytes(m) }));
   const l0FixedBytes = l0FixedBlocks.reduce((n, b) => n + b.bytes, 0);
 
   // ---- L2 索引（送达引用目录 + 封存目录摘要；先于回执构建，回执可引用其最终字节数）----
-  const artifactOf = new Map<string, string>();
-  for (const facts of sealFactSets) {
-    for (const f of facts) artifactOf.set(f.factId, f.artifactSha256);
-  }
   const deliveredFacts: { factId: string; materialId: string; artifactSha256: string; layer: 'L0' | 'L1' }[] = [];
   const seenFacts = new Set<string>();
   const deliveredMaterials: { material: Material; layer: 'L0' | 'L1' }[] = [
@@ -1636,6 +1675,7 @@ export async function assembleResearchInput(
     packageKind: 'RESEARCH_INPUT' as const,
     packageVersion: PACKAGE_VERSION,
     assemblerRulesVersion: ASSEMBLER_RULES_VERSION,
+    benchmark,
     businessKey,
     cutoff,
     pool: poolMeta,
@@ -1721,6 +1761,15 @@ export async function validateResearchInputPackage(
   if (canonicalSha256(core) !== inputHash) {
     throw new ResearchInputError('INPUT_HASH_MISMATCH', 'inputHash 重算不一致');
   }
+  if (pkg.packageVersion >= 2 || pkg.benchmark !== undefined) {
+    const benchmark = validateFrozenBenchmark(pkg.benchmark, pkg.businessKey);
+    if (benchmark.attributionFact !== null) {
+      const original = await loadFact(pool, benchmark.attributionFact.factId);
+      if (original === null || canonicalSha256(original) !== canonicalSha256(benchmark.attributionFact)) {
+        throw new ResearchInputError('FACT_ARTIFACT_MISMATCH', '冻结基准与归属事实原文不符');
+      }
+    }
+  }
   const frozenRules = rulesOfKind(pkg.businessKey.subjectKind);
   if (canonicalJsonString(pkg.rules) !== canonicalJsonString([...frozenRules])) {
     throw new ResearchInputError('PACKAGE_MALFORMED', '规则表与组装器冻结规则不一致（哈希钉扎失败）');
@@ -1790,6 +1839,9 @@ export async function validateResearchInputPackage(
         throw new ResearchInputError('FACT_NOT_IN_SEAL', `${material.materialId} 引用 ${factId} 不在封存池`);
       }
       const fact = await loadCached(factId);
+      if (material.evidenceRefs !== undefined && !material.evidenceRefs.some((ref) => ref.factId === factId && ref.artifactSha256 === fact.artifactSha256)) {
+        throw new ResearchInputError('FACT_ARTIFACT_MISMATCH', `${factId} 材料引用与库内配对不符`);
+      }
       if (material.kind === 'BAR_TABLE') {
         const rowMeta = material.table.meta.rowFacts.find((r) => r.factId === factId);
         if (rowMeta !== undefined && rowMeta.artifactSha256 !== fact.artifactSha256) {
@@ -1809,7 +1861,28 @@ export async function validateResearchInputPackage(
     }
   }
 
+  if (pkg.benchmark?.subjectKind === 'BROAD_ETF') {
+    const snapshot = pkg.benchmark.mapping.snapshot;
+    const observation = snapshot.observation as ArtifactRef | null;
+    if (observation !== null) {
+      const original = await store.readBytes(observation.sha256);
+      if (new TextDecoder().decode(original) !== canonicalJsonString(etfMappingContent(pkg.businessKey.subject,
+        { frozenAt: String(snapshot.frozenAt), tracks: String(snapshot.tracks) })) ||
+          canonicalJsonString(await store.refOf(observation.sha256)) !== canonicalJsonString(observation)) {
+        throw new ResearchInputError('FACT_ARTIFACT_MISMATCH', 'ETF 映射原件或首次观察身份不符');
+      }
+    }
+  }
+
   // 每个 artifact 哈希可校验读回（readBytes 内建哈希比对）
+  for (const material of pkg.materials) {
+    if (material.kind !== 'INDEX') continue;
+    for (const ref of material.content.deliveredFacts) {
+      if ((await loadCached(ref.factId)).artifactSha256 !== ref.artifactSha256) {
+        throw new ResearchInputError('FACT_ARTIFACT_MISMATCH', `${ref.factId} 送达索引与库内配对不符`);
+      }
+    }
+  }
   let artifactsChecked = 0;
   for (const seal of pkg.seals) {
     for (const ref of seal.artifactRefs) {

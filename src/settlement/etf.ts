@@ -33,6 +33,7 @@ import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import type { Pool } from 'pg';
+import { BenchmarkError, requireResolvedBenchmark, trackingIndexCode, type FrozenBenchmark } from '../conclusion/benchmark.js';
 import { asOfFacts } from '../pintime/facts.js';
 import { fenOf, limitPrice, LimitRuleError } from '../rules/limit.js';
 import type { SettlementZone } from '../contracts.js';
@@ -79,6 +80,8 @@ export interface EtfSettleArgs {
   disposition: EtfDisposition;
   /** 结论完成时刻（SR-3.1 参考价锚点；沿用个股裁定，不得改锚事件时刻）。 */
   conclusionTime: string | Date;
+  cutoff?: string | Date;
+  benchmark?: FrozenBenchmark | undefined;
   /** 事实读取 as-of（默认当前时刻；只消费窗口内各日事实）。 */
   asOf?: Date;
   /** 窗口长度（默认 20；测试注入用）。 */
@@ -86,8 +89,7 @@ export interface EtfSettleArgs {
   /** 失效触发阈值（默认 '0.05' 预留值；定点字符串）。 */
   invalidationThreshold?: string;
   /**
-   * 跟踪指数代码（裸 6 位）。缺省时从冻结池 data/research-pool.json 的 etfs[].tracks
-   * 解析（R24 冻结单一事实源）；显式注入供测试与审计重放。
+   * 兼容调用者的显式一致性断言；必须与 benchmark 相同，不能替代冻结身份。
    */
   trackedIndex?: string;
 }
@@ -96,11 +98,11 @@ export interface EtfSettleArgs {
 
 /** tracks 字符串（如 '上证50(000016)'）→ 指数代码；括号内非 6 位数字即具名拒绝，不猜。 */
 export function parseTrackedIndex(tracks: string): string {
-  const m = /\((\d{6})\)/.exec(tracks);
-  if (m === null) {
+  const code = trackingIndexCode(tracks);
+  if (code === null) {
     throw new SettlementError('ETF_TRACKS_UNPARSEABLE', `tracks: "${tracks}"（须形如 名称(6位指数代码)）`);
   }
-  return m[1] as string;
+  return code;
 }
 
 /** 冻结池 etfs 段 → ETF 代码 → 跟踪指数代码映射。 */
@@ -474,10 +476,6 @@ export async function settleEtfConclusion(pool: Pool, args: EtfSettleArgs): Prom
   if (decCmp(threshold, { scaled: 0n }) <= 0) {
     throw new SettlementError('SETTLE_INPUT_INVALID', `invalidationThreshold 须为正: ${thresholdStr}`);
   }
-  const trackedIndex = args.trackedIndex ?? (await loadEtfIndexMap()).get(args.subject);
-  if (trackedIndex === undefined) {
-    throw new SettlementError('ETF_NOT_IN_POOL', `subject ${args.subject} 不在冻结池 data/research-pool.json（R24）；宽基结算仅覆盖池内 4 只，未知标的具名拒绝不猜`);
-  }
 
   try {
     // 1) 参考价（SR-3.1/3.2 沿用：结论完成后首个 ETF 有成交交易日开盘价，停牌顺延）
@@ -488,6 +486,12 @@ export async function settleEtfConclusion(pool: Pool, args: EtfSettleArgs): Prom
     const reference = resolveReferenceOpen(tradingDays, etfBars, conclusionTime);
     if (reference.state === 'NOT_DUE') {
       return { state: 'UNSETTLED', reason: 'REFERENCE_NOT_DUE', detail: reference.detail, reference };
+    }
+    const binding = requireResolvedBenchmark(args.benchmark, { subjectKind: 'BROAD_ETF', subject: args.subject,
+      cutoff: args.cutoff ?? args.benchmark?.cutoff ?? conclusionTime });
+    const trackedIndex = binding.indexCode!;
+    if (args.trackedIndex !== undefined && args.trackedIndex !== trackedIndex) {
+      throw new BenchmarkError('BENCHMARK_BINDING_MISMATCH', '传入指数与原结论冻结身份不符');
     }
     // 2) 逐日跟踪指数收益序列（SR-8A.1；I_ref=参考价日指数开盘，R26.1）
     const indexBars = await loadDailyBarsFor(pool, 'INDEX', trackedIndex, asOf);
@@ -574,7 +578,7 @@ export async function settleEtfConclusion(pool: Pool, args: EtfSettleArgs): Prom
     };
     return { state: 'SETTLED', zone, diagnostics };
   } catch (error) {
-    if (error instanceof SettlementError) {
+    if (error instanceof SettlementError || error instanceof BenchmarkError) {
       return { state: 'ANOMALY', code: error.code, detail: error.message };
     }
     if (error instanceof LimitRuleError) {

@@ -26,8 +26,9 @@
  * 表为 W7 冻结核验映射（src/adapters/sw.ts，只读依赖）。pre2014 窗口无核验映射 → null。
  */
 import type { Pool } from 'pg';
+import { selectIndustryBenchmark } from '../conclusion/benchmark.js';
 import { asOfFacts } from '../pintime/facts.js';
-import { SW_2014_EFFECTIVE, SW2014_PREFIX_L1, SW_2021_CLASSIFY_EFFECTIVE, SW2021_PREFIX_L1 } from '../adapters/sw.js';
+import { SW_2014_EFFECTIVE, SW_2021_CLASSIFY_EFFECTIVE } from '../adapters/sw.js';
 import {
   DEC_ONE,
   SettlementError,
@@ -83,53 +84,9 @@ export async function industryBenchmarkAt(
   if (Number.isNaN(cutoffDate.getTime())) {
     throw new SettlementError('DATE_INVALID', `cutoff: ${String(args.cutoff)}`);
   }
-  const cutoffMs = cutoffDate.getTime();
-  const cutoffDay = new Date(cutoffMs + 8 * 3600_000).toISOString().slice(0, 10); // Asia/Shanghai 日
-  const windowSystem = swWindowSystem(cutoffDay);
-  if (windowSystem === 'pre2014') return null; // pre2014 窗口无核验映射（2015 前研究窗口外）
-  const system: '2014' | '2021' = windowSystem;
-  const facts = await asOfFacts(pool, {
-    subjectType: 'STOCK',
-    subjectId: args.subject,
-    factKind: 'INDUSTRY_CLASS_VERSION',
-    asOf: cutoffDate,
-  });
-  // sw@p1 轴行带「体系」字段；csrc@current 轴（classVersion）不参与申万基准选择。
-  const swRows = facts.filter((f) => typeof (f.typedValue as Record<string, unknown>).体系 === 'string');
-  const covering = swRows.filter((f) => {
-    const from = f.validFrom === null ? null : new Date(f.validFrom).getTime();
-    const to = f.validTo === null ? null : new Date(f.validTo).getTime();
-    if (from !== null && from > cutoffMs) return false;
-    if (to !== null && cutoffMs >= to) return false;
-    return true;
-  });
-  if (covering.length === 0) return null;
-  // 入库构造的区间按股互斥；多行并存（数据异常）时确定性取：体系同读取窗口优先 → validFrom 最新。
-  covering.sort((a, b) => {
-    const ra = (a.typedValue as Record<string, unknown>).体系 === system ? 0 : 1;
-    const rb = (b.typedValue as Record<string, unknown>).体系 === system ? 0 : 1;
-    if (ra !== rb) return ra - rb;
-    const fa = new Date(a.validFrom ?? a.availableAt).getTime();
-    const fb = new Date(b.validFrom ?? b.availableAt).getTime();
-    if (fa !== fb) return fb - fa;
-    return a.factId < b.factId ? -1 : 1;
-  });
-  const head = covering[0] as (typeof covering)[number];
-  const tv = head.typedValue as Record<string, unknown>;
-  const mintedSystem = String(tv.体系);
-  const industryCode = typeof tv.行业代码 === 'string' ? (tv.行业代码 as string) : '';
-  let l1: string | null = null;
-  let source: IndustryBenchmark['l1IndexCodeSource'] = 'WINDOW_TABLE';
-  if (mintedSystem === system) {
-    l1 = typeof tv.l1IndexCode === 'string' && tv.l1IndexCode.length > 0 ? (tv.l1IndexCode as string) : null;
-    source = 'ROW';
-  } else if (system === '2021') {
-    l1 = SW2021_PREFIX_L1[industryCode.slice(0, 2)] ?? null;
-  } else if (system === '2014') {
-    l1 = SW2014_PREFIX_L1[industryCode.slice(0, 2)] ?? null;
-  }
-  if (l1 === null) return null;
-  return { subject: args.subject, industryIndexCode: l1, system, mintedSystem, industryCode, l1IndexCodeSource: source, factId: head.factId };
+  const facts = await asOfFacts(pool, { subjectType: 'STOCK', subjectId: args.subject,
+    factKind: 'INDUSTRY_CLASS_VERSION', asOf: cutoffDate });
+  return selectIndustryBenchmark(facts, args.subject, cutoffDate)?.industry ?? null;
 }
 
 // ===== 指数行情视图（SW_INDEX_BAR）=====

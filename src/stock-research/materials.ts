@@ -41,11 +41,11 @@ export async function loadReportMaterials(subject: string, cutoff: string): Prom
     if (createHash('sha256').update(bytes).digest('hex') !== m.sha256) throw new Error(`REPORT_MATERIAL_HASH_MISMATCH: ${m.sourcePath}`);
     for (const t of m.tables) {
       const locator = { kind: 'FILE' as const, path: m.sourcePath, note: `${m.sourceUrl}；${m.sourceKind === 'SNAPSHOT' ? '固定网页/行情快照，数据日' : `PDF页 ${t.pages.join(',')}；报告期`} ${m.period}；来源日期 ${m.publishedDate}；可用时刻 ${m.publishedAt}；首次取证 ${m.retrievedAt}；SHA256 ${m.sha256}；当前下载原件，不是历史封存` };
-      const provenance = [m.period, m.publishedDate, m.retrievedAt, m.sourceUrl, t.pages.join(','), m.sha256];
+      const provenance = [m.period, m.publishedDate, m.retrievedAt, m.sourceUrl, t.pages.join(','), m.sha256, m.subject];
       const existing = tables.get(t.tableId);
       const rows = t.rows.map((r) => [...r, ...provenance]);
       if (existing) { existing.rows.push(...rows); existing.locators.push(locator); }
-      else tables.set(t.tableId, { tableId: t.tableId, title: t.title, columns: [...t.columns, 'reportPeriod', 'publishedDate', 'retrievedAt', 'sourceUrl', 'pages', 'sha256'], rows, unitNote: t.unitNote + '；取证时点晚于原披露，非历史封存。', locators: [locator], cutoff });
+      else tables.set(t.tableId, { tableId: t.tableId, title: t.title, columns: [...t.columns, 'reportPeriod', 'publishedDate', 'retrievedAt', 'sourceUrl', 'pages', 'sha256', 'sourceSubject'], rows, unitNote: t.unitNote + '；取证时点晚于原披露，非历史封存。', locators: [locator], cutoff });
     }
   }
   if (!tables.size) gaps.push('无截点内已取证的官方报表正文；公告标题不能支持渠道/产品/回款事实');

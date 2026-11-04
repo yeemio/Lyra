@@ -14,7 +14,8 @@ import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { test } from 'node:test';
 import { SettlementError } from '../settlement/decimal.js';
-import { computeIndicators, type IndicatorBar, type IndicatorResult } from './indicators.js';
+import { computeIndicators, indicatorVersionForMethod, LEGACY_INDICATOR_VERSION, EMA_INDICATOR_VERSION,
+  RESEARCH_REPAIR_METHOD_VERSION, type IndicatorBar, type IndicatorResult } from './indicators.js';
 
 /** 60 根确定性合成收盘（两位小数；生成后固化为字面量，双语言共以此为准）。 */
 const SYN_CLOSES: string[] = [
@@ -98,7 +99,7 @@ def compute(closes):
         if m >= 34:
             dea = mean(difs[:9])
             for i in range(9, len(difs)):
-                dea = q((dea * 8 + difs[i]) / 9)
+                dea = ema_step(dea, difs[i], 9)
             out['macd']['dea'] = dstr(dea)
             out['macd']['histogram'] = dstr(q((difs[-1] - dea) * 2))
     return out
@@ -122,6 +123,27 @@ test('Python 独立对照：60 根合成收盘七值逐字符串一致', () => {
     assert.equal(actual.macd[key], expected.macd[key], `macd.${key}`);
     assert.match(actual.macd[key] as string, DECIMAL_STRING_RE);
   }
+});
+
+test('I-14：非线性平方序列的 SMA 种子与首个 EMA9 递推；新旧方法分流', () => {
+  const closes = Array.from({ length: 60 }, (_, i) => String((i + 1) ** 2 + (i % 4) * 3));
+  for (const n of [33, 34, 35, 60]) {
+    const bars = synthBars(n, closes), expected = JSON.parse(execFileSync('python3', ['-c', PY_INDEPENDENT, JSON.stringify(closes.slice(0, n))], { encoding: 'utf8' })) as IndicatorResult;
+    assert.deepEqual(computeIndicators(bars, '2026-12-31', EMA_INDICATOR_VERSION), expected);
+    const oldPython = PY_INDEPENDENT.replace('dea = ema_step(dea, difs[i], 9)', 'dea = q((dea * 8 + difs[i]) / 9)');
+    const legacy = JSON.parse(execFileSync('python3', ['-c', oldPython, JSON.stringify(closes.slice(0, n))], { encoding: 'utf8' })) as IndicatorResult;
+    assert.deepEqual(computeIndicators(bars, '2026-12-31', LEGACY_INDICATOR_VERSION), legacy);
+  }
+  const bars = synthBars(60, closes);
+  assert.equal(computeIndicators(bars.slice(0, 33), '2026-12-31').macd.dea, null);
+  assert.equal(computeIndicators(bars.slice(0, 34), '2026-12-31').macd.dea, '244.029724355442');
+  assert.equal(computeIndicators(bars.slice(0, 35), '2026-12-31').macd.dea, '252.573340169807');
+  assert.equal(computeIndicators(bars, '2026-12-31', LEGACY_INDICATOR_VERSION).macd.dea, '490.417071752968');
+  assert.equal(computeIndicators(bars, '2026-12-31').macd.dea, '537.092127779934');
+  assert.equal(indicatorVersionForMethod('method@p2-v1'), LEGACY_INDICATOR_VERSION);
+  assert.equal(indicatorVersionForMethod(RESEARCH_REPAIR_METHOD_VERSION), EMA_INDICATOR_VERSION);
+  assert.throws(() => indicatorVersionForMethod('unknown'), /INDICATOR_METHOD_UNSUPPORTED/);
+  assert.throws(() => computeIndicators(bars, '2026-12-31', 'unknown' as never), /INDICATOR_VERSION_UNSUPPORTED/);
 });
 
 test('数据不足边界：各窗口 null 精确边界', () => {

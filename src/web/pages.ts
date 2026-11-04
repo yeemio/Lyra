@@ -942,7 +942,7 @@ function renderConclusionsPage(data: ConclusionsPageData): string {
             ? pill('命中', 'green')
             : pill('未命中', 'danger');
       return `<tr>
-  <td><a class="text-button mono" href="/subject/${escapeHtml(c.subject)}">${escapeHtml(c.subject)}</a></td>
+  <td><a class="text-button mono" href="/subject/${escapeHtml(c.subject)}?c=${encodeURIComponent(c.conclusionId)}">${escapeHtml(c.subject)}</a></td>
   <td>${c.subjectKind === 'STOCK' ? '个股' : '宽基'}</td>
   <td>${escapeHtml(c.researchKind)}</td>
   <td>${pill(disp.text, disp.cls)}</td>
@@ -951,7 +951,7 @@ function renderConclusionsPage(data: ConclusionsPageData): string {
   <td class="mono">${escapeHtml(c.excessReturn ?? '—')}</td>
   <td class="mono">${escapeHtml(c.tradability ?? '—')}</td>
   <td class="mono">${escapeHtml(fmtDateTime(c.createdAt))}</td>
-  <td class="cell-actions"><a class="text-button" href="/subject/${escapeHtml(c.subject)}">报告 →</a></td>
+  <td class="cell-actions"><a class="text-button" href="/subject/${escapeHtml(c.subject)}?c=${encodeURIComponent(c.conclusionId)}">报告 →</a></td>
 </tr>`;
     })
     .join('\n');

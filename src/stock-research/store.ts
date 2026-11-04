@@ -16,12 +16,14 @@ import type { Pool, PoolClient } from 'pg';
 import { KernelError, type PlanAuthBudget } from '../contracts.js';
 import { canonicalSha256 } from '../canonical.js';
 import { dbNow, withTransaction, type DbClient } from '../db/exec.js';
+import { assemblyBody, signReport, verifyReport } from './report-identity.js';
 import type { PermitSpace } from '../kernel/executor.js';
 import type { PermitOutcome, TryMarkSentOutcome } from '../kernel/permit.js';
 import type {
   ChatMessage,
   ChatThread,
   ReportDocument,
+  ReportVersionSummary,
   SrCall,
   SrCallContract,
   SrStep,
@@ -84,6 +86,7 @@ interface StepRow {
   note: string | null;
   started_at: Date | null;
   finished_at: Date | null;
+  output_artifact: SrStep['outputArtifact'];
 }
 
 function rowToStep(row: StepRow): SrStep {
@@ -97,6 +100,7 @@ function rowToStep(row: StepRow): SrStep {
     note: row.note,
     startedAt: row.started_at ? row.started_at.toISOString() : null,
     finishedAt: row.finished_at ? row.finished_at.toISOString() : null,
+    outputArtifact: row.output_artifact ?? null,
   };
 }
 
@@ -680,23 +684,50 @@ export const SR_PERMIT_SPACE: PermitSpace<SrCallPermit, SrCallContract> = {
 
 // ===== 报告 =====
 
-export async function insertReport(srPool: Pool, report: Omit<ReportDocument, 'contentHash'>): Promise<ReportDocument> {
-  const full: ReportDocument = { ...report, contentHash: canonicalSha256({ ...report }) };
+export async function insertReport(srPool: DbClient, report: Omit<ReportDocument, 'contentHash'>): Promise<ReportDocument> {
+  const full = signReport(report);
   const res = await srPool.query(
     `insert into sr_report (report_id, task_id, version, status, subject, subject_name, focus, horizon,
        cutoff, method_version, adapter_version, plan_auth_version, generated_by, content, qa_findings,
-       change_summary, content_hash, published_at, report_gate, evidence_refs)
+       change_summary, content_hash, published_at, report_gate, evidence_refs, created_at)
      values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$15::jsonb,$16,$17,
-       case when $4 like 'PUBLISHED%' then now() else null end, $18::jsonb, $19::jsonb)`,
+       $18::timestamptz, $19::jsonb, $20::jsonb, $21::timestamptz)
+     on conflict (task_id, version) do nothing`,
     [full.reportId, full.taskId, full.version, full.status, full.subject, full.subjectName,
       full.focus, full.horizon, full.cutoff, full.methodVersion, full.adapterVersion,
-      full.planAuthVersion, full.generatedBy, JSON.stringify(full.sections),
-      JSON.stringify(full.qaFindings), full.changeSummary, full.contentHash,
+      full.planAuthVersion, full.generatedBy, JSON.stringify({ sections: full.sections, ...(full.derivation ? { derivation: full.derivation } : {}) }),
+      JSON.stringify(full.qaFindings), full.changeSummary, full.contentHash, full.publishedAt,
       full.gate ? JSON.stringify(full.gate) : null,
-      full.evidenceRefs ? JSON.stringify(full.evidenceRefs) : null],
+      full.evidenceRefs ? JSON.stringify(full.evidenceRefs) : null, full.createdAt],
   );
-  if ((res.rowCount ?? 0) === 0) throw new Error('insertReport: 写入失败');
+  if ((res.rowCount ?? 0) === 0) {
+    const existing = await getReportByTaskAndVersion(srPool, full.taskId, full.version);
+    if (!existing || existing.contentHash !== full.contentHash) throw new KernelError('SR_REPORT_CONFLICT', '该版本已存在且正文不同');
+    return existing;
+  }
   return full;
+}
+
+export async function insertAssembledReport(srPool: Pool, report: Omit<ReportDocument, 'contentHash'>): Promise<ReportDocument> {
+  const stepId = report.evidenceRefs?.artifacts?.assemblyStepId;
+  if (!stepId) throw new KernelError('SR_ARTIFACT_UNBOUND', '组装缺少步骤身份');
+  return withTransaction(srPool, async (tx) => {
+    await tx.query('select task_id from sr_task where task_id = $1::uuid for update', [report.taskId]);
+    const step = await tx.query("select step_id from sr_step where task_id=$1::uuid and step_id=$2::uuid and step_kind='ASSEMBLE'", [report.taskId, stepId]);
+    if (!step.rows[0]) throw new KernelError('SR_ARTIFACT_UNBOUND', '组装步骤不属于该任务');
+    const prior = await tx.query<ReportRow>(`select * from sr_report where task_id=$1::uuid
+      and evidence_refs #>> '{artifacts,assemblyStepId}' = $2 order by version desc`, [report.taskId, stepId]);
+    if (prior.rows.length > 1) throw new KernelError('SR_REPORT_CONFLICT', '同一组装步骤存在多个版本');
+    const existing = prior.rows[0] ? rowToReport(prior.rows[0]) : null;
+    if (existing) {
+      if (canonicalSha256(assemblyBody(existing)) !== canonicalSha256(assemblyBody(report))) {
+        throw new KernelError('SR_REPORT_CONFLICT', '同一组装步骤的材料或正文发生变化');
+      }
+      return existing;
+    }
+    const latest = await tx.query<{ report_id: string; version: number }>('select report_id, version from sr_report where task_id=$1::uuid order by version desc limit 1', [report.taskId]);
+    return insertReport(tx, { ...report, reportId: latest.rows[0]?.report_id ?? report.reportId, version: (latest.rows[0]?.version ?? 0) + 1 });
+  });
 }
 
 export async function getReportByTaskAndVersion(
@@ -737,8 +768,10 @@ interface ReportRow {
   account_id?: string;
 }
 
-function rowToReport(row: ReportRow): ReportDocument {
-  return {
+export function rowToReport(row: ReportRow): ReportDocument {
+  const stored = row.content as { sections: ReportDocument['sections']; derivation?: ReportDocument['derivation'] };
+  if (!Array.isArray(row.content) && (!stored || !Array.isArray(stored.sections))) throw new KernelError('SR_REPORT_HASH_MISMATCH', '报告正文结构不完整');
+  return verifyReport({
     reportId: row.report_id,
     taskId: row.task_id,
     version: row.version,
@@ -752,7 +785,8 @@ function rowToReport(row: ReportRow): ReportDocument {
     adapterVersion: row.adapter_version,
     planAuthVersion: row.plan_auth_version,
     generatedBy: row.generated_by as ReportDocument['generatedBy'],
-    sections: row.content as ReportDocument['sections'],
+    sections: Array.isArray(row.content) ? row.content as ReportDocument['sections'] : stored.sections,
+    ...(!Array.isArray(row.content) && stored.derivation ? { derivation: stored.derivation } : {}),
     qaFindings: row.qa_findings as ReportDocument['qaFindings'],
     changeSummary: row.change_summary,
     gate: (row.report_gate as ReportDocument['gate']) ?? null,
@@ -760,7 +794,7 @@ function rowToReport(row: ReportRow): ReportDocument {
     createdAt: row.created_at.toISOString(),
     publishedAt: row.published_at ? row.published_at.toISOString() : null,
     contentHash: row.content_hash,
-  };
+  });
 }
 
 export interface ReportWithOwner extends ReportDocument {
@@ -768,11 +802,12 @@ export interface ReportWithOwner extends ReportDocument {
 }
 
 /** 按报告身份读取（带归属；accountId 不匹配返回 null——服务端访问控制的取数基础）。 */
-export async function getReportById(srPool: DbClient, reportId: string, accountId?: string): Promise<ReportWithOwner | null> {
+export async function getReportById(srPool: DbClient, reportId: string, accountId?: string, version?: number): Promise<ReportWithOwner | null> {
   const res = await srPool.query<ReportRow>(
     `select r.*, a.account_id from sr_report r join sr_task a on a.task_id = r.task_id
-     where r.report_id = $1::uuid${accountId ? ' and a.account_id = $2::uuid' : ''}`,
-    accountId ? [reportId, accountId] : [reportId],
+     where r.report_id = $1::uuid and ($2::uuid is null or a.account_id = $2::uuid)
+       and ($3::integer is null or r.version = $3) order by r.version desc limit 1`,
+    [reportId, accountId ?? null, version ?? null],
   );
   const row = res.rows[0];
   if (!row) return null;
@@ -788,53 +823,74 @@ export async function listReportVersions(srPool: DbClient, taskId: string): Prom
   return res.rows.map(rowToReport);
 }
 
-/** 旧版本 SUPERSEDED 化 + 新版本发布（一个事务；不可变发布版本语义）。 */
+export async function getLatestReportForTask(srPool: DbClient, taskId: string): Promise<ReportDocument | null> {
+  const res = await srPool.query<ReportRow>('select * from sr_report where task_id=$1::uuid order by version desc limit 1', [taskId]);
+  return res.rows[0] ? rowToReport(res.rows[0]) : null;
+}
+
+/** 导航不消费坏版本正文，也不把坏版本重新签成有效材料。 */
+export async function listReportVersionSummaries(srPool: DbClient, taskId: string): Promise<ReportVersionSummary[]> {
+  const res = await srPool.query<ReportRow>('select * from sr_report where task_id=$1::uuid order by version desc', [taskId]);
+  return res.rows.map((row) => {
+    let unavailableReason: string | null = null;
+    try {
+      const report = rowToReport(row);
+      if (!report.evidenceRefs?.artifacts) unavailableReason = 'SR_ARTIFACT_UNBOUND';
+    } catch { unavailableReason = 'SR_REPORT_HASH_MISMATCH'; }
+    return { reportId: row.report_id, version: row.version, status: row.status as ReportDocument['status'],
+      createdAt: row.created_at.toISOString(), publishedAt: row.published_at?.toISOString() ?? null, unavailableReason };
+  });
+}
+
+/** 新版本追加；旧版的签名正文（包括 status）保持不变。 */
 export async function publishNewVersion(
   srPool: Pool,
   report: Omit<ReportDocument, 'contentHash'>,
 ): Promise<ReportDocument> {
-  return withTransaction(srPool, async (tx) => {
-    await tx.query(
-      `update sr_report set status = 'SUPERSEDED' where report_id = $1::uuid and version < $2`,
-      [report.reportId, report.version],
-    );
-    return insertReport(tx as unknown as Pool, { ...report, status: 'PUBLISHED' });
-  });
+  return insertReport(srPool, { ...report, status: 'PUBLISHED' });
 }
 
 // ===== 对话 =====
 
-export async function createChatThread(srPool: Pool, reportId: string, accountId: string): Promise<ChatThread> {
+export async function createChatThread(srPool: Pool, reportId: string, accountId: string, reportVersion: number): Promise<ChatThread> {
   const threadId = randomUUID();
   await srPool.query(
-    `insert into sr_chat_thread (thread_id, report_id, account_id) values ($1,$2,$3)`,
-    [threadId, reportId, accountId],
+    `insert into sr_chat_thread (thread_id, report_id, account_id, report_version)
+     select $1,$2,$3,$4 where exists (
+       select 1 from sr_report r join sr_task k on k.task_id = r.task_id
+       where r.report_id = $2::uuid and r.version = $4 and k.account_id = $3::uuid)
+     on conflict (report_id, report_version, account_id) do nothing`,
+    [threadId, reportId, accountId, reportVersion],
   );
-  return { threadId, reportId, accountId, createdAt: new Date().toISOString() };
+  const thread = await findThreadForReport(srPool, reportId, accountId, reportVersion);
+  if (!thread) throw new KernelError('REPORT_NOT_FOUND', '追问版本不存在或无权访问');
+  return thread;
 }
 
 export async function getChatThread(srPool: DbClient, threadId: string, accountId?: string): Promise<ChatThread | null> {
   const res = await srPool.query(
     `select t.*, r.task_id as task_ref from sr_chat_thread t
-     join sr_report r on r.report_id = t.report_id
+     join sr_report r on r.report_id = t.report_id and r.version = t.report_version
      join sr_task k on k.task_id = r.task_id
      where t.thread_id = $1::uuid${accountId ? ' and k.account_id = $2::uuid' : ''}`,
     accountId ? [threadId, accountId] : [threadId],
   );
   const row = res.rows[0];
   if (!row) return null;
-  return { threadId: row.thread_id, reportId: row.report_id, accountId: row.account_id, createdAt: row.created_at.toISOString() };
+  return { threadId: row.thread_id, reportId: row.report_id, reportVersion: row.report_version, accountId: row.account_id, createdAt: row.created_at.toISOString() };
 }
 
-export async function findThreadForReport(srPool: DbClient, reportId: string, accountId: string): Promise<ChatThread | null> {
+export async function findThreadForReport(srPool: DbClient, reportId: string, accountId: string, reportVersion: number): Promise<ChatThread | null> {
   const res = await srPool.query(
     `select t.* from sr_chat_thread t
-     join sr_task k on k.task_id = (select task_id from sr_report where report_id = $1::uuid)
-     where t.report_id = $1::uuid and k.account_id = $2::uuid limit 1`,
-    [reportId, accountId],
+     join sr_report r on r.report_id = t.report_id and r.version = t.report_version
+     join sr_task k on k.task_id = r.task_id
+     where t.report_id = $1::uuid and t.account_id = $2::uuid and k.account_id = $2::uuid
+       and t.report_version = $3 limit 1`,
+    [reportId, accountId, reportVersion],
   );
   const row = res.rows[0];
-  return row ? { threadId: row.thread_id, reportId: row.report_id, accountId, createdAt: row.created_at.toISOString() } : null;
+  return row ? { threadId: row.thread_id, reportId: row.report_id, reportVersion: row.report_version, accountId, createdAt: row.created_at.toISOString() } : null;
 }
 
 export async function addChatMessage(srPool: DbClient, msg: Omit<ChatMessage, 'messageId' | 'createdAt'>): Promise<ChatMessage> {

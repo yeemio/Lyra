@@ -40,6 +40,17 @@ const msgs: ChatMessage[] = [{
   createdAt: '2026-10-26T00:00:00.000Z',
 }];
 
+it('PR5 版本导航隔离坏旧版，所选有效版与追问/修订版本一致', () => {
+  const current = { ...report('第二版有效正文'), version: 2 };
+  const invalid = { reportId: current.reportId, version: 1, status: 'PUBLISHED' as const,
+    createdAt: current.createdAt, publishedAt: current.publishedAt, unavailableReason: 'SR_REPORT_HASH_MISMATCH' };
+  const html = renderReportPage({ report: current, versions: [invalid, current], tablesById: {}, messages: [], csrf: 'synthetic' });
+  assert.ok(html.includes('第二版有效正文') && html.includes('v1（材料不可验证）'));
+  assert.ok(!html.includes(`href="/reports/${current.reportId}?v=1"`));
+  assert.equal((html.match(/name="report_version" value="2"/g) ?? []).length, 2);
+  assert.ok(html.includes(`/pdf?v=2`));
+});
+
 describe('渲染安全：模型/用户文本不可信', () => {
   it('script 注入被转义（narrative 与用户消息）', () => {
     const doc = report('正文中 <script>alert("x")</script> 与 <img src=x onerror=alert(1)> 结束');

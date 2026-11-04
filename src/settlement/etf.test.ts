@@ -1,3 +1,4 @@
+import { testEtfMapping } from '../research/inputs-pit-test-helper.js';
 /**
  * Lyra · 宽基 ETF 结算单测（P3 W19: code-writer-pro）。DB 用例走本地 lyra-pg 隔离
  * schema，不碰网络；合成事实覆盖 SR-8A 全形态：UP/DOWN/ABSTAIN 三态命中、=0 两侧
@@ -12,6 +13,7 @@ import { randomUUID } from 'node:crypto';
 import { after, before, test } from 'node:test';
 import type { Pool } from 'pg';
 import { createPool } from '../db/pool.js';
+import { freezeBenchmark } from '../conclusion/benchmark.js';
 import { insertFact } from '../pintime/facts.js';
 import { settleEtfConclusion, parseTrackedIndex, loadEtfIndexMap, type EtfSettleOutcome } from './etf.js';
 import { SettlementError, decFrom, decMin, decToString } from './decimal.js';
@@ -119,7 +121,10 @@ function flatEtf(refOpen: string, close: string, closeLast: string, days: readon
 }
 
 function etfArgs(subject: string, disposition: 'RESEARCH_UP' | 'RESEARCH_DOWN' | 'ABSTAIN', overrides: Record<string, unknown> = {}) {
-  return { subject, disposition, conclusionTime: CONCLUSION_T0, asOf: AS_OF, trackedIndex: IDX, ...overrides };
+  const cutoff = String(overrides.cutoff ?? CONCLUSION_T0);
+  const index = String(overrides.trackedIndex ?? IDX);
+  const benchmark = freezeBenchmark({ subjectKind: 'BROAD_ETF', subject, cutoff, facts: [], etfMapping: testEtfMapping(subject, `合成跟踪指数(${index})`) });
+  return { subject, disposition, conclusionTime: CONCLUSION_T0, cutoff, asOf: AS_OF, trackedIndex: index, benchmark, ...overrides };
 }
 
 /** SETTLED 形态收窄助手。 */
@@ -385,20 +390,21 @@ test('loadEtfIndexMap：R24 冻结池 4 只 ETF 全解析', async () => {
   assert.equal(map.size, 4);
 });
 
-test('默认映射路径：不传 trackedIndex 时按冻结池解析（510050 → 000016）并全链结算', async () => {
+test('冻结映射路径：不传 trackedIndex 时只按研究时身份（510050 → 000016）结算', async () => {
   await insertIndex(TRACKS_510050, CAL, (d) => (d === LAST_20TH ? '3300.0000' : '3000.0000'), IDX_BASE);
   await insertEtf('510050', flatEtf('3.0000', '3.0000', '3.3000'));
   const o = settled(await settleEtfConclusion(pool, {
-    subject: '510050', disposition: 'RESEARCH_UP', conclusionTime: CONCLUSION_T0, asOf: AS_OF, // 不传 trackedIndex
+    subject: '510050', disposition: 'RESEARCH_UP', conclusionTime: CONCLUSION_T0, cutoff: CONCLUSION_T0, asOf: AS_OF,
+    benchmark: etfArgs('510050', 'RESEARCH_UP', { trackedIndex: TRACKS_510050 }).benchmark,
   }));
-  assert.equal(o.diagnostics.trackedIndex, '000016'); // 来自 data/research-pool.json
+  assert.equal(o.diagnostics.trackedIndex, '000016'); // 来自研究时冻结身份，结算不再读取当前池
   assert.equal(o.zone.excessReturn, '0.1');
   assert.equal(o.zone.directionHit, true);
 });
 
 // ===== R18 跨类与输入校验 =====
 
-test('个股 disposition / 非 ETF 代码段 / 池外 ETF：具名拒绝', async () => {
+test('个股 disposition / 非 ETF 代码段 / 缺少冻结身份：具名拒绝', async () => {
   await assert.rejects(
     settleEtfConclusion(pool, etfArgs('510300', 'RESEARCH_OUTPERFORM' as 'RESEARCH_UP')),
     (e: unknown) => e instanceof SettlementError && e.code === 'SETTLE_INPUT_INVALID',
@@ -407,11 +413,9 @@ test('个股 disposition / 非 ETF 代码段 / 池外 ETF：具名拒绝', async
     settleEtfConclusion(pool, etfArgs('600519', 'RESEARCH_UP')),
     (e: unknown) => e instanceof SettlementError && e.code === 'SETTLE_INPUT_INVALID',
   );
-  await assert.rejects(
-    // 不注入 trackedIndex：走冻结池解析，池外标的具名拒绝
-    settleEtfConclusion(pool, { subject: '519999', disposition: 'RESEARCH_UP', conclusionTime: CONCLUSION_T0, asOf: AS_OF }),
-    (e: unknown) => e instanceof SettlementError && e.code === 'ETF_NOT_IN_POOL',
-  );
+  const missing = await settleEtfConclusion(pool, { subject: '510300', disposition: 'RESEARCH_UP', conclusionTime: CONCLUSION_T0, asOf: AS_OF });
+  assert.equal(missing.state, 'ANOMALY');
+  assert.equal(missing.state === 'ANOMALY' && missing.code, 'BENCHMARK_NOT_FROZEN');
   await assert.rejects(
     settleEtfConclusion(pool, etfArgs('510300', 'RESEARCH_UP', { invalidationThreshold: '-0.05' })),
     (e: unknown) => e instanceof SettlementError && e.code === 'SETTLE_INPUT_INVALID',

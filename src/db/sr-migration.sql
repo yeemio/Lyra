@@ -65,6 +65,19 @@ create table if not exists sr_step (
 );
 create index if not exists sr_step_task_idx on sr_step(task_id, sequence);
 
+-- PR5：步骤产物只绑定一次；固定工作文件不是恢复或报告证据入口。
+alter table sr_step add column if not exists output_artifact jsonb;
+create or replace function sr_keep_output_artifact() returns trigger language plpgsql as $$
+begin
+  if old.output_artifact is not null and new.output_artifact is distinct from old.output_artifact then
+    raise exception 'SR_ARTIFACT_IMMUTABLE';
+  end if;
+  return new;
+end $$;
+drop trigger if exists sr_step_artifact_immutable on sr_step;
+create trigger sr_step_artifact_immutable before update on sr_step
+  for each row execute function sr_keep_output_artifact();
+
 -- 〔C3/R0〕已建 sr schema 的步骤类型扩展（幂等：先建表的新约束同名，drop+add 对新旧安装均成立）
 alter table sr_step drop constraint if exists sr_step_step_kind_check;
 alter table sr_step add constraint sr_step_step_kind_check
@@ -147,6 +160,7 @@ create table if not exists sr_report (
   unique (task_id, version) -- 不可变发布版本：修订只新增行
 );
 create index if not exists sr_report_task_idx on sr_report(task_id, version desc);
+create unique index if not exists sr_report_identity_idx on sr_report(report_id, version);
 
 -- 〔C3/R0〕发布门与证据绑定四哈希（对齐 Metis ConclusionEvidence；幂等）
 alter table sr_report add column if not exists report_gate jsonb;
@@ -162,6 +176,9 @@ create table if not exists sr_chat_thread (
   created_at timestamptz not null default now()
 );
 create index if not exists sr_chat_thread_report_idx on sr_chat_thread(report_id);
+-- 旧线程无版本证明，保留原行但不猜配到任何版本。新线程显式按版本隔离。
+alter table sr_chat_thread add column if not exists report_version integer check (report_version > 0);
+create unique index if not exists sr_chat_thread_version_idx on sr_chat_thread(report_id, report_version, account_id);
 
 create table if not exists sr_chat_message (
   message_id       uuid primary key,
