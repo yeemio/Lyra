@@ -1,3 +1,5 @@
+import { researchJInputHash } from './validation.js';
+import { researchMaterial } from './requests.js';
 /**
  * Lyra · 事件后研究编排器单测（P3 W20: code-writer-pro）。DB 用例走 public 真实事实 +
  * 真实事件（public.events），执行与结论落隔离 schema；无网络。
@@ -14,10 +16,10 @@ import { randomUUID } from 'node:crypto';
 import { after, before, test } from 'node:test';
 import type { Pool } from 'pg';
 import { loadTradeCalendarTable } from '../adapters/calendar.js';
-import { canonicalSha256 } from '../canonical.js';
 import type { AOutput, ConclusionObject, JOutput, PlanAuthBudget } from '../contracts.js';
 import { applySchema, dropSchema } from '../db/exec.js';
-import { persistConclusion, readConclusion } from '../db/conclusion.js';
+import { readConclusion } from '../db/conclusion.js';
+import { persistResearchConclusion } from './trace.js';
 import { ArtifactStore } from '../artifacts/store.js';
 import { createPool } from '../db/pool.js';
 import { runModelCall } from '../kernel/executor.js';
@@ -107,10 +109,7 @@ async function buildWeeklyPrior(cutoff: string): Promise<ConclusionObject> {
     versions: { ...VERSIONS, planAuthVersion: BUDGET.planAuthVersion },
   });
   const deadline = new Date(Date.now() + REPLAY_DEADLINE_MS).toISOString();
-  const material = {
-    artifactSha256s: assembled.package.seals.flatMap((s) => s.artifactRefs.map((r) => r.sha256)).slice(0, 12),
-    factCount: assembled.package.seals.reduce((n, s) => n + s.factIds.length, 0),
-  };
+  const material = researchMaterial(assembled.package);
   const a = await runModelCall<AOutput>(isolated, {
     contract: {
       businessKey,
@@ -128,7 +127,7 @@ async function buildWeeklyPrior(cutoff: string): Promise<ConclusionObject> {
     holderId: HOLDER,
   });
   const checklist = deriveChecklist(a.output, assembled.package.seals[0]!.manifestHash);
-  const jInputHash = canonicalSha256({ a: a.output, checklist });
+  const jInputHash = researchJInputHash(assembled.package, a.output, checklist);
   const j = await runModelCall<JOutput>(isolated, {
     contract: {
       businessKey,
@@ -145,7 +144,7 @@ async function buildWeeklyPrior(cutoff: string): Promise<ConclusionObject> {
     simulated: true,
     holderId: HOLDER,
   });
-  return persistConclusion(isolated, {
+  const prior = await persistResearchConclusion(isolated, store, {
     businessKey,
     methodVersion: VERSIONS.methodVersion,
     adapterVersion: VERSIONS.adapterVersion,
@@ -154,9 +153,14 @@ async function buildWeeklyPrior(cutoff: string): Promise<ConclusionObject> {
     checklist,
     jOutput: j.output,
     manifest: assembled.package.seals[0]!,
+    researchInput: assembled.package,
     inheritance: null,
     changeReason: j.output.changedFromA ? j.output.changeReason : null,
   });
+  // 隔离夹具的历史完成时钟，非业务结论回写；资格必须使用原行而非调用者自报时间。
+  const completed = new Date(Date.parse(cutoff) + 60_000).toISOString();
+  await isolated.query('update conclusion set created_at = $1 where conclusion_id = $2', [completed, prior.conclusionId]);
+  return (await readConclusion(isolated, prior.conclusionId))!;
 }
 
 /** 第一条测试产出的真实周度先验（顺序测试共享，供资格破坏用例复用）。 */
@@ -254,7 +258,7 @@ test('SC-7.1 STANDALONE 全链：真实事件（600519 增速变化 2017-10-26�
   );
   assert.deepEqual(outcome.declaration, { basis: 'STANDALONE', standaloneNote: '无基础结论可继承' });
   assert.equal(outcome.conclusion.inheritance, null);
-  assert.equal(outcome.conclusion.standaloneNote, '无基础结论可继承');
+  assert.match(outcome.conclusion.standaloneNote ?? '', /^完整重研：/);
   // STANDALONE 非重试：changeReason 仅在 J 改判 A 候选时由 J 提供（RM §8 配对）
   if (outcome.conclusion.changeReason !== null) {
     assert.ok((outcome.conclusion.changeReason ?? '').length > 0);
@@ -279,7 +283,7 @@ test('RM §7.1 继承资格不满足（方法版本不兼容）→ 不继承，�
       inheritance: { priorConclusion: realPrior },
       budget: BUDGET,
       holderId: HOLDER,
-      versions: { methodVersion: 'method@incompatible-v9', adapterVersion: VERSIONS.adapterVersion }, // 资格破坏：方法版本不兼容
+      versions: { methodVersion: 'method@p2-v2-20261103', adapterVersion: VERSIONS.adapterVersion }, // 资格破坏：方法版本不兼容
       now: new Date('2018-09-03T01:00:00.000Z'),
       deadline: new Date(Date.now() + REPLAY_DEADLINE_MS).toISOString(),
     },
@@ -288,7 +292,7 @@ test('RM §7.1 继承资格不满足（方法版本不兼容）→ 不继承，�
   if (!outcome.eligibility.eligible) assert.match(outcome.eligibility.reason, /方法版本/);
   assert.equal(outcome.declaration.basis, 'STANDALONE'); // 不满足任一条即不继承（RM §7.1）
   assert.equal(outcome.conclusion.inheritance, null);
-  assert.equal(outcome.conclusion.standaloneNote, '无基础结论可继承');
+  assert.match(outcome.conclusion.standaloneNote ?? '', /^完整重研：/);
 });
 
 test('SC-3.3 启动闸：次日 08:00 后新启动具名拒绝 POST_EVENT_START_LATE（零 permit、零组装）', async () => {
