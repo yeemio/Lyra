@@ -52,7 +52,7 @@ Owner 已授权这批经核对的问题修复、验证、对应分支提交/推�
 
 ## PR4 R1 实施与依赖（2026-11-04）
 
-唯一作者在原 PR4 分支上采用已接受 PR5 `5ecf5e87a2dfec261ddaa1e044085caa5cb62b26`（其祖先包含已接受 PR1、PR3）。依赖合并提交 `32baeae7b8af459fdfa722c44f1f5cc9a416776e` 的第一父为本 PR 初始合同 `3a97bf4283be95b3a3c0afab2e116ba64d3d70`，第二父为上述 PR5；tree `1d2f119edc823d6fbfafdf3a9b508d4e60a4384f`。未采用 PR2、PR6、PR7；未更改其旧身份。R1 修复提交以该合并为唯一父，精确 head/tree/raw commit、全量增量和哈希由冻结交付 manifest 记录。
+唯一作者在原 PR4 分支上采用已接受 PR5 `5ecf5e87a2dfec261ddaa1e044085caa5cb62b26`（其祖先包含已接受 PR1、PR3）。依赖合并提交 `32baeae7b8af459fdfa722c44f1f5cc9a416776e` 的第一父为本 PR 初始合同 `3a97bf4283be95b3a3a3c0afab2e116ba64d3d70`，第二父为上述 PR5；tree `1d2f119edc823d6fbfafdf3a9b508d4e60a4384f`。未采用 PR2、PR6、PR7；未更改其旧身份。R1 修复提交以该合并为唯一父，精确 head/tree/raw commit、全量增量和哈希由冻结交付 manifest 记录。
 
 | 出口 | 本候选行为与证据位置 |
 |---|---|
