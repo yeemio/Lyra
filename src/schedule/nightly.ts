@@ -28,7 +28,10 @@ import { ArtifactStore } from '../artifacts/store.js';
 import { createPool } from '../db/pool.js';
 import { canonicalSha256 } from '../canonical.js';
 import { validDispositions, type AOutput, type JOutput, type PlanAuthBudget, type SubjectKind } from '../contracts.js';
-import { readConclusion, persistConclusion } from '../db/conclusion.js';
+import { readConclusion } from '../db/conclusion.js';
+import { persistResearchConclusion } from '../research/trace.js';
+import { buildARequest, buildJRequest } from '../research/requests.js';
+import { validateResearchA, validateResearchJ } from '../research/validation.js';
 import { backfillSettlement } from '../conclusion/settlement.js';
 import { runModelCall } from '../kernel/executor.js';
 import { acquireExecutorLock, heartbeatExecutorLock, releaseExecutorLock } from '../kernel/lock.js';
@@ -334,62 +337,51 @@ async function commitWeeklySubject(
   const businessKey = assembled.package.businessKey;
   const manifest = assembled.package.seals[0];
   if (manifest === undefined) throw new NightlyError('SEAL_MISSING', `${plan.subject} 输入包无封存 manifest`);
-  const material = {
-    artifactSha256s: assembled.package.seals.flatMap((s) => s.artifactRefs.map((r) => r.sha256)).slice(0, 12),
-    factCount: assembled.package.seals.reduce((n, s) => n + s.factIds.length, 0),
-    gaps: assembled.package.dimensions.flatMap((c) => c.gap),
-  };
+  const pkg = assembled.package;
+  const simulated = ctx.transport.describe().simulated;
+  const aRequest = buildARequest(pkg, simulated);
   const a = await runModelCall<AOutput>(deps.execPool, {
     contract: {
       businessKey,
       stage: 'A',
       inputHash: assembled.inputHash,
-      inputBytes: assembled.inputBytes,
+      inputBytes: aRequest.inputBytes,
       methodVersion: SKELETON_METHOD_VERSION,
       planAuthVersion: ctx.planAuthVersion,
       deadline: ctx.deadline,
     },
     budget: SKELETON_BUDGET,
     modelFn: async (c) =>
-      (await ctx.transport.dispatch(c.contract, {
-        inputHash: assembled.inputHash,
-        subjectKind: plan.subjectKind,
-        subject: plan.subject,
-        material,
-      })) as AOutput,
+      validateResearchA(await ctx.transport.dispatch(c.contract, aRequest.payload), pkg, simulated),
     simulated: ctx.transport.describe().simulated,
     holderId: ctx.holderId,
   });
   const checklist = deriveChecklist(a.output, manifest.manifestHash);
-  const jInputHash = canonicalSha256({ a: a.output, checklist });
+  const jRequest = buildJRequest(pkg, a.output, checklist, simulated);
+  const jInputHash = jRequest.inputHash;
   const j = await runModelCall<JOutput>(deps.execPool, {
     contract: {
       businessKey,
       stage: 'J',
       inputHash: jInputHash,
-      inputBytes: assembled.inputBytes,
+      inputBytes: jRequest.inputBytes,
       methodVersion: SKELETON_METHOD_VERSION,
       planAuthVersion: ctx.planAuthVersion,
       deadline: ctx.deadline,
     },
     budget: SKELETON_BUDGET,
     modelFn: async (c) =>
-      (await ctx.transport.dispatch(c.contract, {
-        inputHash: jInputHash,
-        subjectKind: plan.subjectKind,
-        subject: plan.subject,
-        aOutput: a.output,
-        checklist,
-      })) as JOutput,
+      validateResearchJ(await ctx.transport.dispatch(c.contract, jRequest.payload), pkg, a.output, checklist, simulated),
     simulated: ctx.transport.describe().simulated,
     holderId: ctx.holderId,
   });
-  const conclusion = await persistConclusion(deps.execPool, {
+  const conclusion = await persistResearchConclusion(deps.execPool, deps.store, {
     businessKey,
     methodVersion: SKELETON_METHOD_VERSION,
     adapterVersion: SKELETON_ADAPTER_VERSION,
     planAuthVersion: ctx.planAuthVersion,
     aOutput: a.output,
+    researchInput: pkg,
     checklist,
     jOutput: j.output,
     manifest,
@@ -416,6 +408,11 @@ function mondayOfWeek(date: string): string {
 }
 
 export async function runNightly(deps: NightlyDeps, opts: NightlyOptions): Promise<NightlyRunOutcome> {
+  // 新校验/送达协议不得借冻结 P5 的方法与运行授权写新真实样本。
+  // 本修复不迁移、不激活 P5；迁移须由总控在单独授权后显式建立新身份。
+  if (opts.mode === 'commit' && !(deps.transport ?? selectTransport({ provider: opts.transportProvider ?? 'simulated' })).describe().simulated) {
+    throw new NightlyError('P5_PROTOCOL_FROZEN', '冻结 P5 真实入口未迁移到 traditional-research@2；拒绝沿旧身份发送');
+  }
   const now = opts.now ?? new Date();
   const mode = opts.mode;
   const provider = opts.transportProvider ?? 'simulated';
@@ -940,6 +937,7 @@ export async function settleDueConclusions(
             subject: c.businessKey.subject,
             disposition: c.disposition as 'RESEARCH_OUTPERFORM' | 'RESEARCH_UNDERPERFORM' | 'ABSTAIN',
             conclusionTime: c.createdAt,
+            benchmark: c.evidence.benchmark,
             cutoff: c.businessKey.cutoff,
             ...asOfField,
             ...windowField,
@@ -947,7 +945,9 @@ export async function settleDueConclusions(
         : await settleEtfConclusion(factPool, {
             subject: c.businessKey.subject,
             disposition: c.disposition as 'RESEARCH_UP' | 'RESEARCH_DOWN' | 'ABSTAIN',
+            cutoff: c.businessKey.cutoff,
             conclusionTime: c.createdAt,
+            benchmark: c.evidence.benchmark,
             ...asOfField,
             ...windowField,
           });

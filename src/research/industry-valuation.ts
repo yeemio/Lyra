@@ -41,6 +41,7 @@
  *   覆盖限制随表注记如实声明）。
  */
 import type { Pool } from 'pg';
+import { selectIndustryBenchmark } from '../conclusion/benchmark.js';
 import type { TimePointFact } from '../contracts.js';
 import { asOfFacts } from '../pintime/facts.js';
 import {
@@ -389,8 +390,9 @@ export function swL1OfWindow(head: SwChainHead, system: ValuationSystem): string
 /** 装载结果：样本 + 宇宙与逐级跳过清单（覆盖限制如实）。 */
 export interface StockPESamplesLoad {
   asOf: string;
-  /** 截点时刻（asOf 15:00 Asia/Shanghai，收盘口径）。 */
+  /** 调用方的精确截点，不提升到当日收盘。 */
   cutoffIso: string;
+  inputFacts: TimePointFact[];
   /** as-of 可见 FINANCIAL(profit) 股票数（样本宇宙上界）。 */
   universe: number;
   samples: StockPESample[];
@@ -400,7 +402,7 @@ export interface StockPESamplesLoad {
   skippedNoBar: string[];
   /** 链头行前缀在窗口体系无映射（或无申万轴链头）的股票。 */
   skippedNoAttribution: string[];
-  /** 行业代码 → 名称标签（SW_INDEX_LIST 当前快照，便捷标签非时点事实；快照缺则 null）。 */
+  /** 行业代码 → 名称标签（截点内 SW_INDEX_LIST 标签；不将当前标签补入旧材料）。 */
   names: ReadonlyMap<string, string> | null;
   note: string;
 }
@@ -410,20 +412,19 @@ export interface StockPESamplesLoad {
  * 同报告期 pubDate 最新）+ as-of 最新收盘（date ≤ asOf 最大）+ as-of 链头行读取窗口
  * 前缀归属。同日重复行情行不同收盘具名拒绝（来源冲突不静默合并，DATA-SOURCES §6.5）。
  */
-export async function loadStockPESamples(pool: Pool, asOf: string): Promise<StockPESamplesLoad> {
-  if (!DATE_RE.test(asOf)) {
-    throw new IndustryValuationError('INDUSTRY_VALUATION_AS_OF_INVALID', `asOf: ${asOf}（须 YYYY-MM-DD）`);
+export async function loadStockPESamples(pool: Pool, cutoffInstant: string | Date): Promise<StockPESamplesLoad> {
+  const cutoff = new Date(cutoffInstant);
+  if (Number.isNaN(cutoff.getTime()) || (typeof cutoffInstant === 'string' && !/(?:Z|[+-]\d{2}:\d{2})$/.test(cutoffInstant))) {
+    throw new IndustryValuationError('INDUSTRY_VALUATION_AS_OF_INVALID', 'cutoff 必须为带时区的精确时刻');
   }
+  const asOf = new Date(cutoff.getTime() + 8 * 3600_000).toISOString().slice(0, 10);
   const system = valuationSystemOf(asOf);
-  const cutoff = new Date(`${asOf}T15:00:00+08:00`);
-  if (Number.isNaN(cutoff.getTime())) {
-    throw new IndustryValuationError('INDUSTRY_VALUATION_AS_OF_INVALID', `asOf: ${asOf}（截点时刻构造失败）`);
-  }
   const cutoffIso = cutoff.toISOString();
+  const used = new Map<string, TimePointFact>();
 
   // ---- FINANCIAL(profit) as-of 可见 → 每股最新报告期（pubDate 口径可见性由 availableAt 过滤承载）----
   const fins = await asOfFacts(pool, { subjectType: 'STOCK', factKind: 'FINANCIAL', asOf: cutoff });
-  interface ProfitEntry { code: string; factId: string; statDate: string; pubDate: string; tv: Record<string, unknown> }
+  interface ProfitEntry { code: string; factId: string; fact: TimePointFact; statDate: string; pubDate: string; tv: Record<string, unknown> }
   const latestByStock = new Map<string, ProfitEntry>();
   for (const f of fins) {
     const v = tvOf(f);
@@ -439,7 +440,7 @@ export async function loadStockPESamples(pool: Pool, asOf: string): Promise<Stoc
       cur === undefined ||
       statDate > cur.statDate ||
       (statDate === cur.statDate && (pubDate > cur.pubDate || (pubDate === cur.pubDate && f.factId > cur.factId)));
-    if (better) latestByStock.set(code, { code, factId: f.factId, statDate, pubDate, tv: v });
+    if (better) latestByStock.set(code, { code, factId: f.factId, fact: f, statDate, pubDate, tv: v });
   }
   const universe = latestByStock.size;
 
@@ -450,6 +451,7 @@ export async function loadStockPESamples(pool: Pool, asOf: string): Promise<Stoc
   const skippedNoAttribution: string[] = [];
   for (const code of [...latestByStock.keys()].sort()) {
     const entry = latestByStock.get(code) as ProfitEntry;
+    used.set(entry.factId, entry.fact);
     const epsTTM = entry.tv.epsTTM;
     if (typeof epsTTM !== 'string' || epsTTM === '') {
       skippedNoEpsTTM.push(code); // 最新可见报告期无 epsTTM：如实跳过，不以旧报告期补值（不混期）
@@ -479,10 +481,12 @@ export async function loadStockPESamples(pool: Pool, asOf: string): Promise<Stoc
       continue;
     }
     const close = closesByDate.get(latestDate) as string;
+    for (const b of bars.filter((f) => tvOf(f).date === latestDate)) used.set(b.factId, b);
 
     const classFacts = await asOfFacts(pool, { subjectType: 'STOCK', subjectId: code, factKind: 'INDUSTRY_CLASS_VERSION', asOf: cutoff });
-    const head = pickSwChainHeadAt(classFacts, cutoff);
-    const l1 = head === null ? null : swL1OfWindow(head, system);
+    const attribution = selectIndustryBenchmark(classFacts, code, cutoff);
+    if (attribution !== null) used.set(attribution.fact.factId, attribution.fact);
+    const l1 = attribution?.industry?.industryIndexCode ?? null;
     if (l1 === null) {
       skippedNoAttribution.push(code); // 链头前缀在窗口体系无核验映射——不猜
       continue;
@@ -499,12 +503,14 @@ export async function loadStockPESamples(pool: Pool, asOf: string): Promise<Stoc
     });
   }
 
-  // ---- 行业名称标签（当前快照；读取失败/缺行 → null，名称非时点事实不阻断）----
+  // ---- 截点内行业名称标签；精确输入身份随材料封存 ----
   let names: ReadonlyMap<string, string> | null = null;
   try {
-    const q = await pool.query(`select typed_value from pintime_fact where fact_kind = 'SW_INDEX_LIST' limit 1`);
-    const rows = (q.rows[0]?.typed_value as { rows?: unknown } | undefined)?.rows;
+    const lists = await asOfFacts(pool, { factKind: 'SW_INDEX_LIST', asOf: cutoff });
+    const list = lists.at(-1);
+    const rows = (list?.typedValue as { rows?: unknown } | undefined)?.rows;
     if (Array.isArray(rows)) {
+      used.set(list!.factId, list!);
       const m = new Map<string, string>();
       for (const row of rows) {
         if (typeof row !== 'object' || row === null) continue;
@@ -521,15 +527,16 @@ export async function loadStockPESamples(pool: Pool, asOf: string): Promise<Stoc
   }
 
   const note =
-    `估值样本装载：as-of ${asOf}（截点 ${cutoffIso} = asOf 15:00 Asia/Shanghai 收盘口径）；` +
+    `估值样本装载：上海业务日 ${asOf}，精确截点 ${cutoffIso}（不推进到当日收盘）；` +
     '可见性：DAILY_BAR date ≤ asOf（availableAt=当日 15:00+08），FINANCIAL availableAt=pubDate 次日 00:00+08（pubDate ≤ asOf−1 可见，当日披露次日可得）；' +
     `样本宇宙 = 库内 as-of 可见 FINANCIAL(profit) 股票（${String(universe)} 股，非全市场成分）；` +
     `逐级跳过：无 epsTTM ${String(skippedNoEpsTTM.length)} / 无收盘 ${String(skippedNoBar.length)} / 行业归属不可定 ${String(skippedNoAttribution.length)}` +
-    '；行业归属 = as-of 链头行的行业代码前缀在读取窗口体系（' + system + '）前缀表下解释（W7 语义；携带行由此取得归属）。';
+    '；行业归属与冻结基准共用读取窗口体系（' + system + '）的归属行/跨体系前缀规则。';
 
   return {
     asOf,
     cutoffIso,
+    inputFacts: [...used.values()].sort((a, b) => a.factId.localeCompare(b.factId)),
     universe,
     samples,
     skippedNoEpsTTM,

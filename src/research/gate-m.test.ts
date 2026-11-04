@@ -20,8 +20,9 @@ import type { SolDispatchPayload } from '../kernel/sol-transport.js';
 import { DEFAULT_SOL_MODEL } from '../kernel/sol-transport.js';
 import { readConclusion } from '../db/conclusion.js';
 import { KernelError, type AOutput, type JOutput, type ModelCallContract } from '../contracts.js';
-import { canonicalSha256 } from '../canonical.js';
 import { runGateM, renderJPrompt, GATE_M_PLAN_BUDGET } from './gate-m.js';
+import { researchJInputHash } from './validation.js';
+import { researchMaterial, type ResearchDispatchPayload } from './requests.js';
 import { deriveChecklist } from './checklist.js';
 import { simulatedModelA } from './simulated.js';
 
@@ -50,7 +51,7 @@ class FakeSolChannel implements ModelTransport {
   readonly calls: { stage: 'A' | 'J'; prompt: string; inputBytes: number }[] = [];
 
   async dispatch(call: ModelCallContract, payload: unknown): Promise<unknown> {
-    const p = payload as SolDispatchPayload;
+    const p = payload as ResearchDispatchPayload;
     const requiredHash = /required_input_hash = "([0-9a-f]{64})"/.exec(p.prompt)?.[1];
     if (requiredHash === undefined) {
       throw new KernelError('MODEL_OUTPUT_SCHEMA_INVALID', 'fake：prompt 未内嵌 required_input_hash');
@@ -63,13 +64,13 @@ class FakeSolChannel implements ModelTransport {
         subjectKind: call.businessKey.subjectKind,
         candidate: 'RESEARCH_OUTPERFORM',
         decisiveLinks: [
-          { text: '决定性连接一：近 8 季财务趋势（fake 通道）', evidenceArtifactSha256: '11'.repeat(32) },
-          { text: '决定性连接二：行业基准相对表现（fake 通道）', evidenceArtifactSha256: '22'.repeat(32) },
+          { text: '决定性连接一：近 8 季财务趋势（fake 通道）', evidenceArtifactSha256: p.material.artifactSha256s[0]! },
+          { text: '决定性连接二：行业基准相对表现（fake 通道）', evidenceArtifactSha256: p.material.artifactSha256s[0]! },
         ],
         strongestCounter: '最强反证：近 20 日换手率抬升（fake 通道）',
         confidence: 'MEDIUM',
         limitations: ['fake 通道输出（测试）'],
-        simulated: true,
+        simulated: false,
       };
       return out;
     }
@@ -78,12 +79,12 @@ class FakeSolChannel implements ModelTransport {
       stage: 'J',
       inputHash: requiredHash,
       finalDisposition: 'ABSTAIN',
-      verdicts: ids.map((id) => ({ checklistId: id, verdict: 'SUPPORTED' as const, decisionBearing: true, correction: null })),
-      changedFromA: false,
-      changeReason: null,
+      verdicts: ids.map((id) => ({ checklistId: id, verdict: 'SUPPORTED' as const, decisionBearing: true, correction: null, reason: '合成复核', evidenceArtifactSha256s: [p.material.artifactSha256s[0]!], remainingBasisChecklistIds: [] })),
+      changedFromA: true,
+      changeReason: '合成复核选择放弃',
       strongestCaseDisposition: 'ACCEPTED',
       limitations: ['fake 通道输出（测试）'],
-      simulated: true,
+      simulated: false,
     };
     return out;
   }
@@ -131,15 +132,11 @@ test('Gate-M prompt：J prompt 含 J_DUTIES、A 输出全文、清单全文与�
     inputHash: pkg.inputHash,
     subjectKind: pkg.businessKey.subjectKind,
     subject: pkg.businessKey.subject,
-    material: {
-      artifactSha256s: pkg.seals.flatMap((s) => s.artifactRefs.map((r) => r.sha256)).slice(0, 12),
-      factCount: pkg.seals.reduce((n, s) => n + s.factIds.length, 0),
-      gaps: pkg.dimensions.flatMap((c) => c.gap),
-    },
+    material: researchMaterial(pkg),
   });
   const checklist = deriveChecklist(fakeA, pkg.seals[0]!.manifestHash);
-  const jInputHash = canonicalSha256({ a: fakeA, checklist });
-  const j = renderJPrompt('STOCK', fakeA, checklist, jInputHash);
+  const jInputHash = researchJInputHash(pkg, fakeA, checklist);
+  const j = renderJPrompt(pkg, fakeA, checklist, jInputHash);
   assert.ok(j.includes('J（裁决者）义务 · method@p2-v1'), 'J_DUTIES 版本行');
   assert.ok(j.includes('逐项裁决恰好一次'), 'J_DUTIES 逐项裁决句');
   assert.ok(j.includes('A 输出全文'), 'A 输出全文段');
@@ -226,7 +223,7 @@ test('Gate-M 预算闸：prompt 真实字节超授权上限 → INPUT_OVER_BUDGE
       execute: true,
       holderId: HOLDER,
       budget: { ...GATE_M_PLAN_BUDGET, planAuthVersion: 'pa-gate-m-budget-test', maxInputBytes: 1_000 },
-      versions: { methodVersion: 'method@p2-v1', adapterVersion: 'data@p1', planAuthVersion: 'pa-gate-m-budget-test' },
+      versions: { methodVersion: 'method@p2-v2-20261103', adapterVersion: 'data@p1', planAuthVersion: 'pa-gate-m-budget-test' },
     }),
     (err: unknown) => (err as { code?: string }).code === 'INPUT_OVER_BUDGET',
     '超预算具名阻断',

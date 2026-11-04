@@ -1,3 +1,4 @@
+import type { FrozenBenchmark } from '../conclusion/benchmark.js';
 /**
  * Lyra · 周末复盘编排（P3 W17: code-writer-pro）。
  * 合同：docs/specs/SCHEDULING.md §11（SC-11.1 零模型调用、SC-11.2 结算、SC-11.3 档案更新、
@@ -64,6 +65,7 @@ export function planWeekendReview(calendar: TradeCalendarTable, saturday: string
 
 /** 到期个股结论（结算输入；宽基 SR-8A 未实现，具名跳过不猜）。 */
 export interface DueStockConclusion {
+  benchmark?: FrozenBenchmark | undefined;
   conclusionId: string;
   subject: string;
   disposition: 'RESEARCH_OUTPERFORM' | 'RESEARCH_UNDERPERFORM' | 'ABSTAIN';
@@ -235,6 +237,7 @@ export async function runWeekendReview(plan: WeekendReviewPlan, deps: WeekendDep
           disposition: c.disposition,
           conclusionTime: c.conclusionTime,
           cutoff: c.cutoff,
+          benchmark: c.benchmark,
         });
     })();
 

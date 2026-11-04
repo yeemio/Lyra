@@ -1,3 +1,5 @@
+import { testEtfMapping } from '../research/inputs-pit-test-helper.js';
+import { syntheticConclusionInput } from '../research/research-test-helper.js';
 /**
  * Lyra · 周末复盘真实接线单测（P3 W20: code-writer-pro）。
  * 模式申明：个股可结算结论与宽基结论的结算读 **public 真实事实**（factPool=admin：
@@ -10,19 +12,18 @@
  * SR-2.4（未到期不提前结算）；RM §8（回填只写占位区，研究字段不可变）。
  */
 import assert from 'node:assert/strict';
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { after, before, test } from 'node:test';
 import type { Pool } from 'pg';
 import { loadTradeCalendarTable, type TradeCalendarTable } from '../adapters/calendar.js';
-import { canonicalJsonString, canonicalSha256 } from '../canonical.js';
+import { canonicalJsonString } from '../canonical.js';
 import { researchCoreOf } from '../conclusion/object.js';
 import type { ConclusionObject, Disposition, SubjectKind } from '../contracts.js';
 import { applySchema, dropSchema } from '../db/exec.js';
 import { persistConclusion, readConclusion } from '../db/conclusion.js';
 import { createPool } from '../db/pool.js';
-import { insertFact } from '../pintime/facts.js';
-import { deriveChecklist } from '../research/checklist.js';
-import { simulatedModelA, simulatedModelJ } from '../research/simulated.js';
+import { freezeBenchmark } from '../conclusion/benchmark.js';
+import { asOfFacts, insertFact } from '../pintime/facts.js';
 import { runWeekend, type DueConclusionView } from './weekend-runner.js';
 import type { WeekendProcessMetrics } from './weekend.js';
 
@@ -58,28 +59,11 @@ interface FixtureInput {
 
 /** 直接构造 simulated A/J（夹具构造路径，不经 runModelCall、零 permit）→ persistConclusion。 */
 async function fixtureConclusion(input: FixtureInput): Promise<ConclusionObject> {
-  const inputHash = createHash('sha256').update(`${input.seed}:a`).digest('hex');
-  const a = simulatedModelA({
-    inputHash,
-    subjectKind: input.subjectKind,
-    subject: input.subject,
-    material: { artifactSha256s: [ART], factCount: 1 },
-  });
-  const manifestHash = createHash('sha256').update(`${input.seed}:manifest`).digest('hex');
-  const checklist = deriveChecklist(a, manifestHash);
-  const j = simulatedModelJ({ inputHash: canonicalSha256({ a, checklist }), subjectKind: input.subjectKind, aOutput: a, checklist });
-  return persistConclusion(isolated, {
-    businessKey: { subjectKind: input.subjectKind, subject: input.subject, researchKind: 'WEEKLY', cutoff: input.cutoff },
-    methodVersion: 'method@p2-v1',
-    adapterVersion: 'data@p1',
-    planAuthVersion: 'pa-w20-weekend-test',
-    aOutput: a,
-    checklist,
-    jOutput: j,
-    manifest: { manifestHash },
-    inheritance: null,
-    changeReason: j.changedFromA ? j.changeReason : null,
-  });
+  const facts = input.subjectKind === 'STOCK' ? await asOfFacts(input.subject === '600201' ? isolated : admin, { subjectType: 'STOCK', subjectId: input.subject, factKind: 'INDUSTRY_CLASS_VERSION', asOf: new Date(input.cutoff) }) : [];
+  const benchmark = freezeBenchmark({ ...input, facts, ...(input.subjectKind === 'BROAD_ETF' ? { etfMapping: testEtfMapping(input.subject, '测试冻结映射(000016)') } : {}) });
+  return persistConclusion(isolated, syntheticConclusionInput(
+    { subjectKind: input.subjectKind, subject: input.subject, researchKind: 'WEEKLY', cutoff: input.cutoff },
+    { methodVersion: 'method@p2-v1', adapterVersion: 'data@p1', planAuthVersion: 'pa-w20-weekend-test' }, benchmark));
 }
 
 function dueView(c: ConclusionObject, conclusionTime: string): DueConclusionView {

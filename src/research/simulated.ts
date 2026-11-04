@@ -27,6 +27,7 @@ import {
   type SubjectKind,
 } from '../contracts.js';
 import type { ModelCallContext, ModelFn } from '../kernel/executor.js';
+import type { LayeredInputView } from './inputs.js';
 
 export class SimulatedModelError extends Error {
   constructor(readonly code: 'SIMULATED_INPUT_INVALID' | 'CHECKLIST_UNBOUND', detail?: string) {
@@ -141,6 +142,7 @@ export interface SimulatedJInput {
   subjectKind: SubjectKind;
   aOutput: AOutput;
   checklist: ProgramChecklist;
+  researchInput?: LayeredInputView;
 }
 
 const VERDICTS = ['SUPPORTED', 'NARROWED', 'REJECTED', 'UNRESOLVED'] as const;
@@ -164,16 +166,26 @@ export function simulatedModelJ(input: SimulatedJInput): JOutput {
   if (canonicalSha256(input.aOutput) !== input.checklist.aOutputHash) {
     throw new SimulatedModelError('CHECKLIST_UNBOUND', '清单未绑定本次 A 输出（aOutputHash 不符）：J 不得裁决他轮清单');
   }
-  const verdicts = input.checklist.items.map((item, index) => {
+  const verdicts: JOutput['verdicts'] = input.checklist.items.map((item, index) => {
     const verdict = VERDICTS[pick(`${input.inputHash}:v:${item.checklistId}`, VERDICTS.length)] as JOutput['verdicts'][number]['verdict'];
     return {
       checklistId: item.checklistId,
       verdict,
       decisionBearing: index === 0 ? true : pick(`${input.inputHash}:b:${item.checklistId}`, 3) !== 0,
       correction: verdict === 'REJECTED' || verdict === 'NARROWED' ? `J 复核修正条目 ${item.checklistId}（模拟）` : null,
+      reason: `模拟逐项复核 ${item.checklistId}，非真实判断`,
+      evidenceArtifactSha256s: [...new Set(input.aOutput.decisiveLinks.map((l) => l.evidenceArtifactSha256))],
+      remainingBasisChecklistIds: [],
     };
   });
+  const bases = verdicts.filter((v) => v.decisionBearing && (v.verdict === 'SUPPORTED' || v.verdict === 'NARROWED'));
+  for (const v of verdicts) {
+    if (bases.length === 0) v.decisionBearing = true;
+    else if (!v.decisionBearing) v.remainingBasisChecklistIds = bases.map((b) => b.checklistId);
+  }
   const bearingUnresolved = verdicts.some((v) => v.decisionBearing && v.verdict === 'UNRESOLVED');
+  const strongestCaseDisposition = CASE_DISPOSITIONS[pick(`${input.inputHash}:case`, CASE_DISPOSITIONS.length)] as JOutput['strongestCaseDisposition'];
+  const hasBasis = input.checklist.items.some((i) => i.category === 'DECISIVE_LINK' && bases.some((v) => v.checklistId === i.checklistId));
 
   const space = validDispositions(input.subjectKind);
   const candIdx = space.indexOf(input.aOutput.candidate);
@@ -182,7 +194,7 @@ export function simulatedModelJ(input: SimulatedJInput): JOutput {
   }
   let finalDisposition: Disposition;
   let changedFromA: boolean;
-  if (bearingUnresolved) {
+  if (bearingUnresolved || strongestCaseDisposition === 'UNRESOLVED' || !hasBasis) {
     finalDisposition = 'ABSTAIN';
     changedFromA = finalDisposition !== input.aOutput.candidate;
   } else {
@@ -202,9 +214,10 @@ export function simulatedModelJ(input: SimulatedJInput): JOutput {
       ? bearingUnresolved
         ? '承重项 UNRESOLVED，按裁决规则 ABSTAIN（模拟）'
         : 'J 复核后改判 A 候选（模拟理由）'
-      : null,
-    strongestCaseDisposition: CASE_DISPOSITIONS[pick(`${input.inputHash}:case`, CASE_DISPOSITIONS.length)] as JOutput['strongestCaseDisposition'],
-    limitations: ['模拟模型 J 裁决（EK-10.1），非真实判断'],
+      : input.researchInput?.l0.some((b) => b.materialId === 'mat:0:post-event-context')
+        ? '模拟比较已送达的原判断/条件和新增事件后维持 A（非真实判断）' : null,
+    strongestCaseDisposition,
+    limitations: ['模拟模型 J 裁决（EK-10.1），非真实判断', ...verdicts.filter((v) => v.verdict === 'UNRESOLVED').map((v) => `${v.checklistId}：模拟未解项`) ],
     simulated: true,
   };
 }

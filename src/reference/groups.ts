@@ -247,6 +247,19 @@ export function marketStateOf(hs300Bars: DailyBarInput[], eventTime: string): Ma
 // ===== 样本层元数据（构建方按上述工具组装；selectGroups 只做机械收窄）=====
 
 export interface ReferenceEventLayers {
+  /** 发布版本所需的原事件及成熟窗口；纯统计可缺省，持久发布必须齐备。 */
+  lineage?: {
+    eventId: string;
+    evidenceFactId: string;
+    /** 增速事件：初披锚点与最新修订数值分开绑定，保留原检测快照。 */
+    growth?: {
+      firstDisclosureFactId: string;
+      previousEvidenceFactId: string;
+      revisionFactIds: string[];
+      attrs: Record<string, unknown>;
+    };
+    windows: { h: 1 | 5 | 20; status: string; endDate: string | null; maturedAt: string | null }[];
+  };
   subject: string;
   eventTime: string;
   /** 事件类型层键（六类 + 子类，如 'PERF_FORECAST' / 'PERF_FORECAST:REVISE_UP'）。 */

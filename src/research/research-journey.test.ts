@@ -1,3 +1,5 @@
+import { researchJInputHash } from './validation.js';
+import { researchMaterial } from './requests.js';
 /**
  * P2 整合测试（总控整合波）：真实数据全链——
  * 组装器（真实封存材料）→ SimulatedTransport → A → 程序清单 → J → 结论对象落库 → 报告读回。
@@ -68,11 +70,7 @@ test('P2 全链：真实材料组装 → 模拟 A/J → 清单 → 结论 → �
   const transport = selectTransport({ provider: 'simulated' });
   assert.ok(transport instanceof SimulatedTransport);
   assert.equal(transport.describe().simulated, true);
-  const material = {
-    artifactSha256s: assembled.package.seals.flatMap((s) => s.artifactRefs.map((r) => r.sha256)).slice(0, 12),
-    factCount: assembled.package.seals.reduce((n, s) => n + s.factIds.length, 0),
-    gaps: assembled.package.dimensions.flatMap((c) => c.gap),
-  };
+  const material = researchMaterial(assembled.package);
   const aInput = { inputHash: assembled.inputHash, subjectKind: 'STOCK' as const, subject, material };
   const contractA: ModelCallContract = {
     businessKey, stage: 'A',
@@ -97,7 +95,7 @@ test('P2 全链：真实材料组装 → 模拟 A/J → 清单 → 结论 → �
   assert.equal(rederiveChecklistHash(a.output, manifestHash), checklist.checklistHash);
 
   // 4. 模拟 J
-  const jInputHash = canonicalSha256({ a: a.output, checklist });
+  const jInputHash = researchJInputHash(assembled.package, a.output, checklist);
   const contractJ: ModelCallContract = {
     businessKey, stage: 'J',
     inputHash: jInputHash, inputBytes: assembled.inputBytes,
@@ -118,6 +116,7 @@ test('P2 全链：真实材料组装 → 模拟 A/J → 清单 → 结论 → �
     methodVersion: VERSIONS.methodVersion, adapterVersion: VERSIONS.adapterVersion, planAuthVersion: VERSIONS.planAuthVersion,
     aOutput: a.output, checklist, jOutput: j.output,
     manifest: assembled.package.seals[0]!,
+    researchInput: assembled.package,
     inheritance: null, changeReason: j.output.changedFromA ? j.output.changeReason : null,
   });
   assert.equal(conclusion.disposition, j.output.finalDisposition);
@@ -158,10 +157,7 @@ test('P2 全链：宽基标的（ETF 七维）', async () => {
   const v = await validateResearchInputPackage(admin, store, assembled.package);
   assert.equal(v.ok, true);
   const transport = selectTransport();
-  const material = {
-    artifactSha256s: assembled.package.seals.flatMap((s) => s.artifactRefs.map((r) => r.sha256)).slice(0, 8),
-    factCount: assembled.package.seals.reduce((n, s) => n + s.factIds.length, 0),
-  };
+  const material = researchMaterial(assembled.package);
   const aInput = { inputHash: assembled.inputHash, subjectKind: 'BROAD_ETF' as const, subject, material };
   const contract: ModelCallContract = {
     businessKey, stage: 'A', inputHash: assembled.inputHash, inputBytes: assembled.inputBytes,
@@ -173,7 +169,7 @@ test('P2 全链：宽基标的（ETF 七维）', async () => {
     simulated: true, holderId: HOLDER,
   });
   const checklist = deriveChecklist(a.output, assembled.package.seals[0]!.manifestHash);
-  const jInputHash = canonicalSha256({ a: a.output, checklist });
+  const jInputHash = researchJInputHash(assembled.package, a.output, checklist);
   const j = await runModelCall<JOutput>(isolated, {
     contract: { ...contract, stage: 'J', inputHash: jInputHash }, budget: BUDGET,
     modelFn: async (ctx) => (await transport.dispatch(ctx.contract, { inputHash: jInputHash, subjectKind: 'BROAD_ETF' as const, aOutput: a.output, checklist })) as JOutput,
@@ -183,7 +179,8 @@ test('P2 全链：宽基标的（ETF 七维）', async () => {
     businessKey,
     methodVersion: VERSIONS.methodVersion, adapterVersion: VERSIONS.adapterVersion, planAuthVersion: VERSIONS.planAuthVersion,
     aOutput: a.output, checklist, jOutput: j.output,
-    manifest: assembled.package.seals[0]!, inheritance: null,
+    manifest: assembled.package.seals[0]!,
+    researchInput: assembled.package, inheritance: null,
     changeReason: j.output.changedFromA ? j.output.changeReason : null,
   });
   // 宽基选项空间：结论只允许 UP/DOWN/ABSTAIN

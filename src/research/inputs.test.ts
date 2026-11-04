@@ -1,3 +1,5 @@
+import { researchJInputHash } from './validation.js';
+import { researchMaterial } from './requests.js';
 /**
  * Lyra · 研究输入组装器 + 报告视图单测（P2 W11）。不碰网络；DB 用隔离 schema
  * （每次运行独立 schema + 临时原件目录），与 pintime.test.ts 同款夹具纪律。
@@ -20,6 +22,7 @@ import { createPool } from '../db/pool.js';
 import { insertFact } from '../pintime/facts.js';
 import { readConclusion, persistConclusion } from '../db/conclusion.js';
 import { simulatedModelA, simulatedModelJ } from './simulated.js';
+import { requireResolvedBenchmark } from '../conclusion/benchmark.js';
 import { deriveChecklist } from './checklist.js';
 import {
   assembleResearchInput,
@@ -190,7 +193,7 @@ async function seedUniverse(): Promise<void> {
 
 // ===== 选项构造 =====
 
-const VERSIONS = { methodVersion: 'method@test-1', adapterVersion: 'data@test-1', planAuthVersion: 'pa-test-1' };
+const VERSIONS = { methodVersion: 'method@p2-v2-20261103', adapterVersion: 'data@test-1', planAuthVersion: 'pa-test-1' };
 const GENEROUS_BUDGET = { l0Bytes: 50_000, l1Bytes: 100_000, l2Bytes: 100_000, totalBytes: 200_000 };
 
 function stockOpts(overrides: Partial<AssembleResearchInputOptions> = {}): AssembleResearchInputOptions {
@@ -221,8 +224,8 @@ test('个股组装：八维 coverage、时点纪律、封存复用、程序校�
   assert.equal(canonicalJsonString(readBack), canonicalJsonString(pkg));
   assert.equal(inputBytes, artifactRef.bytes);
 
-  // 封存复用：两个 seal（标的 + 行业基准），业务键同为 WEEKLY
-  assert.equal(pkg.seals.length, 2);
+  // 封存复用：标的 + 行业基准 + 估值截面精确输入，业务键同为 WEEKLY
+  assert.equal(pkg.seals.length, 3);
   assert.equal(pkg.seals[0]?.businessKey.researchKind, 'WEEKLY');
   assert.equal(pkg.seals[0]?.businessKey.subject, '600519');
 
@@ -255,7 +258,11 @@ test('个股组装：八维 coverage、时点纪律、封存复用、程序校�
   const gapText = pkg.dimensions.flatMap((d) => d.gap).join('\n');
   assert.match(gapText, /D7: STOCK_BASIC 截点不可见/);
   assert.match(gapText, /D7: 股权质押比例未入库/);
-  assert.match(gapText, /D8: 历史参照群组块不可得/);
+  assert.match(gapText, /D8: REFERENCE_VERSION_NOT_VISIBLE：截点前无可见参照发布/);
+  const referenceVersion = pkg.materials.find((m) => m.materialId === 'mat:8:reference-version');
+  assert.ok(referenceVersion && referenceVersion.kind === 'RECORDS');
+  assert.deepEqual(referenceVersion.records, [{ status: 'REFERENCE_VERSION_NOT_VISIBLE', cutoff: CUTOFF }]);
+  assert.equal(pkg.materials.some((m) => m.materialId === 'mat:8:reference-group-stats'), false);
   assert.match(gapText, /D5: 融资融券余额未入库/);
   assert.match(gapText, /D2: (估值历史分位与行业分位不可精确计算|本股行业截面分位不可计算)/);
 
@@ -275,11 +282,11 @@ test('个股组装：八维 coverage、时点纪律、封存复用、程序校�
     assert.deepEqual(d4.records.map((r) => String(r.title)), ['关于控股股东部分股份解除质押的公告']);
   }
 
-  // D6：2014 体系归属（pre2014 已过期被跳过；证监会轴不参与申万基准）
+  // D6：2014 铸造行按 2021 读取窗口解释（pre2014 已过期；证监会轴不参与）
   const d6 = pkg.materials.find((m) => m.materialId === 'mat:6:industry-attribution');
   assert.ok(d6 && d6.kind === 'RECORDS');
   if (d6.kind === 'RECORDS') {
-    assert.equal((d6.records[0] as Record<string, unknown>)['体系'], '2014');
+    assert.equal((d6.records[0] as Record<string, unknown>)['体系'], '2021');
     assert.equal((d6.records[0] as Record<string, unknown>)['l1IndexCode'], '801120');
   }
 
@@ -337,16 +344,20 @@ test('L1 预算压力：超层预算材料降级并标记，不静默截断；L2
     const demotedInIndex = new Set(indexForDemoted.content.demotedMaterials.map((e) => e.materialId));
     for (const id of demoted) assert.equal(demotedInIndex.has(id), true, `降级材料 ${id} 应在 L2 降级目录`);
   }
-  // 降级材料的 factIds 不进送达引用目录
+  // 目录只能指向实际送达的材料/层；同一事实可由 L0 基准等另一材料送达。
   const index = pkg.materials.find((m) => m.kind === 'INDEX');
   assert.ok(index && index.kind === 'INDEX');
   if (index.kind === 'INDEX') {
+    const delivered = new Map([
+      ...pkg.layers.l0.blocks.map((b) => [b.materialId, 'L0'] as const),
+      ...pkg.layers.l1.blocks.map((b) => [b.materialId, 'L1'] as const),
+    ]);
+    const expectedFacts = new Set(pkg.materials.filter((m) => delivered.has(m.materialId)).flatMap((m) => m.factIds));
     const indexed = new Set(index.content.deliveredFacts.map((e) => e.factId));
-    for (const id of demoted) {
-      const material = pkg.materials.find((m) => m.materialId === id);
-      for (const factId of material?.factIds ?? []) {
-        assert.equal(indexed.has(factId), false, `降级材料 ${id} 的 ${factId} 不得出现在送达目录`);
-      }
+    assert.deepEqual(indexed, expectedFacts, '目录事实集必须恰等于实际送达材料的事实集');
+    for (const entry of index.content.deliveredFacts) {
+      assert.equal(delivered.get(entry.materialId), entry.layer, `目录不得声称降级材料 ${entry.materialId} 已送达`);
+      assert.ok(pkg.materials.find((m) => m.materialId === entry.materialId)?.factIds.includes(entry.factId));
     }
   }
   // 降级包仍能通过程序校验（coverage 与层一致）
@@ -374,18 +385,24 @@ test('ETF 组装：七维映射、跟踪指数材料、缺口声明、程序校�
   const { package: pkg } = await assembleResearchInput(pool, store, etfOpts());
   assert.deepEqual(pkg.dimensions.map((d) => d.dimension), [1, 2, 3, 4, 5, 6, 7]);
   assert.equal(pkg.seals.length, 2); // ETF + INDEX/000300
+  assert.equal(pkg.benchmark?.status, 'CURRENT_PROXY'); // 当前池在2022截点没有历史观察证明
+  assert.equal(pkg.benchmark?.reason, 'ETF_MAPPING_NOT_OBSERVED_AT_CUTOFF');
+  assert.equal(pkg.benchmark?.indexCode, '000300');
+  assert.throws(() => requireResolvedBenchmark(pkg.benchmark, { subjectKind: 'BROAD_ETF', subject: '510300', cutoff: CUTOFF }), /ETF_MAPPING_NOT_OBSERVED_AT_CUTOFF/);
   assert.equal(pkg.seals[1]?.businessKey.subject, '510300'); // 同业务键（selector 不同）
   const e5etf = pkg.materials.find((m) => m.materialId === 'mat:5:etf-bar-table');
   const e5idx = pkg.materials.find((m) => m.materialId === 'mat:5:tracking-index-bar-table');
   assert.ok(e5etf && e5etf.kind === 'BAR_TABLE' && e5etf.table.rows.length === 2);
   assert.ok(e5idx && e5idx.kind === 'BAR_TABLE' && e5idx.table.rows.length === 2);
+  assert.match(e5idx.title, /当前映射代理指数（非截点已证实基准） 000300/);
   const gapText = pkg.dimensions.flatMap((d) => d.gap).join('\n');
   for (const expected of [
-    'E1: 跟踪指数估值（PE/PB）as-of 不可见',
+    'E1: 当前映射代理指数（非截点已证实基准）估值（PE/PB）as-of 不可见',
     'E2: 成分股盈利数据未入库',
     'E3: 宏观与政策数据源未接入',
     'E4: 资金流向专用数据未入库',
     'E5: 市场宽度数据未入库',
+    'E5: ETF_MAPPING_NOT_OBSERVED_AT_CUTOFF：当前映射仅为代理，不具备正式结算资格',
     'E6: 可比指数序列未纳入本轮封存',
     'E7: 历史状态参照库未建',
   ]) {
@@ -413,10 +430,10 @@ test('报告视图：A 摘要/清单裁决/J 决定/证据下钻/coverage，末�
     inputHash: pkg.inputHash,
     subjectKind: 'STOCK',
     subject: '600519',
-    material: { artifactSha256s: seal.artifactRefs.map((r) => r.sha256), factCount: seal.factIds.length, gaps: seal.gaps },
+    material: researchMaterial(pkg),
   });
   const checklist = deriveChecklist(aOutput, seal.manifestHash);
-  const jInputHash = canonicalSha256({ j: 'input', aOutputHash: canonicalSha256(aOutput) });
+  const jInputHash = researchJInputHash(pkg, aOutput, checklist);
   const jOutput = simulatedModelJ({ inputHash: jInputHash, subjectKind: 'STOCK', aOutput, checklist });
   const conclusion = await persistConclusion(pool, {
     businessKey: pkg.businessKey,
@@ -427,6 +444,7 @@ test('报告视图：A 摘要/清单裁决/J 决定/证据下钻/coverage，末�
     checklist,
     jOutput,
     manifest: seal,
+    researchInput: pkg,
     inheritance: null,
     changeReason: jOutput.changedFromA ? jOutput.changeReason : null, // J 改判时回抄其改判理由
   });

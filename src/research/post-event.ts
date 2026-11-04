@@ -10,12 +10,12 @@
  *   0) 事件形状校验 + SC-3.3 启动闸（canStartPostEvent，时钟注入；08:00 后新启动具名拒绝）；
  *   1) 事件准入记录（复用 W17 admitPostEvent 形态：截点=事件 availableAt 基准，触发引用=[eventId]）；
  *   2) 继承声明（复用 W17 declarePostEventInheritance）：先验经 RM §7.1 资格校验
- *      （同股 / 周度结论 / 先验截点严格早于本次截点 / 方法版本兼容 / 已落库即 A/J 完整有效），
- *      不满足任一条 → 不继承，落 STANDALONE（"无基础结论可继承"）；
+ *      （同股 / 本周已完成周度结论 / 先验截点严格早于本次截点 / 方法版本兼容），
+ *      从数据库及 CAS 读回原输入/A/清单/J；缺原文或资格不符 → STANDALONE 完整重研；
  *   3) 组装输入（assembleResearchInput，POST_EVENT 业务键、截点=事件时点——W11 组装器
  *      researchKind 参数原生接受 POST_EVENT，无缺口）；
- *   4) 模拟 A（经 transport.dispatch）→ deriveChecklist（无模型机械抽取）→ 模拟 J →
- *      persistConclusion（继承指针 + changeReason：INHERITED 恒必填，桥接文本程序拼装，
+ *   4) A（经 transport.dispatch）→ deriveChecklist（无模型机械抽取）→ J →
+ *      persistResearchConclusion（先保存原文 CAS；INHERITED 必须有 J 自身比较理由，程序附加桥接，
  *      含"先验是先验模型判断非当前事实 / 本轮只重新评估新公告 / 触发事件引用"三要素）。
  *
  * 执行截止（EK-6.1）：缺省 = 事件窗口截止（postEventWindowOf 显式计算，SC-3.3 次日 09:15，
@@ -24,7 +24,7 @@
  * deadline 原样写入 permit 落库可审计。
  */
 import type { Pool } from 'pg';
-import { canonicalSha256 } from '../canonical.js';
+import { canonicalJsonString } from '../canonical.js';
 import type {
   ArtifactRef,
   AOutput,
@@ -35,7 +35,12 @@ import type {
 import type { ArtifactStore } from '../artifacts/store.js';
 import { runModelCall } from '../kernel/executor.js';
 import type { ModelTransport } from '../kernel/transport.js';
-import { persistConclusion } from '../db/conclusion.js';
+import { persistResearchConclusion } from './trace.js';
+import { loadFact } from '../pintime/facts.js';
+import { buildARequest, buildJRequest, assertAssembledIdentity } from './requests.js';
+import { validateResearchA, validateResearchJ } from './validation.js';
+import { loadPriorResearch, withPostEventContext, type PostEventTriggerEvent, type PostEventContext } from './inheritance.js';
+export type { PostEventTriggerEvent } from './inheritance.js';
 import type { TradeCalendarTable } from '../adapters/calendar.js';
 import {
   canStartPostEvent,
@@ -61,19 +66,6 @@ export class PostEventError extends Error {
   }
 }
 
-/** 触发事件引用（public.events 行形态，W14 EventInstance 兼容；只消费不重定义判定）。 */
-export interface PostEventTriggerEvent {
-  eventId: string;
-  /** 个股代码（裸 6 位；宽基不进事件后研究，SC-4.1）。 */
-  subject: string;
-  type: string;
-  subtype: string | null;
-  /** ISO；= availableAt 基准（W14 口径）= 本次研究资料截点（SC-3.2）。 */
-  eventTime: string;
-  evidenceFactId: string;
-  attrs?: Record<string, unknown>;
-}
-
 /** 继承入参：null = STANDALONE；先验为已落库结论对象（id/hash 与资格字段取自其身）。 */
 export type PostEventInheritanceInput = { priorConclusion: ConclusionObject } | null;
 
@@ -90,6 +82,7 @@ export interface PostEventResearchDeps {
   store: ArtifactStore;
   transport: ModelTransport;
   calendar: TradeCalendarTable;
+  assembleInput?: typeof assembleResearchInput;
 }
 
 export interface PostEventResearchOptions {
@@ -143,31 +136,6 @@ function parseInstant(value: string, field: string): Date {
   return d;
 }
 
-/** RM §7.1 继承资格：同股 / STOCK / 周度结论 / 先验截点严格早于本次截点 / 方法版本兼容；
- * "先验 A/J 完整有效"由先验是已落库结论对象（buildConclusionObject 全字段校验 + 不可变落库）承载。 */
-function checkInheritanceEligibility(
-  event: PostEventTriggerEvent,
-  prior: ConclusionObject,
-  methodVersion: string,
-): InheritanceEligibility {
-  if (prior.businessKey.subject !== event.subject) {
-    return { eligible: false, reason: `先验标的 ${prior.businessKey.subject} ≠ 事件标的 ${event.subject}` };
-  }
-  if (prior.businessKey.subjectKind !== 'STOCK') {
-    return { eligible: false, reason: `先验标的类别 ${prior.businessKey.subjectKind} 非 STOCK` };
-  }
-  if (prior.businessKey.researchKind !== 'WEEKLY') {
-    return { eligible: false, reason: `先验研究类型 ${prior.businessKey.researchKind} 非本周周度结论（SC-7.1）` };
-  }
-  if (new Date(prior.businessKey.cutoff).getTime() >= new Date(event.eventTime).getTime()) {
-    return { eligible: false, reason: `先验资料截点 ${prior.businessKey.cutoff} 不早于本次截点 ${event.eventTime}` };
-  }
-  if (prior.methodVersion !== methodVersion) {
-    return { eligible: false, reason: `先验方法版本 ${prior.methodVersion} 与本轮 ${methodVersion} 不兼容` };
-  }
-  return { eligible: true };
-}
-
 /** INHERITED 的 changeReason 桥接文本（RM §7.1 维持与改判都写；三要素：先验是模型判断 / 只重新评估新公告 / 触发引用）。 */
 function inheritanceChangeReason(
   event: PostEventTriggerEvent,
@@ -180,7 +148,7 @@ function inheritanceChangeReason(
       : `改判先验结论方向（先验 ${prior.disposition} → 本轮 J 终判 ${jOutput.finalDisposition}）`;
   const vsA = jOutput.changedFromA
     ? `；J 相对 A 候选改判：${jOutput.changeReason ?? '(A/J 改判理由缺失)'}`
-    : '；J 维持 A 候选';
+    : `；J 维持 A 候选；J 对先验和新增事件的比较：${jOutput.changeReason}`;
   return (
     `事件后研究继承桥接（RM §7.1）：先验 ${prior.conclusionId} 是先验模型判断，不是当前事实，不构成自动选择；` +
     `本轮只重新评估新公告（触发事件 ${event.eventId} ${event.type}${event.subtype === null ? '' : `/${event.subtype}`}，证据事实 ${event.evidenceFactId}）；` +
@@ -191,7 +159,7 @@ function inheritanceChangeReason(
 // ===== 编排主函数 =====
 
 /**
- * 执行一次事件后研究（准入 → 继承声明 → 组装 → 模拟 A → 清单 → 模拟 J → 结论落库）。
+ * 执行一次事件后研究（准入 → 继承原文核验 → 组装 → A → 清单 → J → 原文/结论落库）。
  * 模型调用恰两次（A/J），全部经 kernel.runModelCall（permit 纪律 EK-3.2；模拟器同样不得 bypass）。
  */
 export async function runPostEventResearch(
@@ -230,11 +198,9 @@ export async function runPostEventResearch(
   );
 
   // 2) 继承声明（判定时机=准入时刻，SC-7.1；资格不满足即 STANDALONE，RM §7.1）。
-  const prior = opts.inheritance === null ? null : opts.inheritance.priorConclusion;
-  const eligibility =
-    prior === null
-      ? ({ eligible: false, reason: '无基础结论可继承（未注入先验）' } as InheritanceEligibility)
-      : checkInheritanceEligibility(event, prior, opts.versions.methodVersion);
+  const resolved = await loadPriorResearch(deps.execPool, deps.store, opts.inheritance?.priorConclusion ?? null, event, opts.versions.methodVersion, now.toISOString());
+  const prior = resolved.prior?.conclusion ?? null;
+  const eligibility: InheritanceEligibility = prior === null ? { eligible: false, reason: resolved.reason } : { eligible: true };
   const weeklyRefs: CompletedWeeklyRef[] =
     prior !== null && eligibility.eligible
       ? [{
@@ -247,7 +213,7 @@ export async function runPostEventResearch(
   const declaration = declarePostEventInheritance(event.subject, weeklyRefs);
 
   // 3) 组装输入（POST_EVENT 业务键、截点=事件时点；W11 组装器原生支持，无缺口）。
-  const assembled = await assembleResearchInput(deps.dataPool, deps.store, {
+  const base = await (deps.assembleInput ?? assembleResearchInput)(deps.dataPool, deps.store, {
     subjectKind: 'STOCK',
     subject: event.subject,
     cutoff: event.eventTime,
@@ -260,6 +226,16 @@ export async function runPostEventResearch(
     researchKind: 'POST_EVENT',
     ...(opts.poolInfoFile === undefined ? {} : { poolInfoFile: opts.poolInfoFile }),
   });
+  assertAssembledIdentity(base, { subjectKind: 'STOCK', subject: event.subject, cutoff: event.eventTime, researchKind: 'POST_EVENT' },
+    { ...opts.versions, planAuthVersion: budget.planAuthVersion });
+  const eventFact = await loadFact(deps.dataPool, event.evidenceFactId);
+  if (eventFact === null) throw new PostEventError('EVENT_FACT_MISSING', event.evidenceFactId);
+  const context: PostEventContext = resolved.prior === null
+    ? { kind: 'POST_EVENT_CONTEXT_V2', basis: 'STANDALONE', prior: null, event, eventFact, admittedAt: now.toISOString(), reason: resolved.reason }
+    : { kind: 'POST_EVENT_CONTEXT_V2', basis: 'INHERITED', prior: resolved.prior, event, eventFact, admittedAt: now.toISOString(), reason: resolved.reason };
+  const pkg = withPostEventContext(base.package, context, opts.inputBudget ?? DEFAULT_POST_EVENT_INPUT_BUDGET);
+  const artifactRef = await deps.store.put(new TextEncoder().encode(canonicalJsonString(pkg)), 'application/json', new Date().toISOString());
+  const assembled = { package: pkg, artifactRef, inputHash: pkg.inputHash, inputBytes: artifactRef.bytes };
   const businessKey = assembled.package.businessKey; // 组装器规范化后的业务键（cutoff ISO 化）
 
   // 执行截止（EK-6.1）：显式给定优先；缺省 = 窗口截止（显式计算，不从模板继承）。
@@ -267,30 +243,22 @@ export async function runPostEventResearch(
   const deadline = opts.deadline ?? window.deadline;
   parseInstant(deadline, 'deadline');
 
-  // 4a) 模拟 A（经 transport，permit 已 SENT 才发送——EK-3.2/EK-11.2）。
-  const material = {
-    artifactSha256s: assembled.package.seals.flatMap((s) => s.artifactRefs.map((r) => r.sha256)).slice(0, 12),
-    factCount: assembled.package.seals.reduce((n, s) => n + s.factIds.length, 0),
-    gaps: assembled.package.dimensions.flatMap((c) => c.gap),
-  };
+  // 4a) A（经 transport，permit 已 SENT 才发送——EK-3.2/EK-11.2）。
+  const simulated = deps.transport.describe().simulated;
+  const aRequest = buildARequest(pkg, simulated);
   const a = await runModelCall<AOutput>(deps.execPool, {
     contract: {
       businessKey,
       stage: 'A',
       inputHash: assembled.inputHash,
-      inputBytes: assembled.inputBytes,
+      inputBytes: aRequest.inputBytes,
       methodVersion: opts.versions.methodVersion,
       planAuthVersion: budget.planAuthVersion,
       deadline,
     },
     budget,
     modelFn: async (ctx) =>
-      (await deps.transport.dispatch(ctx.contract, {
-        inputHash: assembled.inputHash,
-        subjectKind: 'STOCK',
-        subject: event.subject,
-        material,
-      })) as AOutput,
+      validateResearchA(await deps.transport.dispatch(ctx.contract, aRequest.payload), pkg, simulated),
     simulated: deps.transport.describe().simulated,
     ...(opts.holderId === undefined ? {} : { holderId: opts.holderId }),
   });
@@ -300,26 +268,22 @@ export async function runPostEventResearch(
   if (manifest === undefined) throw new PostEventError('SEAL_MISSING', '输入包无封存 manifest');
   const checklist = deriveChecklist(a.output, manifest.manifestHash);
 
-  // 4c) 模拟 J（inputHash = 程序对 J 输入整体的哈希，RM §2.3 输入哈希回抄）。
-  const jInputHash = canonicalSha256({ a: a.output, checklist });
+  // 4c) J（inputHash 绑定实际材料包 + A + 清单，RM §2.3 输入哈希回抄）。
+  const jRequest = buildJRequest(pkg, a.output, checklist, simulated);
+  const jInputHash = jRequest.inputHash;
   const j = await runModelCall<JOutput>(deps.execPool, {
     contract: {
       businessKey,
       stage: 'J',
       inputHash: jInputHash,
-      inputBytes: assembled.inputBytes,
+      inputBytes: jRequest.inputBytes,
       methodVersion: opts.versions.methodVersion,
       planAuthVersion: budget.planAuthVersion,
       deadline,
     },
     budget,
     modelFn: async (ctx) =>
-      (await deps.transport.dispatch(ctx.contract, {
-        inputHash: jInputHash,
-        subjectKind: 'STOCK',
-        aOutput: a.output,
-        checklist,
-      })) as JOutput,
+      validateResearchJ(await deps.transport.dispatch(ctx.contract, jRequest.payload), pkg, a.output, checklist, simulated),
     simulated: deps.transport.describe().simulated,
     ...(opts.holderId === undefined ? {} : { holderId: opts.holderId }),
   });
@@ -336,12 +300,14 @@ export async function runPostEventResearch(
       : j.output.changedFromA
         ? j.output.changeReason
         : null;
-  const conclusion = await persistConclusion(deps.execPool, {
+  const conclusion = await persistResearchConclusion(deps.execPool, deps.store, {
     businessKey,
     methodVersion: opts.versions.methodVersion,
     adapterVersion: opts.versions.adapterVersion,
     planAuthVersion: budget.planAuthVersion,
     aOutput: a.output,
+    researchInput: pkg,
+    ...(resolved.verification === undefined ? {} : { verifiedPrior: resolved.verification }),
     checklist,
     jOutput: j.output,
     manifest,
