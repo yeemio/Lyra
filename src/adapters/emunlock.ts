@@ -29,10 +29,10 @@
  *   解禁为**预先公告**的日程事件，但来源无公告日列 → 派发冻结规则 availableAt =
  *   min(公告日, 解禁日)+1 在无公告日时塌缩为 **解禁日次日 00:00+08**（保守：不在解禁日
  *   前宣称可得，as-of 解禁日前不可见）；eventAt=解禁日 15:00+08（解禁生效日时点标记）。
- *   typedValue 原样保留来源字段（解禁数量/实际解禁数量/未解禁数量/实际解禁数量市值/
+ *   typedValue 仅保留事件白名单（解禁数量/实际解禁数量/未解禁数量/实际解禁数量市值/
  *   占总市值比例/占流通市值比例/限售股类型等——C4 核心的股数/金额字段）+
  *   unlockDateISO/code 归一。未来批次的市场衍生字段为抓取时点快照，到期后来源刷新、
- *   raw 变化 → 新事实快照（同业务键不同值并存），不接 supersedes 链（同 emblock 先例，
+ *   事件白名单变化 → 新事实快照（同业务键不同值并存），不接 supersedes 链（同 emblock 先例，
  *   修正不覆盖原件见 POINT-IN-TIME §6）；akshare 生成的 序号 列为调用内 reset_index
  *   重排序号（随批次漂移），桥侧剔除——同业务键重放 raw 稳定 → 同 factId → IDENTICAL
  *   （DATA-SOURCES §6.5 去重）。
@@ -47,7 +47,7 @@ import { promisify } from 'node:util';
 import type { Pool } from 'pg';
 import type { ArtifactRef, TimePointFact, TimePointSubjectType } from '../contracts.js';
 import { canonicalJsonString, canonicalSha256 } from '../canonical.js';
-import { insertFact, loadFact } from '../pintime/facts.js';
+import { asOfFacts, insertFact, loadFact } from '../pintime/facts.js';
 import type { ArtifactStore } from '../artifacts/store.js';
 import {
   BACKFILL_REVISION_NOTICE,
@@ -61,7 +61,18 @@ import { classifySubject, normalizeCode, shanghaiClose, shanghaiNextDayStart } f
 
 const execFileAsync = promisify(execFile);
 
-export const EMUNLOCK_ADAPTER_VERSION = 'emunlock@p1';
+export const EMUNLOCK_ADAPTER_VERSION = 'emunlock@p2-pit';
+
+/** 来源整行含事后收益；历史事件材料只允许下列字段（旧事实读取同样应用）。 */
+export const UNLOCK_EVENT_FIELDS = [
+  '解禁时间', '解禁股东数', '解禁数量', '实际解禁数量', '未解禁数量',
+  '实际解禁数量市值', '占总市值比例', '占流通市值比例',
+  '解禁前一交易日收盘价', '限售股类型', '解禁前20日涨跌幅',
+] as const;
+
+export function unlockEventFields(row: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(UNLOCK_EVENT_FIELDS.filter((k) => Object.hasOwn(row, k)).map((k) => [k, row[k]]));
+}
 
 /**
  * 东财 datacenter 单页行数上限（akshare queue_em 无分页循环，pageSize=500 pageNumber=1）。
@@ -78,8 +89,9 @@ export const EMUNLOCK_REVISION_NOTICE =
   '股数列单位=股、市值列单位=元（akshare 由来源原始万股/万元 ×10000 换算）；akshare 生成的 ' +
   '序号 列为调用内重排序号（非来源数据），桥侧剔除；来源行无股票代码列，代码为调用参数绑定' +
   '（typedValue.code 注入，raw 不掺合成列）；未来未到期批次的市场衍生字段（收盘价/解禁前' +
-  '后20日涨跌幅）为抓取时点快照，到期后来源刷新 raw 变化 → 新事实快照并存，不接 supersedes ' +
-  '链（修正不覆盖原件）；东财无记录的股票（如 600036）空结果如实入档，不造数。';
+  '20日涨跌幅）按事件白名单保留；解禁后20日涨跌幅仅在逐日交易日历完整且20交易日窗口成熟后，' +
+  '写独立 UNLOCK_OUTCOME，availableAt=max(成熟收盘时刻,取得时刻)，不进入事件材料。缺日历则只留原件，' +
+  '不猜成熟时间。当前修订回填不等于严格历史PIT；东财无记录的股票空结果如实入档，不造数。';
 
 const repoRoot = fileURLToPath(new URL('../../', import.meta.url));
 
@@ -101,6 +113,36 @@ export interface EmUnlockMapContext {
   adapterVersion: string;
   fetchedAt: string;
   artifactSha256: string;
+  /** 成熟窗口证明：包含非交易日的逐日日历；缺失时不发布事后收益事实。 */
+  calendarFacts?: readonly TimePointFact[];
+}
+
+function unlockMaturity(date: string, ctx: EmUnlockMapContext): { at: string; factIds: string[] } | null {
+  const days = new Map<string, { trading: boolean; id: string }>();
+  const conflicts = new Set<string>();
+  for (const f of ctx.calendarFacts ?? []) {
+    if (f.factKind !== 'TRADE_CALENDAR' || f.subjectType !== 'RULE' || f.subjectId !== 'ashare-calendar' ||
+        Date.parse(f.availableAt) > Date.parse(ctx.fetchedAt) || Date.parse(f.firstObservedAt) > Date.parse(ctx.fetchedAt)) continue;
+    const v = f.typedValue as Record<string, unknown>;
+    if (typeof v.calendar_date !== 'string' || !DATE_RE.test(v.calendar_date) || !['0', '1'].includes(String(v.is_trading_day))) continue;
+    const trading = String(v.is_trading_day) === '1';
+    if (days.has(v.calendar_date) && days.get(v.calendar_date)!.trading !== trading) conflicts.add(v.calendar_date);
+    days.set(v.calendar_date, { trading, id: f.factId });
+  }
+  const factIds: string[] = [];
+  let tradingDays = 0;
+  // 完整逐日日历证明；不以工作日或20个自然日冒充20个交易日。
+  for (let ms = Date.parse(`${date}T00:00:00Z`) + 86_400_000; ms <= Date.parse(ctx.fetchedAt); ms += 86_400_000) {
+    const day = new Date(ms).toISOString().slice(0, 10);
+    const row = days.get(day);
+    if (row === undefined || conflicts.has(day)) return null;
+    factIds.push(row.id);
+    if (row.trading && ++tradingDays === 20) {
+      const at = shanghaiClose(day);
+      return Date.parse(at) <= Date.parse(ctx.fetchedAt) ? { at, factIds } : null;
+    }
+  }
+  return null;
 }
 
 export interface EmUnlockMappedFact {
@@ -149,7 +191,7 @@ function objectKeyOf(iso: string, row: EmUnlockRow): string {
 /**
  * 限售解禁批次行 → UNLOCK_DETAIL 事实（一行 = 一个批次；code 为调用参数绑定）。
  * availableAt=validFrom=解禁日次日 00:00+08（派发冻结保守口径：来源无公告日列）；
- * eventAt=解禁日 15:00+08（解禁生效日时点标记）；typedValue 原样保留来源字段
+ * eventAt=解禁日 15:00+08（解禁生效日时点标记）；typedValue 只保留事件白名单
  * （股数/金额/比例/限售股类型等）+ unlockDateISO/code 归一；factId 不含观察时刻
  * （终局窗口去重）。
  */
@@ -171,7 +213,7 @@ export function mapUnlockRowsToFacts(
     const eventT = shanghaiClose(date); // 解禁日 15:00+08（生效日时点标记）
     const availT = shanghaiNextDayStart(date); // 解禁日次日 00:00+08（派发冻结保守可得）
     const objectKey = objectKeyOf(date, row);
-    const typedValue = { unlockDateISO: date, code: bsCode, ...row };
+    const typedValue = { ...unlockEventFields(row), unlockDateISO: date, code: bsCode };
     const fact: TimePointFact = {
       factId: factIdOf({
         adapterVersion: ctx.adapterVersion,
@@ -179,7 +221,7 @@ export function mapUnlockRowsToFacts(
         subjectType,
         subjectId,
         objectKey,
-        raw: row,
+        raw: typedValue,
       }),
       subjectType,
       subjectId,
@@ -196,6 +238,29 @@ export function mapUnlockRowsToFacts(
       adapterVersion: ctx.adapterVersion,
     };
     facts.push({ fact, objectKey });
+    const outcome = row['解禁后20日涨跌幅'];
+    const present = outcome !== null && outcome !== undefined && outcome !== '';
+    const numeric = (typeof outcome === 'number' && Number.isFinite(outcome)) ||
+      (typeof outcome === 'string' && /^[+-]?(?:\d+(?:\.\d+)?|\.\d+)$/.test(outcome) && Number.isFinite(Number(outcome)));
+    if (present && !numeric) rejections.push({ rowIndex, code: 'EMUNLOCK_OUTCOME_INVALID' });
+    const maturity = numeric ? unlockMaturity(date, ctx) : null;
+    if (maturity !== null) {
+      const value = {
+        code: bsCode, unlockDateISO: date, eventFactId: fact.factId,
+        horizonTradingDays: 20, maturedAt: maturity.at,
+        calendarFactIds: maturity.factIds, '解禁后20日涨跌幅': outcome,
+      };
+      facts.push({
+        objectKey: `${objectKey}:outcome20`,
+        fact: {
+          ...fact,
+          factId: factIdOf({ adapterVersion: ctx.adapterVersion, factKind: 'UNLOCK_OUTCOME', subjectType, subjectId, objectKey, raw: value }),
+          factKind: 'UNLOCK_OUTCOME', typedValue: value,
+          validFrom: maturity.at, eventAt: maturity.at,
+          availableAt: new Date(Math.max(Date.parse(maturity.at), Date.parse(ctx.fetchedAt))).toISOString(),
+        },
+      });
+    }
   });
   return { facts, rejections };
 }
@@ -378,6 +443,7 @@ export class EmUnlockAdapter {
       adapterVersion: this.adapterVersion,
       fetchedAt,
       artifactSha256: artifact.sha256,
+      calendarFacts: await asOfFacts(this.pool, { subjectType: 'RULE', subjectId: 'ashare-calendar', factKind: 'TRADE_CALENDAR', asOf: new Date(fetchedAt) }),
     });
     const insertedFactIds: string[] = [];
     const identicalFactIds: string[] = [];

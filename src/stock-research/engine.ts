@@ -295,13 +295,12 @@ async function runOneStep(ctx: RunContext, step: SrStep): Promise<void> {
   try {
     switch (step.stepKind) {
       case 'PLAN': {
-        const subject = ctx.pool.stocks.find((s) => s.code === task.subject);
         const preflight = await buildEvidencePack(deps.dataPool, { taskId: task.taskId, subject: task.subject, cutoff: task.cutoff, focus: task.focus, outputDir: deps.outputDir });
         ctx.pack = preflight.pack;
         const input: PlanInput = {
           subject: task.subject,
           subjectName: task.subjectName,
-          swL1: subject?.swL1 ?? '未知',
+          swL1: preflight.pack.coverage.industry.swL1 ?? '历史归属/名称缺失',
           focus: task.focus,
           horizon: task.horizon,
           emphasis: task.emphasis,

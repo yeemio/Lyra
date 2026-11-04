@@ -178,7 +178,7 @@ function validJJson(expectedIds: string[], overrides?: Record<string, unknown>):
     stage: 'J',
     inputHash: 'cd'.repeat(32),
     finalDisposition: 'ABSTAIN',
-    verdicts: expectedIds.map((id) => ({ checklistId: id, verdict: 'SUPPORTED', decisionBearing: true, correction: null })),
+    verdicts: expectedIds.map((id) => ({ checklistId: id, verdict: 'SUPPORTED', decisionBearing: true, correction: null, reason: '合成复核理由', evidenceArtifactSha256s: ['11'.repeat(32)], remainingBasisChecklistIds: [] })),
     changedFromA: false,
     changeReason: null,
     strongestCaseDisposition: 'ACCEPTED',
