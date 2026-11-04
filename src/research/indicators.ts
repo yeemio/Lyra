@@ -7,7 +7,7 @@
  * 无浮点。输出为定点字符串（decToString 去尾零，兼容 /^-?\d+(\.\d+)?$/）或 null
  * （数据不足该窗口，如实缺口，不编造）。
  *
- * 公式冻结（写死，勿改；单测与 Python 独立实现按此对照）：
+ * 公式按版本冻结；旧 P5 方法显式选 LEGACY_INDICATOR_VERSION，新方法选 EMA_INDICATOR_VERSION。
  * - MA(n)：最近 n 根收盘的简单均值；不足 n 根 → null。
  * - RSI(14)：Wilder 经典口径——涨幅/跌幅取逐日差分，种子 = 首 14 个差分的简单均值，
  *   之后 Wilder 平滑 avg = (prev×13 + x) / 14；RSI = 100 × avgGain / (avgGain + avgLoss)；
@@ -17,7 +17,8 @@
  *   之后 EMA[i] = (EMA[i-1]×(N-1) + 2×close[i]) / (N+1)（合并式，每步仅一次 scale-12
  *   half-up 舍入，与逐项 k×(close−prev)+prev 数学等价）；DIF = EMA12 − EMA26（自第 26 根）；
  *   DEA = DIF 的 EMA9，种子 = 首 9 个 DIF 的简单均值（自第 34 根），递推
- *   (prev×8 + dif) / 9；histogram = 2×(DIF − DEA)（A 股软件惯例口径）。
+ *   (prev×8 + 2×dif) / 10；histogram = 2×(DIF − DEA)（A 股软件惯例口径）。
+ *   旧版仅供冻结样本复现，保留非 EMA9 的 (prev×8 + dif) / 9，不冒称修正后方法。
  *   DIF 不足 26 根 → null；DEA/histogram 不足 34 根 → null。
  *
  * 输入纪律：bars 为 {date, close} 数组，close 为定点字符串（DAILY_BAR 原始字段口径；
@@ -46,6 +47,18 @@ export class IndicatorError extends Error {
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const TWO = decFromInt(2);
+
+export const LEGACY_INDICATOR_VERSION = 'indicators@p2-v1-legacy';
+export const EMA_INDICATOR_VERSION = 'indicators@p2-v2-ema9';
+export const RESEARCH_REPAIR_METHOD_VERSION = 'method@p2-v2-20261103';
+export type IndicatorVersion = typeof LEGACY_INDICATOR_VERSION | typeof EMA_INDICATOR_VERSION;
+
+/** 未知方法不得默默采用新公式；冻结 P5 的方法入口仍明确保留旧值。 */
+export function indicatorVersionForMethod(methodVersion: string): IndicatorVersion {
+  if (methodVersion === 'method@p2-v1') return LEGACY_INDICATOR_VERSION;
+  if (methodVersion === RESEARCH_REPAIR_METHOD_VERSION) return EMA_INDICATOR_VERSION;
+  throw new IndicatorError('INDICATOR_METHOD_UNSUPPORTED', methodVersion);
+}
 
 export interface IndicatorBar {
   /** 交易日 YYYY-MM-DD（零填充，字典序 = 时间序）。 */
@@ -95,7 +108,10 @@ function emaStep(prev: Dec, x: Dec, period: number): Dec {
  * 计算三样经典指标在 as-of 截点的值。纯函数：不改写入参、不碰外部状态。
  * bars 可乱序（内部升序排序）；date > asOf 的行被过滤；数据不足的窗口为 null。
  */
-export function computeIndicators(bars: readonly IndicatorBar[], asOf: string): IndicatorResult {
+export function computeIndicators(bars: readonly IndicatorBar[], asOf: string, version: IndicatorVersion = EMA_INDICATOR_VERSION): IndicatorResult {
+  if (version !== LEGACY_INDICATOR_VERSION && version !== EMA_INDICATOR_VERSION) {
+    throw new IndicatorError('INDICATOR_VERSION_UNSUPPORTED', String(version));
+  }
   if (!DATE_RE.test(asOf)) {
     throw new IndicatorError('INDICATOR_INVALID_DATE', `asOf: "${asOf}"（须为 YYYY-MM-DD）`);
   }
@@ -163,7 +179,9 @@ export function computeIndicators(bars: readonly IndicatorBar[], asOf: string): 
     if (m >= 34) {
       let dea = meanOf(difs.slice(0, 9)); // 种子 = 首 9 个 DIF 简单均值（索引 25..33）
       for (let i = 9; i < difs.length; i++) {
-        dea = decDiv(decAdd(decMul(dea, decFromInt(8)), difs[i] as Dec), decFromInt(9));
+        dea = version === LEGACY_INDICATOR_VERSION
+          ? decDiv(decAdd(decMul(dea, decFromInt(8)), difs[i] as Dec), decFromInt(9))
+          : emaStep(dea, difs[i] as Dec, 9);
       }
       macd.dea = decToString(dea);
       macd.histogram = decToString(decMul(decSub(difLast, dea), TWO));

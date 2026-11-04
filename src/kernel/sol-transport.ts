@@ -195,12 +195,15 @@ export function jOutputWireSchema(subjectKind: SubjectKind): Record<string, unkn
         type: 'array', minItems: 1,
         items: {
           type: 'object', additionalProperties: false,
-          required: ['checklistId', 'verdict', 'decisionBearing', 'correction'],
+          required: ['checklistId', 'verdict', 'decisionBearing', 'correction', 'reason', 'evidenceArtifactSha256s', 'remainingBasisChecklistIds'],
           properties: {
             checklistId: { type: 'string' },
             verdict: { type: 'string', enum: ['SUPPORTED', 'NARROWED', 'REJECTED', 'UNRESOLVED'] },
             decisionBearing: { type: 'boolean' },
             correction: { type: ['string', 'null'] },
+            reason: { type: 'string', minLength: 1 },
+            evidenceArtifactSha256s: { type: 'array', items: hex64 },
+            remainingBasisChecklistIds: { type: 'array', items: { type: 'string' } },
           },
         },
       },
@@ -239,7 +242,7 @@ function assertExactKeys(obj: Record<string, unknown>, keys: readonly string[], 
  * subjectKind 必须等于合同标的类别、candidate 必须在该类别选项空间（R18 跨类拒绝）。
  * 注：simulated 字段是通道自声明（R28）——本真实通道断言 false；permit.simulated（false）与 describe() 同向印证。
  */
-export function validateAOutputShape(value: unknown, call: ModelCallContract): AOutput {
+export function validateAOutputShape(value: unknown, call: ModelCallContract, simulated = false): AOutput {
   if (!isPlainObject(value)) throw shapeError(`A 输出须为 JSON 对象，实为 ${typeof value}`);
   assertExactKeys(value, A_KEYS, 'A');
   if (value.stage !== 'A') throw shapeError(`stage 须为 'A'，实为 ${String(value.stage)}`);
@@ -274,8 +277,8 @@ export function validateAOutputShape(value: unknown, call: ModelCallContract): A
   if (!Array.isArray(value.limitations) || value.limitations.some((x) => typeof x !== 'string')) {
     throw shapeError('limitations 须为字符串数组');
   }
-  if (value.simulated !== false) {
-    throw shapeError(`R28：真实通道输出 simulated 须为 false，实为 ${String(value.simulated)}`);
+  if (value.simulated !== simulated) {
+    throw shapeError(`输出 simulated 须与通道 ${String(simulated)} 一致，实为 ${String(value.simulated)}`);
   }
   return {
     stage: 'A',
@@ -286,7 +289,7 @@ export function validateAOutputShape(value: unknown, call: ModelCallContract): A
     strongestCounter: value.strongestCounter,
     confidence: value.confidence,
     limitations: value.limitations as string[],
-    simulated: false,
+    simulated,
   };
 }
 
@@ -300,6 +303,7 @@ export function validateJOutputShape(
   value: unknown,
   call: ModelCallContract,
   expectedChecklistIds?: readonly string[],
+  simulated = false,
 ): JOutput {
   if (!isPlainObject(value)) throw shapeError(`J 输出须为 JSON 对象，实为 ${typeof value}`);
   assertExactKeys(value, J_KEYS, 'J');
@@ -315,16 +319,21 @@ export function validateJOutputShape(
     throw shapeError('verdicts 须为非空数组');
   }
   const verdicts = value.verdicts.map((v, i): JOutput['verdicts'][number] => {
-    if (!isPlainObject(v) || Object.keys(v).length !== 4) {
-      throw shapeError(`verdicts[${i}] 须为 {checklistId, verdict, decisionBearing, correction}`);
+    if (!isPlainObject(v)) {
+      throw shapeError(`verdicts[${i}] 须为对象`);
     }
+    assertExactKeys(v, ['checklistId', 'verdict', 'decisionBearing', 'correction', 'reason', 'evidenceArtifactSha256s', 'remainingBasisChecklistIds'], `verdicts[${i}]`);
     if (typeof v.checklistId !== 'string' || v.checklistId.length === 0) throw shapeError(`verdicts[${i}].checklistId 须为非空字符串`);
     if (v.verdict !== 'SUPPORTED' && v.verdict !== 'NARROWED' && v.verdict !== 'REJECTED' && v.verdict !== 'UNRESOLVED') {
       throw shapeError(`verdicts[${i}].verdict ${String(v.verdict)} 不在 SUPPORTED/NARROWED/REJECTED/UNRESOLVED`);
     }
     if (typeof v.decisionBearing !== 'boolean') throw shapeError(`verdicts[${i}].decisionBearing 须为 boolean`);
     if (v.correction !== null && typeof v.correction !== 'string') throw shapeError(`verdicts[${i}].correction 须为 string|null`);
-    return { checklistId: v.checklistId, verdict: v.verdict, decisionBearing: v.decisionBearing, correction: v.correction };
+    if (typeof v.reason !== 'string' || !v.reason.trim()) throw shapeError(`verdicts[${i}].reason 必填`);
+    if (!Array.isArray(v.evidenceArtifactSha256s) || v.evidenceArtifactSha256s.some((x) => typeof x !== 'string' || !HASH_RE.test(x))) throw shapeError(`verdicts[${i}].evidenceArtifactSha256s 须为原件哈希数组`);
+    if (!Array.isArray(v.remainingBasisChecklistIds) || v.remainingBasisChecklistIds.some((x) => typeof x !== 'string' || !x.trim())) throw shapeError(`verdicts[${i}].remainingBasisChecklistIds 须为清单 ID 数组`);
+    return { checklistId: v.checklistId, verdict: v.verdict, decisionBearing: v.decisionBearing, correction: v.correction,
+      reason: v.reason, evidenceArtifactSha256s: v.evidenceArtifactSha256s as string[], remainingBasisChecklistIds: v.remainingBasisChecklistIds as string[] };
   });
   if (expectedChecklistIds !== undefined) {
     const expected = [...expectedChecklistIds].sort();
@@ -346,8 +355,8 @@ export function validateJOutputShape(
   if (!Array.isArray(value.limitations) || value.limitations.some((x) => typeof x !== 'string')) {
     throw shapeError('limitations 须为字符串数组');
   }
-  if (value.simulated !== false) {
-    throw shapeError(`R28：真实通道输出 simulated 须为 false，实为 ${String(value.simulated)}`);
+  if (value.simulated !== simulated) {
+    throw shapeError(`输出 simulated 须与通道 ${String(simulated)} 一致，实为 ${String(value.simulated)}`);
   }
   return {
     stage: 'J',
@@ -358,7 +367,7 @@ export function validateJOutputShape(
     changeReason: value.changeReason,
     strongestCaseDisposition: value.strongestCaseDisposition,
     limitations: value.limitations as string[],
-    simulated: false,
+    simulated,
   };
 }
 
