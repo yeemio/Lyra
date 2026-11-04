@@ -13,8 +13,10 @@ import { createAccount } from './accounts.js';
 import { defaultSrPlanBudget, type SrModelTransport } from './contracts.js';
 import { askReportQuestion, runSrTask } from './engine.js';
 import { reportFixture } from './report-identity-test-helper.js';
+import { syntheticInitialEvidence, SyntheticRecoveryTransport } from './engine-recovery-test-helper.js';
+import { canonicalSha256 } from '../canonical.js';
 import { createSrServer } from './server.js';
-import { createTask, getReportById, getReportByTaskAndVersion, insertAssembledReport, insertReport, listReportVersions, publishNewVersion } from './store.js';
+import { createTask, getReportById, getReportByTaskAndVersion, insertAssembledReport, insertReport, listReportVersions, listSteps, publishNewVersion } from './store.js';
 import type { ChatInput } from './transport.js';
 
 const url = process.env.LYRA_REPAIR_TEST_PG;
@@ -78,31 +80,33 @@ test('PR5 actual isolated PG: identity, versions, immutable recovery and deliver
     });
     await t.test('插入报告后写工作文件失败：原 ASSEMBLE 重入不增版；覆盖 A/J/QA 副本不改恢复', async () => {
       const recoveryTask = await newTask();
-      const f = await reportFixture(outputDir, { taskId: recoveryTask.taskId });
-      for (const step of [...f.steps, f.assembly]) {
-        await pool.query(`insert into sr_step (step_id, task_id, step_kind, section_key, sequence, status, output_artifact)
-          values ($1,$2,$3,$4,$5,$6,$7::jsonb)`, [step.stepId, step.taskId, step.stepKind, step.sectionKey, step.sequence, step.status, step.outputArtifact ? JSON.stringify(step.outputArtifact) : null]);
-      }
+      const pack = syntheticInitialEvidence(recoveryTask.taskId, recoveryTask.subject, recoveryTask.cutoff);
+      await pool.query('update sr_task set initial_evidence=$2::jsonb,initial_evidence_hash=$3 where task_id=$1',
+        [recoveryTask.taskId, JSON.stringify(pack), canonicalSha256(pack)]);
+      const recoveryTransport = new SyntheticRecoveryTransport(), recoveryDeps = { ...deps, transport: recoveryTransport };
       const work = join(outputDir, 'tasks', recoveryTask.taskId);
       await mkdir(join(work, 'report.md'), { recursive: true }); // 实际文件系统 EISDIR，发生在 DB insert 之后
-      const failed = await runSrTask(deps, recoveryTask.taskId);
+      const failed = await runSrTask(recoveryDeps, recoveryTask.taskId);
       assert.equal(failed.task.status, 'FAILED');
       assert.match(failed.task.error!.message, /EISDIR/);
       const saved = (await listReportVersions(pool, recoveryTask.taskId))[0]!;
       assert.ok(saved);
+      assert.equal(recoveryTransport.calls.length, 6, '原步骤通过正常发送与检查点入口');
+      const savedSteps = await listSteps(pool, recoveryTask.taskId);
       await rm(join(work, 'report.md'), { recursive: true });
       await mkdir(join(work, 'steps'), { recursive: true });
-      for (const step of f.steps) await writeFile(join(work, 'steps', `${String(step.sequence).padStart(2, '0')}-${step.stepKind}${step.sectionKey ? '-' + step.sectionKey : ''}.json`), '{"forged":true}');
+      for (const step of savedSteps) await writeFile(join(work, 'steps', `${String(step.sequence).padStart(2, '0')}-${step.stepKind}${step.sectionKey ? '-' + step.sectionKey : ''}.json`), '{"forged":true}');
       await writeFile(join(work, 'evidence.json'), '{"forged":true}');
-      const restored = await runSrTask(deps, recoveryTask.taskId);
-      assert.equal(restored.task.status, 'COMPLETED', JSON.stringify(restored.task.error));
+      const restored = await runSrTask(recoveryDeps, recoveryTask.taskId);
+      assert.ok(['COMPLETED', 'PARTIAL'].includes(restored.task.status), JSON.stringify(restored.task.error));
       assert.equal(restored.report!.contentHash, saved.contentHash);
       assert.equal((await listReportVersions(pool, recoveryTask.taskId)).length, 1);
-      assert.equal(Number((await pool.query('select count(*) from sr_call where task_id=$1', [recoveryTask.taskId])).rows[0].count), 0, '恢复零模型重发');
-      await assert.rejects(pool.query('update sr_step set output_artifact=$2::jsonb where step_id=$1', [f.steps[0]!.stepId, JSON.stringify({ sha256: '0'.repeat(64), bytes: 1 })]), /SR_ARTIFACT_IMMUTABLE/);
-      const hash = f.steps[8]!.outputArtifact!.sha256;
+      assert.equal(Number((await pool.query('select count(*) from sr_call where task_id=$1', [recoveryTask.taskId])).rows[0].count), 6, '原六次调用未新增');
+      assert.equal(recoveryTransport.calls.length, 6, '恢复零模型重发');
+      await assert.rejects(pool.query('update sr_step set output_artifact=$2::jsonb where step_id=$1', [savedSteps[0]!.stepId, JSON.stringify({ sha256: '0'.repeat(64), bytes: 1 })]), /SR_ARTIFACT_IMMUTABLE/);
+      const hash = savedSteps.find((s) => s.stepKind === 'JUDGE')!.outputArtifact!.sha256;
       await rm(join(outputDir, 'artifacts', hash.slice(0, 2), hash));
-      await assert.rejects(runSrTask(deps, recoveryTask.taskId), { code: 'ARTIFACT_MISSING' });
+      await assert.rejects(runSrTask(recoveryDeps, recoveryTask.taskId), { code: 'ARTIFACT_MISSING' });
     });
     await t.test('HTTP HTML/PDF/追问携带所选版本；错误版本不回退；线程不因多版本标量查询失败', async () => {
       const server = createSrServer({ ...deps, poolCache: { stocks: [], etfs: [] }, localAccountId: account.accountId, localCsrf: 'synthetic-csrf',

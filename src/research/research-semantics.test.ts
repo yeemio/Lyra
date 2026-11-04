@@ -1,4 +1,4 @@
-/** PR#3：公开合成输入、临时 CAS、无外发 transport。内存回执测试不冒充 PG 证据。 */
+/** PR#3：公开合成输入、临时 CAS、无外发 transport。纯材料验证用内存读取；实际执行调用者要求显式隔离PG。 */
 import assert from 'node:assert/strict';
 import { test, type TestContext } from 'node:test';
 import { mkdtemp, rm } from 'node:fs/promises';
@@ -11,7 +11,6 @@ import { canonicalJsonString, canonicalSha256 } from '../canonical.js';
 import { KernelError, type AOutput, type ConclusionObject, type JOutput, type ModelCallContract, type ModelPermit, type PlanAuthBudget, type TimePointFact } from '../contracts.js';
 import { buildConclusionObject, type ConclusionInput } from '../conclusion/object.js';
 import { applySchema, dropSchema } from '../db/exec.js';
-import { AJ_PERMIT_SPACE } from '../kernel/executor.js';
 import type { ModelTransport } from '../kernel/transport.js';
 import { runNightly } from '../schedule/nightly.js';
 import { runGateM, GATE_M_VERSIONS } from './gate-m.js';
@@ -169,28 +168,23 @@ class MemoryRows {
   }
 }
 
-function memoryPermits(t: TestContext) {
-  const permits: ModelPermit[] = [];
-  t.mock.method(AJ_PERMIT_SPACE, 'assertRunning', async () => {});
-
-  t.mock.method(AJ_PERMIT_SPACE, 'preparePermit', async (_p: Pool, c: ModelCallContract, b: PlanAuthBudget, opts: { simulated?: boolean }) => {
-    if (c.inputBytes > b.maxInputBytes) throw new KernelError('INPUT_OVER_BUDGET');
-    const p: ModelPermit = { permitId: randomUUID(), contract: c, state: 'PREPARED', sentAt: null, settledAt: null, failCode: null, simulated: opts.simulated ?? true };
-    permits.push(p); return p;
-  });
-  t.mock.method(AJ_PERMIT_SPACE, 'tryMarkSent', async (_p: Pool, id: string) => {
-    const p = permits.find((p) => p.permitId === id)!; p.state = 'SENT'; p.sentAt = new Date().toISOString(); return { kind: 'SENT', permit: p };
-  });
-  t.mock.method(AJ_PERMIT_SPACE, 'settle', async (_p: Pool, id: string, outcome: { result: ModelPermit['state']; failCode?: string }) => {
-    const p = permits.find((p) => p.permitId === id)!; p.state = outcome.result; p.failCode = outcome.failCode ?? null; p.settledAt = new Date().toISOString(); return p;
-  });
-  return permits;
+const executionGate = { skip: process.env.LYRA_REPAIR_TEST_PG ? false : 'NOT_RUN: original caller now requires durable SQL checkpoints; isolated PG unavailable' };
+async function executionPool(t: TestContext): Promise<Pool> {
+  const url = process.env.LYRA_REPAIR_TEST_PG!;
+  assert.ok(['localhost','127.0.0.1','[::1]'].includes(new URL(url).hostname));
+  const schema = `pr3_caller_${randomUUID().replaceAll('-', '')}`, admin = new Pool({ connectionString: url });
+  await applySchema(admin, schema);
+  const pool = new Pool({ connectionString: url, options: `-c search_path=${schema}` });
+  t.after(async () => { await pool.end(); await dropSchema(admin, schema); await admin.end(); });
+  return pool;
 }
+async function conclusionCount(pool: Pool) { return Number((await pool.query('select count(*) as n from conclusion')).rows[0].n); }
 
 function fakeTransport(mutate?: (stage: 'A' | 'J', output: AOutput | JOutput) => void, simulated = true) {
   const calls: { call: ModelCallContract; payload: ResearchDispatchPayload }[] = [];
   const transport: ModelTransport = {
     describe: () => ({ provider: 'TEST_ONLY fake', simulated }),
+    preflight: (call, raw) => { const p = raw as ResearchDispatchPayload; assert.equal(p.inputHash, call.inputHash); assert.equal(Buffer.byteLength(p.prompt), call.inputBytes); },
     dispatch: async (call, raw) => {
       const p = raw as ResearchDispatchPayload; calls.push({ call, payload: structuredClone(p) });
       let output: AOutput | JOutput;
@@ -212,25 +206,25 @@ async function assembly(store: ArtifactStore, pkg: ResearchInputPackage): Promis
   return { package: pkg, inputHash: pkg.inputHash, artifactRef: ref, inputBytes: ref.bytes };
 }
 
-test('I-08 正常 Gate-M 调用链：内存回执/临时 CAS，坏 A 零 J；坏 J 零结论；正例原文可读回', async (t) => {
-  const permits = memoryPermits(t), root = await mkdtemp(join(tmpdir(), 'lyra-pr3-'));
+test('I-08 正常 Gate-M 调用链：隔离PG回执/临时 CAS，坏 A 零 J；坏 J 零结论；正例原文可读回', executionGate, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'lyra-pr3-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const store = new ArtifactStore(root);
   for (const badStage of ['A', 'J', null] as const) {
-    const rows = new MemoryRows(), pkg = packageFixture();
+    const rows = new MemoryRows(), pkg = packageFixture(), execPool = await executionPool(t);
     const fake = fakeTransport((stage, out) => {
       if (stage === 'A' && badStage === 'A') (out as AOutput).decisiveLinks[0]!.evidenceArtifactSha256 = EXTRA_HASH;
       if (stage === 'J' && badStage === 'J') (out as JOutput).verdicts.forEach((v) => { v.decisionBearing = false; });
     }, badStage !== null); // 正例另覆盖非模拟身份的 fake channel，仍无任何外发。
-    const invoke = (): ReturnType<typeof runGateM> => runGateM({ dataPool: rows.pool, execPool: rows.pool, store, transport: fake.transport, assembleInput: async () => assembly(store, pkg) },
+    const invoke = (): ReturnType<typeof runGateM> => runGateM({ dataPool: rows.pool, execPool, store, transport: fake.transport, assembleInput: async () => assembly(store, pkg) },
       { subject: '600519', cutoff: CUTOFF, execute: true, validatePackage: false, versions: VERSIONS, budget: BUDGET, deadline: new Date(Date.now() + 60_000).toISOString() });
     if (badStage !== null) {
       await assert.rejects(invoke, (e: unknown) => (e as { code?: string }).code === (badStage === 'A' ? 'A_EVIDENCE_NOT_DELIVERED' : 'J_NO_DECISION_BASIS'));
       assert.deepEqual(fake.calls.map((c) => c.call.stage), badStage === 'A' ? ['A'] : ['A', 'J']);
-      assert.equal(rows.writes, 0); assert.equal(permits.at(-1)!.state, 'FAILED');
+      assert.equal(await conclusionCount(execPool), 0); assert.equal((await execPool.query("select state from exec_permit order by created_at desc limit 1")).rows[0].state, 'FAILED');
     } else {
       const out: Awaited<ReturnType<typeof runGateM>> = await invoke(); assert.equal(out.mode, 'execute'); if (out.mode !== 'execute') return;
-      assert.equal(rows.writes, 1); assert.equal(out.permits.j.state, 'SUCCEEDED');
+      assert.equal(await conclusionCount(execPool), 1); assert.equal(out.permits.j.state, 'SUCCEEDED');
       const trace = JSON.parse(new TextDecoder().decode(await store.readBytes(out.conclusion.evidence.researchTraceSha256!)));
       assert.equal(trace.input.inputHash, pkg.inputHash);
       assert.equal(canonicalSha256(trace.aOutput), out.conclusion.evidence.aOutputHash);
@@ -240,18 +234,18 @@ test('I-08 正常 Gate-M 调用链：内存回执/临时 CAS，坏 A 零 J；坏
   }
 });
 
-test('I-08 正常入口：错绑组装哈希或授权版本在任何 permit/发送前拒绝', async (t) => {
-  const permits = memoryPermits(t);
+test('I-08 正常入口：错绑组装哈希或授权版本在任何 permit/发送前拒绝', executionGate, async (t) => {
+  const execPool = await executionPool(t);
   const root = await mkdtemp(join(tmpdir(), 'lyra-pr3-binding-')); t.after(() => rm(root, { recursive: true, force: true }));
   const store = new ArtifactStore(root), rows = new MemoryRows(), fake = fakeTransport(), pkg = packageFixture();
   for (const badHash of [true, false]) {
-    await assert.rejects(() => runGateM({ dataPool: rows.pool, execPool: rows.pool, store, transport: fake.transport,
+    await assert.rejects(() => runGateM({ dataPool: rows.pool, execPool, store, transport: fake.transport,
       assembleInput: async () => ({ ...await assembly(store, pkg), ...(badHash ? { inputHash: 'f'.repeat(64) } : {}) }) },
     { subject: '600519', cutoff: CUTOFF, execute: true, validatePackage: false, versions: VERSIONS,
       budget: { ...BUDGET, planAuthVersion: badHash ? BUDGET.planAuthVersion : 'wrong:auth' } }),
-    (error: unknown) => (error as { code?: string }).code === 'RESEARCH_INPUT_UNBOUND');
+    (error: unknown) => (error as { code?: string }).code === (badHash ? 'RESEARCH_CHECKPOINT_INVALID' : 'RESEARCH_INPUT_UNBOUND'));
   }
-  assert.equal(permits.length, 0); assert.equal(fake.calls.length, 0); assert.equal(rows.writes, 0);
+  assert.equal(Number((await execPool.query('select count(*) as n from exec_permit')).rows[0].n), 0); assert.equal(fake.calls.length, 0); assert.equal(await conclusionCount(execPool), 0);
 });
 
 const EVENT: PostEventTriggerEvent = { eventId: 'test:event', subject: '600519', type: 'EARNINGS', subtype: null,
@@ -323,18 +317,36 @@ test('I-15：原文资格、不可伪造核验收据、同一时刻表示及新�
   assert.match(priorEligibilityReason(EVENT, { ...c, createdAt: '2026-11-04T00:00:00.000Z' }, VERSIONS.methodVersion, ADMITTED)!, /准入/);
 });
 
-test('I-15 正常事件入口：A/J payload 都送达原判断/条件与新事实；完整重研不冒称继承', async (t) => {
-  memoryPermits(t);
+test('I-15 正常事件入口：A/J payload 都送达原判断/条件与新事实；完整重研不冒称继承', executionGate, async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'lyra-pr3-event-')); t.after(() => rm(root, { recursive: true, force: true }));
   const store = new ArtifactStore(root), rows = new MemoryRows();
   const { c } = await priorFixture(store, rows), pkg = packageFixture('POST_EVENT', '2026-11-03T00:00:00.000Z');
   rows.fact = eventFact(pkg);
   for (const inherited of [true, false]) {
+    const execPool = await executionPool(t);
+    await execPool.query('insert into conclusion select * from jsonb_populate_record(null::conclusion,$1::jsonb)', [JSON.stringify(rows.conclusions.get(c.conclusionId))]);
     const fake = fakeTransport();
-    const out = await runPostEventResearch({ dataPool: rows.pool, execPool: rows.pool, store, transport: fake.transport,
-      calendar: { tradingDays: ['2026-11-02', '2026-11-03', '2026-11-04', '2026-11-05'] }, assembleInput: async () => assembly(store, pkg) },
-    { event: EVENT, inheritance: inherited ? { priorConclusion: c } : null, budget: BUDGET, versions: VERSIONS,
-      inputBudget: INPUT_BUDGET, now: new Date(ADMITTED), deadline: new Date(Date.now() + 60_000).toISOString() });
+    let builds = 0, stopBeforeJ = inherited;
+    const normalPreflight = fake.transport.preflight!;
+    fake.transport.preflight = async (call, input) => {
+      await normalPreflight(call, input);
+      if (call.stage === 'J' && stopBeforeJ) throw new KernelError('SYNTHETIC_A_CHECKPOINT_STOP');
+    };
+    const deps = { dataPool: rows.pool, execPool, store, transport: fake.transport,
+      calendar: { tradingDays: ['2026-11-02', '2026-11-03', '2026-11-04', '2026-11-05'] },
+      assembleInput: async () => { builds++; return assembly(store, pkg); } };
+    const opts = { event: EVENT, inheritance: inherited ? { priorConclusion: c } : null, budget: BUDGET, versions: VERSIONS,
+      inputBudget: INPUT_BUDGET, now: new Date(ADMITTED), deadline: new Date(Date.now() + 60_000).toISOString() };
+    if (inherited) {
+      await assert.rejects(runPostEventResearch(deps, opts), { code: 'SYNTHETIC_A_CHECKPOINT_STOP' });
+      assert.equal(fake.calls.length, 1);
+      await execPool.query('update conclusion set settlement=$2::jsonb where conclusion_id=$1', [c.conclusionId,
+        JSON.stringify({ ...c.settlement, state: 'ANOMALY', anomalyCode: 'SYNTHETIC_SETTLEMENT_ONLY' })]);
+      stopBeforeJ = false;
+    }
+    // Recovery uses the original admission even after the fresh-start window; original deadline still applies.
+    const out = await runPostEventResearch(deps, { ...opts, now: inherited ? new Date('2026-11-04T02:00:00.000Z') : opts.now });
+    assert.equal(builds, 1);
     assert.deepEqual(fake.calls.map((x) => x.call.stage), ['A', 'J']);
     for (const { call, payload } of fake.calls) {
       assert.ok(payload.prompt.includes('TEST_ONLY 新增订单超过旧条件'));

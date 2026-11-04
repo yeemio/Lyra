@@ -46,7 +46,7 @@ async function fixture(order: 'NORMAL' | 'A_LATER' = 'NORMAL', fault: 'NONE' | '
   };
   let transportFactories = 0, storeFactories = 0;
   const args = { sourceStore: store, ...prepared, expectedProposalHash: prepared.proposal.proposalHash, realCallsEnabled: true, permitStoreOrigin: 'TEST_ONLY_SQL_DOUBLE' as const,
-    createTransport: () => { transportFactories++; return new RealSrTransport({ ...config, enabled: true }, runner); }, openPermitStore: async () => { storeFactories++; return { srPool: pool.asPool(), holderId: pool.holderId }; } };
+    createTransport: () => { transportFactories++; return new RealSrTransport({ ...config, enabled: true }, runner); }, openPermitStore: async () => { storeFactories++; return { srPool: pool.asPool(), holderId: pool.holderId, lease: pool.lease }; } };
   return { ...prepared, args, grantFor, pool, calls, counts: () => ({ transportFactories, storeFactories }) };
 }
 

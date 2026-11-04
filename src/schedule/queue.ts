@@ -379,11 +379,13 @@ export function budgetGuard(input: {
   postEventUsed: number;
   /** 常态周与财报季的事件上限分别登记于授权文件（SC-8.2），由调用方按当前授权版本注入。 */
   postEventAuthCap: number;
+  scope?: 'WEEKLY' | 'POST_EVENT';
+  requiredCalls?: number;
 }): BudgetGuardOutcome {
-  if (input.postEventUsed >= input.postEventAuthCap) {
+  if (input.scope !== 'WEEKLY' && input.postEventUsed + (input.requiredCalls ?? 1) > input.postEventAuthCap) {
     return { ok: false, scope: 'POST_EVENT', action: 'STOP_AND_PAUSE_REPORT', noAutoScale: true, noModelDowngrade: true };
   }
-  if (input.weeklyUsed >= WEEKLY_BASELINE_PER_WEEK) {
+  if (input.scope !== 'POST_EVENT' && input.weeklyUsed + (input.requiredCalls ?? 1) > WEEKLY_BASELINE_PER_WEEK) {
     return { ok: false, scope: 'WEEKLY', action: 'DEFER', noAutoScale: true, noModelDowngrade: true };
   }
   return { ok: true };

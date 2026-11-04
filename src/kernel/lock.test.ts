@@ -53,44 +53,46 @@ describe('acquireExecutorLock（EK-2.1）', () => {
     assert.equal(lock.holder, 'exec-a');
     const cur = await readExecutorLock(pool);
     assert.equal(cur.holder, 'exec-a');
-    await releaseExecutorLock(pool, 'exec-a');
+    await releaseExecutorLock(pool, lock.lease);
   });
 
   it('进程内第二 holder 被 EXECUTION_LOCK_HELD 命名拒绝', async () => {
-    await acquireExecutorLock(pool, 'exec-a');
+    const lock = await acquireExecutorLock(pool, 'exec-a');
     const err = await assertKernelError(() => acquireExecutorLock(pool, 'exec-b'), 'EXECUTION_LOCK_HELD');
-    assert.match(err.message, /exec-a/);
+    assert.equal(err.code, 'EXECUTION_LOCK_HELD');
     const cur = await readExecutorLock(pool);
     assert.equal(cur.holder, 'exec-a'); // 未被静默改写
-    await releaseExecutorLock(pool, 'exec-a');
+    await releaseExecutorLock(pool, lock.lease);
   });
 
-  it('同 holder 重复 acquire 为续租（acquiredAt 不变）', async () => {
+  it('holder 名不能重新取得当前代际；原 token 续租保留 acquiredAt', async () => {
     const first = await acquireExecutorLock(pool, 'exec-a');
-    const again = await acquireExecutorLock(pool, 'exec-a');
+    await assertKernelError(() => acquireExecutorLock(pool, 'exec-a'), 'EXECUTION_LOCK_HELD');
+    const again = await heartbeatExecutorLock(pool, first.lease);
     assert.equal(again.holder, 'exec-a');
     assert.equal(again.acquiredAt, first.acquiredAt);
-    await releaseExecutorLock(pool, 'exec-a');
+    await releaseExecutorLock(pool, first.lease);
   });
 
   it('心跳过期（TTL）后可被夺取；心跳续租可保锁', async () => {
-    await acquireExecutorLock(pool, 'exec-a');
+    const lock = await acquireExecutorLock(pool, 'exec-a');
     // 人为将心跳拨回 TTL 之前（模拟持有者死亡）
-    await pool.query(`update kernel_lock set heartbeat_at = now() - interval '120 seconds' where id = 1`);
+    await pool.query(`update kernel_lock set lease_until = clock_timestamp() - interval '120 seconds' where id = 1`);
     const stolen = await acquireExecutorLock(pool, 'exec-b');
     assert.equal(stolen.holder, 'exec-b');
-    await heartbeatExecutorLock(pool, 'exec-b'); // 续租
+    await heartbeatExecutorLock(pool, stolen.lease); // 续租
+    await assertKernelError(() => heartbeatExecutorLock(pool, lock.lease), 'EXECUTION_LOCK_HELD');
     await assertKernelError(() => acquireExecutorLock(pool, 'exec-c'), 'EXECUTION_LOCK_HELD');
-    await releaseExecutorLock(pool, 'exec-b');
+    await releaseExecutorLock(pool, stolen.lease);
   });
 
   it('非持有者心跳/释放/执行校验均被拒', async () => {
-    await acquireExecutorLock(pool, 'exec-a');
-    await assertKernelError(() => heartbeatExecutorLock(pool, 'exec-b'), 'EXECUTION_LOCK_HELD');
-    await assertKernelError(() => releaseExecutorLock(pool, 'exec-b'), 'EXECUTION_LOCK_HELD');
-    await assertKernelError(() => assertLockHeld(pool, 'exec-b'), 'EXECUTION_LOCK_HELD');
-    await assertLockHeld(pool, 'exec-a'); // 持有者通过
-    await releaseExecutorLock(pool, 'exec-a');
+    const lock = await acquireExecutorLock(pool, 'exec-a');
+    await assertKernelError(() => heartbeatExecutorLock(pool, { ...lock.lease, holderId: 'exec-b' }), 'EXECUTION_LOCK_HELD');
+    await assertKernelError(() => releaseExecutorLock(pool, { ...lock.lease, holderId: 'exec-b' }), 'EXECUTION_LOCK_HELD');
+    await assertKernelError(() => assertLockHeld(pool, { ...lock.lease, holderId: 'exec-b' }), 'EXECUTION_LOCK_HELD');
+    await assertLockHeld(pool, lock.lease); // 持有者通过
+    await releaseExecutorLock(pool, lock.lease);
   });
 });
 
@@ -107,12 +109,12 @@ describe('probe.ts 第二执行器进程（EK-2.1 旅程形态）', () => {
   }
 
   it('锁被持有时退出码 3（EXECUTION_LOCK_HELD）', async () => {
-    await acquireExecutorLock(pool, 'exec-a');
+    const lock = await acquireExecutorLock(pool, 'exec-a');
     const r = runProbe();
     assert.equal(r.status, 3, `stdout=${r.stdout} stderr=${r.stderr}`);
     assert.match(r.stderr ?? '', /EXECUTION_LOCK_HELD/);
     assert.equal((await readExecutorLock(pool)).holder, 'exec-a'); // 探测不改写锁
-    await releaseExecutorLock(pool, 'exec-a');
+    await releaseExecutorLock(pool, lock.lease);
   });
 
   it('锁空闲时退出码 0，且探测后立即释放', async () => {
@@ -122,6 +124,6 @@ describe('probe.ts 第二执行器进程（EK-2.1 旅程形态）', () => {
     // probe 已释放：下一个 holder 无需等 TTL 即可取得
     const lock = await acquireExecutorLock(pool, 'exec-a');
     assert.equal(lock.holder, 'exec-a');
-    await releaseExecutorLock(pool, 'exec-a');
+    await releaseExecutorLock(pool, lock.lease);
   });
 });

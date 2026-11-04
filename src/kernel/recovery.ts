@@ -138,11 +138,11 @@ export async function confirmRecovery(
       if (!permit) continue;
       if (permit.state === 'SENT') {
         const decision = resolve?.(permit) ?? { outcome: 'UNKNOWN' as const };
+        if (decision.outcome === 'SUCCEEDED') throw new KernelError('RECOVERY_EVIDENCE_REQUIRED', 'A resolver label cannot fabricate a successful response checkpoint');
         const failCode = decision.outcome === 'FAILED'
           ? (decision.failCode ?? 'RECOVERY_CONFIRMED_FAIL')
           : decision.outcome === 'UNKNOWN' ? 'RECOVERY_UNCONFIRMED' : undefined;
-        const outcome = decision.outcome === 'SUCCEEDED' ? { result: 'SUCCEEDED' as const }
-          : decision.outcome === 'FAILED' ? { result: 'FAILED' as const, failCode: failCode ?? 'RECOVERY_CONFIRMED_FAIL' }
+        const outcome = decision.outcome === 'FAILED' ? { result: 'FAILED' as const, failCode: failCode ?? 'RECOVERY_CONFIRMED_FAIL' }
           : { result: 'UNKNOWN' as const, basis: failCode ?? 'RECOVERY_UNCONFIRMED' };
         const after = await settle(tx, permitId, outcome);
         resolved.push({ permitId, from: 'SENT', to: after.state });

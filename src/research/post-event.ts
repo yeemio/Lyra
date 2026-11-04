@@ -33,13 +33,14 @@ import type {
   PlanAuthBudget,
 } from '../contracts.js';
 import type { ArtifactStore } from '../artifacts/store.js';
-import { runModelCall } from '../kernel/executor.js';
+import { withExecutionLease, type ExecutionLease } from '../kernel/lease.js';
+import { releaseUnsentReservations } from '../kernel/budget.js';
+import { coalesceResearchRun, withResearchClaim, freezeResearchSnapshot, runResearchStage, publishResearchCheckpoint } from './gate-m-checkpoint.js';
 import type { ModelTransport } from '../kernel/transport.js';
-import { persistResearchConclusion } from './trace.js';
 import { loadFact } from '../pintime/facts.js';
 import { buildARequest, buildJRequest, assertAssembledIdentity } from './requests.js';
 import { validateResearchA, validateResearchJ } from './validation.js';
-import { loadPriorResearch, withPostEventContext, type PostEventTriggerEvent, type PostEventContext } from './inheritance.js';
+import { loadPriorResearch, immutablePrior, withPostEventContext, validatePostEventContext, type PostEventTriggerEvent, type PostEventContext } from './inheritance.js';
 export type { PostEventTriggerEvent } from './inheritance.js';
 import type { TradeCalendarTable } from '../adapters/calendar.js';
 import {
@@ -90,6 +91,7 @@ export interface PostEventResearchOptions {
   inheritance: PostEventInheritanceInput;
   budget: PlanAuthBudget;
   holderId?: string;
+  lease?: ExecutionLease;
   /** 研究身份版本轴（方法 / 数据与适配器；执行计划与授权版本取 budget.planAuthVersion）。 */
   versions: { methodVersion: string; adapterVersion: string };
   /** 输入分层预算（RM §5）；缺省取 P2 旅程对 600519 真实数据验证过的量级。 */
@@ -166,6 +168,14 @@ export async function runPostEventResearch(
   deps: PostEventResearchDeps,
   opts: PostEventResearchOptions,
 ): Promise<PostEventResearchOutcome> {
+  return coalesceResearchRun(deps.execPool, { subjectKind: 'STOCK', subject: opts.event.subject, cutoff: opts.event.eventTime, researchKind: 'POST_EVENT' },
+    { event: opts.event, budget: opts.budget, versions: opts.versions, inputBudget: opts.inputBudget ?? DEFAULT_POST_EVENT_INPUT_BUDGET, deadline: opts.deadline ?? null, transport: deps.transport.describe() },
+    () => withExecutionLease(deps.execPool, 'kernel', ({ lease }) =>
+      withResearchClaim(deps.execPool, lease, { subjectKind: 'STOCK', subject: opts.event.subject,
+        cutoff: opts.event.eventTime, researchKind: 'POST_EVENT' }, () => runPostEventInner(deps, { ...opts, lease })), opts));
+}
+
+async function runPostEventInner(deps: PostEventResearchDeps, opts: PostEventResearchOptions): Promise<PostEventResearchOutcome> {
   const { event, budget } = opts;
   if (typeof event.eventId !== 'string' || event.eventId.length === 0) {
     throw new PostEventError('EVENT_SHAPE_INVALID', 'eventId 为空');
@@ -177,6 +187,10 @@ export async function runPostEventResearch(
     throw new PostEventError('EVENT_SHAPE_INVALID', 'evidenceFactId 为空');
   }
   parseInstant(event.eventTime, 'event.eventTime');
+  const snapshot = await freezeResearchSnapshot(deps.execPool, deps.store, opts.lease!,
+    { subjectKind: 'STOCK', subject: event.subject, cutoff: event.eventTime, researchKind: 'POST_EVENT' },
+    { event, versions: opts.versions, budget, inputBudget: opts.inputBudget ?? DEFAULT_POST_EVENT_INPUT_BUDGET,
+      transport: deps.transport.describe(), requestedDeadline: opts.deadline ?? null }, async () => {
   const now = opts.now ?? new Date();
 
   // 0) SC-3.3 启动闸：检测命中后即可启动；次日 08:00 后新启动具名拒绝（不猜）。
@@ -236,17 +250,35 @@ export async function runPostEventResearch(
   const pkg = withPostEventContext(base.package, context, opts.inputBudget ?? DEFAULT_POST_EVENT_INPUT_BUDGET);
   const artifactRef = await deps.store.put(new TextEncoder().encode(canonicalJsonString(pkg)), 'application/json', new Date().toISOString());
   const assembled = { package: pkg, artifactRef, inputHash: pkg.inputHash, inputBytes: artifactRef.bytes };
-  const businessKey = assembled.package.businessKey; // 组装器规范化后的业务键（cutoff ISO 化）
 
   // 执行截止（EK-6.1）：显式给定优先；缺省 = 窗口截止（显式计算，不从模板继承）。
   const window = postEventWindowOf(deps.calendar, event.eventTime);
   const deadline = opts.deadline ?? window.deadline;
   parseInstant(deadline, 'deadline');
 
+    return { version: 1, assembled, deadline, metadata: { admission, window, declaration, eligibility } };
+  });
+  const { assembled, deadline } = snapshot;
+  const { admission, window, declaration, eligibility } = snapshot.metadata;
+  const pkg = assembled.package;
+  const businessKey = pkg.businessKey;
+  assertAssembledIdentity(assembled, { subjectKind: 'STOCK', subject: event.subject, cutoff: event.eventTime, researchKind: 'POST_EVENT' },
+    { ...opts.versions, planAuthVersion: budget.planAuthVersion });
+  const original = validatePostEventContext(pkg);
+  if (!original) throw new PostEventError('RESEARCH_CHECKPOINT_INVALID', 'Missing original event admission');
+  // Reissue the nonserializable verification receipt from original DB/CAS evidence and original admission time.
+  const resolved = await loadPriorResearch(deps.execPool, deps.store, original.prior?.conclusion ?? null,
+    original.event, opts.versions.methodVersion, original.admittedAt);
+  if (original.basis === 'INHERITED' && (!resolved.prior || canonicalJsonString(immutablePrior(resolved.prior)) !== canonicalJsonString(immutablePrior(original.prior!)))) {
+    throw new PostEventError('RESEARCH_CHECKPOINT_INVALID', 'Original inherited evidence no longer verifies');
+  }
+  const prior = resolved.prior?.conclusion ?? null;
+
   // 4a) A（经 transport，permit 已 SENT 才发送——EK-3.2/EK-11.2）。
   const simulated = deps.transport.describe().simulated;
   const aRequest = buildARequest(pkg, simulated);
-  const a = await runModelCall<AOutput>(deps.execPool, {
+  const a = await runResearchStage<AOutput>({
+    pool: deps.execPool, lease: opts.lease!, transport: deps.transport, snapshot, request: aRequest,
     contract: {
       businessKey,
       stage: 'A',
@@ -257,10 +289,7 @@ export async function runPostEventResearch(
       deadline,
     },
     budget,
-    modelFn: async (ctx) =>
-      validateResearchA(await deps.transport.dispatch(ctx.contract, aRequest.payload), pkg, simulated),
-    simulated: deps.transport.describe().simulated,
-    ...(opts.holderId === undefined ? {} : { holderId: opts.holderId }),
+    validate: (value) => validateResearchA(value, pkg, simulated),
   });
 
   // 4b) 程序清单（无模型机械抽取；绑定真实封存 manifest）。
@@ -271,7 +300,8 @@ export async function runPostEventResearch(
   // 4c) J（inputHash 绑定实际材料包 + A + 清单，RM §2.3 输入哈希回抄）。
   const jRequest = buildJRequest(pkg, a.output, checklist, simulated);
   const jInputHash = jRequest.inputHash;
-  const j = await runModelCall<JOutput>(deps.execPool, {
+  const j = await runResearchStage<JOutput>({
+    pool: deps.execPool, lease: opts.lease!, transport: deps.transport, snapshot, request: jRequest,
     contract: {
       businessKey,
       stage: 'J',
@@ -282,10 +312,7 @@ export async function runPostEventResearch(
       deadline,
     },
     budget,
-    modelFn: async (ctx) =>
-      validateResearchJ(await deps.transport.dispatch(ctx.contract, jRequest.payload), pkg, a.output, checklist, simulated),
-    simulated: deps.transport.describe().simulated,
-    ...(opts.holderId === undefined ? {} : { holderId: opts.holderId }),
+    validate: (value) => validateResearchJ(value, pkg, a.output, checklist, simulated),
   });
 
   // 4d) 结论对象（继承指针 + 改判理由；INHERITED 恒写桥接——维持也写，RM §7.1/§8）。
@@ -300,7 +327,7 @@ export async function runPostEventResearch(
       : j.output.changedFromA
         ? j.output.changeReason
         : null;
-  const conclusion = await persistResearchConclusion(deps.execPool, deps.store, {
+  const conclusion = await publishResearchCheckpoint(deps.execPool, deps.store, opts.lease!, {
     businessKey,
     methodVersion: opts.versions.methodVersion,
     adapterVersion: opts.versions.adapterVersion,

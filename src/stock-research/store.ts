@@ -1,3 +1,5 @@
+import { bindBudget } from '../kernel/budget.js';
+import { contractHash } from '../kernel/response.js';
 /**
  * Lyra · sr 空间持久层与 permit 空间（R31，2026-10-26）。
  *
@@ -18,6 +20,7 @@ import { canonicalSha256 } from '../canonical.js';
 import { dbNow, withTransaction, type DbClient } from '../db/exec.js';
 import { assemblyBody, signReport, verifyReport } from './report-identity.js';
 import type { PermitSpace } from '../kernel/executor.js';
+import { acquireLease, assertLease, renewLease, releaseLease, type ExecutionLease } from '../kernel/lease.js';
 import type { PermitOutcome, TryMarkSentOutcome } from '../kernel/permit.js';
 import type {
   ChatMessage,
@@ -234,18 +237,33 @@ export async function updateTask(
 }
 
 /** 取一个排队任务执行（FOR UPDATE SKIP LOCKED：多 worker 安全；配额并发由 quota 层管）。 */
-export async function claimQueuedTask(srPool: Pool, workerId: string): Promise<SrTask | null> {
+export async function claimQueuedTask(srPool: Pool, lease: ExecutionLease): Promise<SrTask | null> {
   return withTransaction(srPool, async (tx) => {
+    await assertLease(tx, lease, true);
+    await srAssertRunning(tx as unknown as Pool);
     const res = await tx.query<TaskRow>(
-      `update sr_task as t set status = 'RUNNING', updated_at = now()
-       where t.task_id = (
-         select task_id from sr_task where status = 'QUEUED'
-         order by created_at limit 1 for update skip locked
-       ) returning *`,
-    );
-    void workerId;
-    const row = res.rows[0];
-    return row ? rowToTask(row) : null;
+      `update sr_task as t set status='RUNNING',execution_owner=$1,execution_generation=$2::bigint,updated_at=clock_timestamp()
+       where t.task_id=(select task_id from sr_task
+         where (status='QUEUED' or (status='RUNNING' and execution_owner is not null and execution_generation<$2::bigint))
+           and coalesce(emphasis,'') not like 'FROZEN_STRATEGY_REVIEW:%'
+         order by created_at limit 1 for update skip locked) returning *`, [lease.holderId, lease.generation]);
+    await assertLease(tx, lease);
+    return res.rows[0] ? rowToTask(res.rows[0]) : null;
+  });
+}
+
+/** Explicit retries keep the original task; legacy unclaimed RUNNING rows are never guessed into a worker job. */
+export async function claimSrTask(srPool: Pool, lease: ExecutionLease, taskId: string): Promise<void> {
+  await withTransaction(srPool, async (tx) => {
+    await assertLease(tx, lease, true);
+    await srAssertRunning(tx as unknown as Pool);
+    const r = await tx.query(`update sr_task set status='RUNNING',error=null,execution_owner=$2,
+      execution_generation=$3::bigint,updated_at=clock_timestamp() where task_id=$1::uuid
+      and coalesce(emphasis,'') not like 'FROZEN_STRATEGY_REVIEW:%'
+      and (status='QUEUED' or (status in ('FAILED','RUNNING') and execution_owner is not null and execution_generation<=$3::bigint))`,
+      [taskId, lease.holderId, lease.generation]);
+    if (r.rowCount !== 1) throw new KernelError('TASK_RECOVERY_UNBOUND', 'Task has no reclaimable normal-engine ownership');
+    await assertLease(tx, lease);
   });
 }
 
@@ -293,9 +311,31 @@ export async function listSteps(srPool: DbClient, taskId: string): Promise<SrSte
   return res.rows.map(rowToStep);
 }
 
+/** Repair a partial deterministic skeleton in one transaction; reject foreign rows, never skip them. */
+export async function ensureSrSteps(srPool: Pool, lease: ExecutionLease, taskId: string,
+  plan: { kind: SrStep['stepKind']; sectionKey: string | null }[]): Promise<SrStep[]> {
+  return withTransaction(srPool, async (tx) => {
+    await assertLease(tx, lease, true);
+    await tx.query('select task_id from sr_task where task_id=$1::uuid for update', [taskId]);
+    const existing = (await listSteps(tx, taskId)).filter((s) => s.stepKind !== 'CHAT_ANSWER');
+    const seen = new Set<number>();
+    for (const step of existing) {
+      const expected = plan[step.sequence - 1];
+      if (!expected || seen.has(step.sequence) || step.stepKind !== expected.kind || step.sectionKey !== expected.sectionKey) {
+        throw new KernelError('TASK_STEP_SKELETON_CONFLICT', 'Existing task steps do not match the original engine plan');
+      }
+      seen.add(step.sequence);
+    }
+    for (let i = 0; i < plan.length; i++) if (!seen.has(i + 1)) await insertStep(tx, {
+      taskId, stepKind: plan[i]!.kind, sectionKey: plan[i]!.sectionKey, sequence: i + 1,
+    });
+    return (await listSteps(tx, taskId)).filter((s) => s.stepKind !== 'CHAT_ANSWER');
+  });
+}
+
 /** Register a non-queued, fixed-identity review in the existing sr task/step space. */
 export async function registerSrFrozenReview(
-  srPool: Pool,
+  srPool: DbClient,
   input: NewTaskInput & { taskId: string; steps: { stepId: string; stepKind: SrStep['stepKind']; sequence: number }[] },
 ): Promise<void> {
   await srPool.query(
@@ -331,7 +371,7 @@ export async function registerSrFrozenReview(
  */
 const SR_CONFLICT_WHERE = `where sr_call.sent_at is null and sr_call.state in ('PREPARED', 'FAILED')`;
 const SR_CONFLICT_SET = [
-  'call_id = excluded.call_id',
+  'call_id = sr_call.call_id',
   'input_hash = excluded.input_hash',
   'input_bytes = excluded.input_bytes',
   'method_version = excluded.method_version',
@@ -375,7 +415,7 @@ async function srUpsertCall(
   return res.rows[0] ? rowToCall(res.rows[0]) : null;
 }
 
-async function srGetCall(srPool: DbClient, callId: string): Promise<SrCallPermit | null> {
+export async function srGetCall(srPool: DbClient, callId: string): Promise<SrCallPermit | null> {
   const res = await srPool.query<CallRow>(`select * from sr_call where call_id = $1::uuid`, [callId]);
   return res.rows[0] ? rowToCall(res.rows[0]) : null;
 }
@@ -425,19 +465,48 @@ export async function srTryMarkSent(
   srPool: Pool,
   callId: string,
   maxInFlight: number,
+  lease?: ExecutionLease,
+  budget?: PlanAuthBudget,
+  expectedContract?: SrCallContract,
 ): Promise<TryMarkSentOutcome<SrCallPermit>> {
+  if (!lease || lease.space !== 'sr' || !budget) throw new KernelError('EXECUTION_LEASE_REQUIRED', 'SR sends require a current acquisition token and budget');
+  if (!Number.isSafeInteger(maxInFlight) || maxInFlight < 1 || maxInFlight > budget.maxInFlight) throw new KernelError('EXECUTION_BUDGET_INVALID', 'Send concurrency cannot exceed the bound authorization');
   return withTransaction(srPool, async (tx) => {
+    await assertLease(tx, lease, true);
+    const recovery = await tx.query("select lifecycle from sr_recovery_state where id=1 for share");
+    if (recovery.rows[0]?.lifecycle !== 'RUNNING') throw new KernelError('RECOVERY_CONFIRM_REQUIRED');
     await tx.query('select pg_advisory_xact_lock($1::bigint)', [SR_GATE_ADVISORY_KEY]);
+    const counts = await tx.query<{ week_used: string; task_used: string; task_id: string; state: string; expired: boolean }>(`
+      select c.task_id,c.state,clock_timestamp()>c.deadline as expired,
+      (select count(*)::text from sr_call x where x.sent_at >= (date_trunc('week',clock_timestamp() at time zone 'Asia/Shanghai') at time zone 'Asia/Shanghai')
+        and x.sent_at < ((date_trunc('week',clock_timestamp() at time zone 'Asia/Shanghai') + interval '7 days') at time zone 'Asia/Shanghai')) as week_used,
+      (select count(*)::text from sr_call x where x.task_id=c.task_id and x.sent_at is not null) as task_used
+      from sr_call c where call_id=$1::uuid for update`, [callId]);
+    const count = counts.rows[0];
+    const current = await srGetCall(tx, callId);
+    if (current && expectedContract && contractHash({ taskId: current.taskId, stepId: current.stepId, inputHash: current.inputHash, inputBytes: current.inputBytes,
+      methodVersion: current.methodVersion, planAuthVersion: current.planAuthVersion, deadline: current.deadline }) !== contractHash(expectedContract)) {
+      throw new KernelError('PERMIT_CONTRACT_CONFLICT', 'Prepared SR call was replaced by another request');
+    }
+    if (current && current.planAuthVersion !== budget.planAuthVersion) throw new KernelError('PLAN_AUTH_MISMATCH');
+    await bindBudget(tx, 'sr', budget);
+    const taskCap = (budget as PlanAuthBudget & { maxModelCallsPerTask?: number }).maxModelCallsPerTask;
+    if (count?.state === 'PREPARED' && !count.expired && (Number(count.week_used)>=budget.maxModelCallsPerWeek ||
+        (taskCap !== undefined && Number(count.task_used)>=taskCap))) {
+      throw new KernelError('MODEL_CALL_BUDGET_EXCEEDED', 'SR weekly or task send budget exhausted');
+    }
+    await assertLease(tx, lease);
     const res = await tx.query<CallRow>(
-      `update sr_call as c set state = 'SENT', sent_at = now()
-       where c.call_id = $1::uuid and c.state = 'PREPARED' and now() <= c.deadline
+      `update sr_call as c set state = 'SENT', sent_at = clock_timestamp(),execution_generation=$3::bigint
+       where c.call_id = $1::uuid and c.state = 'PREPARED' and clock_timestamp() <= c.deadline
+         and exists(select 1 from sr_engine_lock where id=1 and lease_until>clock_timestamp())
          and (select count(*) from sr_call x where x.state = 'SENT') < $2::int
        returning c.*`,
-      [callId, maxInFlight],
+      [callId, maxInFlight, lease.generation],
     );
     if (res.rows[0]) return { kind: 'SENT', permit: rowToCall(res.rows[0]) };
     const cur = await tx.query<CallRow & { deadline_exceeded: boolean }>(
-      `select *, now() > deadline as deadline_exceeded from sr_call where call_id = $1::uuid`,
+      `select *, clock_timestamp() > deadline as deadline_exceeded from sr_call where call_id = $1::uuid`,
       [callId],
     );
     const curRow = cur.rows[0];
@@ -593,9 +662,8 @@ export async function srConfirmRecovery(
       if (!call) continue;
       if (call.state === 'SENT') {
         const decision = resolve?.(rowToCall(call)) ?? { outcome: 'UNKNOWN' as const };
-        const outcome: PermitOutcome = decision.outcome === 'SUCCEEDED'
-          ? { result: 'SUCCEEDED' }
-          : decision.outcome === 'FAILED'
+        if (decision.outcome === 'SUCCEEDED') throw new KernelError('RECOVERY_EVIDENCE_REQUIRED', 'A resolver label cannot fabricate a successful response checkpoint');
+        const outcome: PermitOutcome = decision.outcome === 'FAILED'
             ? { result: 'FAILED', failCode: decision.failCode ?? 'RECOVERY_CONFIRMED_FAIL' }
             : { result: 'UNKNOWN', basis: 'RECOVERY_UNCONFIRMED' };
         await srSettle(tx, callId, outcome);
@@ -620,50 +688,17 @@ export async function srConfirmRecovery(
 
 export const SR_LOCK_TTL_MS = 60_000;
 
-export async function acquireSrEngineLock(srPool: Pool, holderId: string, opts?: { ttlMs?: number }): Promise<void> {
-  const ttlMs = opts?.ttlMs ?? SR_LOCK_TTL_MS;
-  const res = await srPool.query(
-    `update sr_engine_lock set
-       holder = $1,
-       acquired_at = case when sr_engine_lock.holder = $1 then sr_engine_lock.acquired_at else now() end,
-       heartbeat_at = now()
-     where id = 1
-       and (sr_engine_lock.holder = '' or sr_engine_lock.holder = $1
-            or sr_engine_lock.heartbeat_at < now() - ($2::double precision * interval '1 millisecond'))`,
-    [holderId, ttlMs],
-  );
-  if ((res.rowCount ?? 0) === 0) {
-    throw new KernelError('EXECUTION_LOCK_HELD', `sr 引擎锁被他人持有，${holderId} 被拒绝`);
-  }
+export async function acquireSrEngineLock(srPool: Pool, holderId: string, opts?: { ttlMs?: number }): Promise<ExecutionLease> {
+  return acquireLease(srPool, 'sr', holderId, opts?.ttlMs ?? SR_LOCK_TTL_MS);
 }
-
-export async function heartbeatSrEngineLock(srPool: Pool, holderId: string): Promise<void> {
-  const res = await srPool.query(
-    `update sr_engine_lock set heartbeat_at = now() where id = 1 and holder = $1`,
-    [holderId],
-  );
-  if ((res.rowCount ?? 0) === 0) throw new KernelError('EXECUTION_LOCK_HELD', 'sr 引擎锁已易主，心跳被拒');
+export async function heartbeatSrEngineLock(srPool: Pool, lease: ExecutionLease): Promise<void> {
+  return renewLease(srPool, lease);
 }
-
-export async function releaseSrEngineLock(srPool: Pool, holderId: string): Promise<void> {
-  await srPool.query(
-    `update sr_engine_lock set holder = '', acquired_at = now() - interval '1 day',
-       heartbeat_at = now() - interval '1 day' where id = 1 and holder = $1`,
-    [holderId],
-  );
+export async function releaseSrEngineLock(srPool: Pool, lease: ExecutionLease): Promise<void> {
+  return releaseLease(srPool, lease);
 }
-
-export async function assertSrLockHeld(srPool: Pool, holderId: string, opts?: { ttlMs?: number }): Promise<void> {
-  const ttlMs = opts?.ttlMs ?? SR_LOCK_TTL_MS;
-  const res = await srPool.query<{ holder: string; heartbeat_at: Date }>(
-    'select holder, heartbeat_at from sr_engine_lock where id = 1',
-  );
-  const row = res.rows[0];
-  if (!row) throw new Error('sr_engine_lock 单行缺失');
-  const ageMs = (await dbNow(srPool)).getTime() - row.heartbeat_at.getTime();
-  if (row.holder !== holderId || ageMs >= ttlMs) {
-    throw new KernelError('EXECUTION_LOCK_HELD', `sr 引擎执行权校验失败（holder=${row.holder || '(空)'}）`);
-  }
+export async function assertSrLockHeld(srPool: DbClient, lease: ExecutionLease): Promise<void> {
+  return assertLease(srPool, lease);
 }
 
 /** UNKNOWN 调用是否已有退役回执（重试新步骤的前置判定）。 */
@@ -675,7 +710,11 @@ export async function srCallHasReceipt(srPool: DbClient, callId: string): Promis
 // ===== sr permit space 装配（接入 runPermittedCall）=====
 
 export const SR_PERMIT_SPACE: PermitSpace<SrCallPermit, SrCallContract> = {
-  assertLock: (pool, holderId) => assertSrLockHeld(pool, holderId),
+  leaseSpace: 'sr',
+  getPermit: srGetCall,
+  contractOf: (p) => ({ taskId: p.taskId, stepId: p.stepId, inputHash: p.inputHash, inputBytes: p.inputBytes,
+    methodVersion: p.methodVersion, planAuthVersion: p.planAuthVersion, deadline: p.deadline }),
+  assertLock: (pool, lease) => assertSrLockHeld(pool, lease),
   assertRunning: srAssertRunning,
   preparePermit: srPreparePermit,
   tryMarkSent: srTryMarkSent,
@@ -708,10 +747,11 @@ export async function insertReport(srPool: DbClient, report: Omit<ReportDocument
   return full;
 }
 
-export async function insertAssembledReport(srPool: Pool, report: Omit<ReportDocument, 'contentHash'>): Promise<ReportDocument> {
+export async function insertAssembledReport(srPool: Pool, report: Omit<ReportDocument, 'contentHash'>, lease?: ExecutionLease): Promise<ReportDocument> {
   const stepId = report.evidenceRefs?.artifacts?.assemblyStepId;
   if (!stepId) throw new KernelError('SR_ARTIFACT_UNBOUND', '组装缺少步骤身份');
   return withTransaction(srPool, async (tx) => {
+    if (lease) await assertLease(tx, lease, true);
     await tx.query('select task_id from sr_task where task_id = $1::uuid for update', [report.taskId]);
     const step = await tx.query("select step_id from sr_step where task_id=$1::uuid and step_id=$2::uuid and step_kind='ASSEMBLE'", [report.taskId, stepId]);
     if (!step.rows[0]) throw new KernelError('SR_ARTIFACT_UNBOUND', '组装步骤不属于该任务');
@@ -723,10 +763,13 @@ export async function insertAssembledReport(srPool: Pool, report: Omit<ReportDoc
       if (canonicalSha256(assemblyBody(existing)) !== canonicalSha256(assemblyBody(report))) {
         throw new KernelError('SR_REPORT_CONFLICT', '同一组装步骤的材料或正文发生变化');
       }
+      if (lease) await assertLease(tx, lease);
       return existing;
     }
     const latest = await tx.query<{ report_id: string; version: number }>('select report_id, version from sr_report where task_id=$1::uuid order by version desc limit 1', [report.taskId]);
-    return insertReport(tx, { ...report, reportId: latest.rows[0]?.report_id ?? report.reportId, version: (latest.rows[0]?.version ?? 0) + 1 });
+    const saved = await insertReport(tx, { ...report, reportId: latest.rows[0]?.report_id ?? report.reportId, version: (latest.rows[0]?.version ?? 0) + 1 });
+    if (lease) await assertLease(tx, lease);
+    return saved;
   });
 }
 
@@ -893,15 +936,26 @@ export async function findThreadForReport(srPool: DbClient, reportId: string, ac
   return row ? { threadId: row.thread_id, reportId: row.report_id, reportVersion: row.report_version, accountId, createdAt: row.created_at.toISOString() } : null;
 }
 
-export async function addChatMessage(srPool: DbClient, msg: Omit<ChatMessage, 'messageId' | 'createdAt'>): Promise<ChatMessage> {
+export async function addChatMessage(srPool: DbClient, msg: Omit<ChatMessage, 'messageId' | 'createdAt'>, requestKey?: string): Promise<ChatMessage> {
   const messageId = randomUUID();
   await srPool.query(
-    `insert into sr_chat_message (message_id, thread_id, role, kind, content, citations, call_id, suggested_action)
-     values ($1,$2,$3,$4,$5,$6::jsonb,$7,$8::jsonb)`,
+    `insert into sr_chat_message (message_id, thread_id, role, kind, content, citations, call_id, suggested_action,request_key)
+     values ($1,$2,$3,$4,$5,$6::jsonb,$7,$8::jsonb,$9)
+     on conflict(thread_id,request_key,role) where request_key is not null do nothing`,
     [messageId, msg.threadId, msg.role, msg.kind, msg.content,
       JSON.stringify(msg.citations ?? []), msg.callId ?? null,
-      msg.suggestedAction ? JSON.stringify(msg.suggestedAction) : null],
+      msg.suggestedAction ? JSON.stringify(msg.suggestedAction) : null, requestKey ?? null],
   );
+  if (requestKey) {
+    const r = await srPool.query<{ message_id: string }>('select message_id from sr_chat_message where thread_id=$1::uuid and request_key=$2 and role=$3',
+      [msg.threadId, requestKey, msg.role]);
+    const saved = (await listChatMessages(srPool, msg.threadId)).find((m) => m.messageId === r.rows[0]?.message_id);
+    if (!saved || canonicalSha256({ threadId: saved.threadId, role: saved.role, kind: saved.kind, content: saved.content,
+      citations: saved.citations, callId: saved.callId, suggestedAction: saved.suggestedAction }) !== canonicalSha256(msg)) {
+      throw new KernelError('REQUEST_MESSAGE_CONFLICT', 'The stable request already has another message');
+    }
+    return saved;
+  }
   return { ...msg, messageId, createdAt: new Date().toISOString() };
 }
 
@@ -921,4 +975,18 @@ export async function listChatMessages(srPool: DbClient, threadId: string): Prom
     suggestedAction: (r.suggested_action as ChatMessage['suggestedAction']) ?? null,
     createdAt: r.created_at instanceof Date ? (r.created_at as Date).toISOString() : String(r.created_at),
   }));
+}
+
+/** Explicit resume requeues the same owned task; an uncertain send is never sampled again. */
+export async function resumeSrTask(pool: Pool, accountId: string, taskId: string): Promise<void> {
+  await withTransaction(pool, async (tx) => {
+    const row = (await tx.query<TaskRow & { execution_owner: string | null }>('select * from sr_task where task_id=$1::uuid and account_id=$2::uuid for update', [taskId, accountId])).rows[0];
+    if (!row) throw new KernelError('TASK_NOT_FOUND');
+    if (['QUEUED','RUNNING'].includes(row.status)) return;
+    if (row.status !== 'FAILED' || !row.execution_owner || row.emphasis?.startsWith('FROZEN_STRATEGY_REVIEW:')) throw new KernelError('TASK_RECOVERY_UNBOUND');
+    const blocked = await tx.query(`select 1 from sr_call where task_id=$1::uuid and sent_at is not null
+      and (state<>'SUCCEEDED' or response_checkpoint is null or response_hash is null) limit 1`, [taskId]);
+    if (blocked.rowCount) throw new KernelError('RECOVERY_CONFIRM_REQUIRED', 'Original send has no trusted successful checkpoint; no automatic resend');
+    await tx.query("update sr_task set status='QUEUED',updated_at=clock_timestamp() where task_id=$1::uuid", [taskId]);
+  });
 }

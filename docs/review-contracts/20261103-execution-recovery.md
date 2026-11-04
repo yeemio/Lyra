@@ -1,6 +1,6 @@
 # 修复发送终态、执行租约、请求幂等与任务恢复
 
-状态：修复合同；当前仅建立 Draft PR，尚无修复接受。
+状态：PR4 R1 源码候选已实现，待总控接收与隔离 PostgreSQL／页面呈现验收；本文件不授予源码或业务接受。
 
 审查候选：[`6c7cd196f20a4222d1f97708de7402b2c50ebeb0`](https://github.com/yeemio/Lyra/tree/6c7cd196f20a4222d1f97708de7402b2c50ebeb0)，tree `843eb5b97617ffda179ebb06e2ee2adf03bf19fc`。PR base=`main@6c7cd196f20a4222d1f97708de7402b2c50ebeb0`；head=`review-20261103/execution-recovery`，初始合同提交身份见 PR。
 
@@ -49,3 +49,34 @@ Owner 已授权这批经核对的问题修复、验证、对应分支提交/推�
 适用验证在稳定候选完成后运行：项目 typecheck、受影响行为/调用链回归、diff检查；使用公开合成输入/隔离数据库。不是严格 TDD 授权，不强制先写失败测试。每条通过必须附实际命令、输出、环境与准确 head；未运行列明原因，不把报告原93测试当新候选证明。UI/PDF变动须提供与候选绑定的实际呈现证据。
 
 停止条件：每个问题的完整行为出口成立，提供稳定 head、完整 changed paths/diff 与适用验证；当前总控接收。若无 GitHub 写工具，完整可发布补丁/文件即本次传输出口。一个初始结果加一次具名窄返工后先由总控重评，不自动无限重试或改换作者。源码接受不自动等于安装、整体L2、真实A/J或效果接受。
+
+## PR4 R1 实施与依赖（2026-11-04）
+
+唯一作者在原 PR4 分支上采用已接受 PR5 `5ecf5e87a2dfec261ddaa1e044085caa5cb62b26`（其祖先包含已接受 PR1、PR3）。依赖合并提交 `32baeae7b8af459fdfa722c44f1f5cc9a416776e` 的第一父为本 PR 初始合同 `3a97bf4283be95b3a3c0afab2e116ba64d3d70`，第二父为上述 PR5；tree `1d2f119edc823d6fbfafdf3a9b508d4e60a4384f`。未采用 PR2、PR6、PR7；未更改其旧身份。R1 修复提交以该合并为唯一父，精确 head/tree/raw commit、全量增量和哈希由冻结交付 manifest 记录。
+
+| 出口 | 本候选行为与证据位置 |
+|---|---|
+| I-09 | 发送后的本地超时、失联、失去租约、结果检查点提交失败、无法证明远端终态的进程失败归 UNKNOWN；明确响应合同失败仍 FAILED。取消信号在等待落库之前传播到 Sol/SR runner/DSH worker，晚到输出不能改写已关闭结果。真实费用未知不填零。`executor`、`response`、两套 transport 与 DSH。 |
+| I-10 | kernel/SR 各有数据库 acquisition generation、截止与独立续租；发送、检查点和任务写入在同一事务内校验原 token，等待锁后再查 DB 时钟。holder 名不能借用新 token。两发送门不接受高于绑定预算的独立并发参数；过期 FULL 等待者不得关闭新代际 SENT 或同代际替换合同。`lease`、`permit`、`store`、`engine-checkpoint`。 |
+| I-11 | 传统链冻结原输入 CAS、业务键、授权/预算、身份和阶段截止；A/J 成功与响应检查点原子提交，A 后/J 后/发布前故障通过正常业务键恢复原回执，校验完整 J 后才发布。事件链同时冻结原准入/初始事实/先验，后来的结算回填不改先验研究身份。SR 冻结 pre-PLAN 证据、补齐原 11 步骨架、验证已完成步骤的原调用/CAS，重领本引擎旧代际 RUNNING 或显式继续原 FAILED；无原身份、冻结策略或 UNKNOWN 不自动重发。文件名猜配 `--a-from` 继续拒绝，不能据此冒称恢复成功。 |
+| I-12 | nightly CLI 的真实工厂进入 `deps.transport`，周度与事件调用共用正常研究请求构造器；完整 prompt 字节、哈希、身份在 SENT 前预检。CLI 合成工厂从参数走到实际 dispatch 的 PG 用例仍保留 7 研究/14 permit/7 结论。非模拟 P5 commit 始终在执行前 `P5_PROTOCOL_FROZEN`。 |
+| I-13 | DB 实际上海发送周计数；scope 独立上限、同授权版本不可增容；A 原子预约未发送 A/J，J 消耗原预约，失败只释放未发送槽，UNKNOWN/已发送永不退还。并发在 SENT 事务计数。nightly 从实际收据回填部分失败、准入和日志。不可变 `execution_attempt` 保留执行器入口的拒绝/未完成/返回，计费调用仍只数 `sent_at`，旧缺失审计不伪报零拒绝。 |
+| I-16 | 追问/修订发送前原子建立 account＋稳定意图键，绑定报告版本/hash、问题及输入；任务/步骤/USER 消息/配额一并落位。双击和刷新默认复用原 pending/UNKNOWN/答案；页面显式 NEW 才采用新意图键。答案落位失败可从原成功响应检查点完成原请求，不重发、不重复计额。修订重投使用原 DB 截止及原任务。原任务继续入口保留鉴权/CSRF。 |
+
+### 必要调用者联动与修改边界
+
+合同目录外只做这些必要联动：`src/contracts.ts` 增加 scope 预算类型；`src/db/exec.ts` 将源执行 DDL 纳入对应隔离初始化；`src/journey/journey.test.ts`、研究旅程/语义测试迁移真实租约调用并把需要事务的调用者明确标为 PG 门；`src/research/inheritance.ts` 区分先验研究不可变身份与结算后补字段；`src/stock-research/transport.ts`、`dsh.ts` 和就近测试实现发送前校验/取消/完整身份；`render.ts` 与内容测试承接稳定意图/原任务继续入口；`sr-engine.test.ts` 与 `report-identity.pg.test.ts` 保留原恢复场景，要求真实原调用检查点，不再伪造成功步骤；`strategy/real-review*` 和 `review-isolated.ts` 传递实际 lease 并适配同一执行器，新增 `execution-port.test.ts` 明确只是 SQL 替身。该联动未变更策略规则、资金股数计算、P5 激活或 I-05 冻结窗口。
+
+`dsh.test.ts` 的原费用写失败夹具改在其独占测试 schema 中对 `durationMs` 更新注入 SQL 失败；原因是生产元数据现通过租约事务 client 写入，原 pool.query 替身不再命中。该旧套件依赖私有输入/原运行目录/原凭据，本环境未运行；新 DSH 取消回归单独使用临时合成凭据和 loopback，绝不读取旧原件。
+
+源 SQL 只随源码交付，未迁移业务库。没有修改 PM 独占文件、I-05、依赖包或 PDF 渲染源码。
+
+### 本作者实际检查与待验门
+
+当前 Linux / Node v24.22.1；既有依赖通过工作区符号链接复用，未执行服务安装。适用纯行为/注入传输/内容回归 126/126、0 失败、0 跳过；typecheck 与 diff 检查通过。冻结后复核的精确命令、完整 stdout/stderr、退出码、候选 head/tree 在交付日志中固定；不把修改前或总控历史测试数量当本候选重跑。
+
+行为命令：`node --import tsx --test src/kernel/execution-recovery.test.ts src/kernel/transport.test.ts src/kernel/sol-transport.test.ts src/schedule/queue.test.ts src/stock-research/sr-real-transport.test.ts src/stock-research/dsh-recovery.test.ts src/stock-research/render.test.ts src/stock-research/report-identity.test.ts src/stock-research/strategy/execution-port.test.ts`。新增取消用例只向合成 loopback Messages 服务发送一次请求，无真实模型或真实凭据；Sol 与 SR runner 使用注入替身。SQL 查询替身不算 PostgreSQL。
+
+**NOT_RUN：真实隔离 PostgreSQL。** 当前 `postgres/initdb/pg_ctl/psql/docker/podman` 均不可用，`LYRA_REPAIR_TEST_PG` 与 `LYRA_PG_PASSWORD` 均未设置。`execution-recovery.pg.test.ts`、`engine-recovery.pg.test.ts` 及调整后的 `report-identity.pg.test.ts` 必须由总控在准确新 head 的自建 PG 上补验。门覆盖源 DDL 重入、两池/两进程、超 TTL 续租与接管、锁等待后过期、旧 token/旧合同拒绝、双预算与 A/J 预约/UNKNOWN、审计计数、检查点失败回滚、A 后/J 后/发布前恢复、双击/HTTP 刷新/答案落位故障/修订重投、8 次 task 额度和原任务 worker 恢复。缺少 URL 时显式跳过即 NOT_RUN，不是通过。原 kernel/研究/调度/SR 集成调用者还需总控在其公开合成事实、研究池及临时 schema 上运行；未触碰真实资料或业务库。
+
+**NOT_RUN：网页实际呈现。** 新意图/原任务继续表单只有 HTML 内容、安全和提交字段断言；未通过浏览器或截图路径绕过已有访问限制，不能签视觉接受。PDF 源码未变，不复报旧 PDF 为新检查。PR1/PR7/PR5 网页及原私有资料兼容性、严格 PIT、真实 A/J 语义、账户、安装、行业八日、效果、六项 NOT_ASSESSED 边界均保留。总控 ACCEPT_SOURCE 前，累计接受仍为 21/27。

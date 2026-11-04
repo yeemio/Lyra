@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 /**
  * Lyra · sr 空间页面渲染（R31）：纯函数 SSR，字符串输出，零外部 CDN，零内联脚本。
  *
@@ -573,6 +574,7 @@ export function renderDashboard(args: {
 
 export function renderTaskPage(args: {
   task: SrTask;
+  csrf?: string;
   steps: SrStep[];
   reports: ReportVersionSummary[];
   account?: { username: string; role: 'ADMIN' | 'USER'; displayName: string };
@@ -612,6 +614,7 @@ export function renderTaskPage(args: {
 <nav class="sr-crumbs"><a href="/">首页</a> / 任务 ${escapeHtml(task.subject)}</nav>
 <h1 class="sr-h1">${escapeHtml(task.subjectName)} <span class="sr-muted sr-mono">${escapeHtml(task.subject)}</span> ${badge(st.text, st.cls)}</h1>
 ${errorBox}
+${task.status === 'FAILED' && args.csrf ? `<form method="post" action="/tasks/${escapeHtml(task.taskId)}/resume"><input type="hidden" name="_csrf" value="${escapeHtml(args.csrf)}"><button class="sr-btn" type="submit">核验原检查点并继续此任务</button><p class="sr-muted small">保留原任务与调用；已发送但结果不明时先对账，不会自动重发。</p></form>` : ''}
 ${running ? '<div class="sr-alert sr-alert-blue">任务执行中，页面每 5 秒自动刷新。</div>' : ''}
 
 <section class="sr-card">
@@ -948,6 +951,8 @@ ${chatHtml}
 <form method="post" action="/reports/${escapeHtml(report.reportId)}/chat" class="sr-form sr-chat-form">
 <input type="hidden" name="_csrf" value="${escapeHtml(args.csrf)}">
 <input type="hidden" name="report_version" value="${report.version}">
+<input type="hidden" name="request_key" value="${randomUUID()}">
+<label><select name="intent_mode"><option value="REUSE">继续同内容原请求（刷新或断线后重试）</option><option value="NEW">明确发起新请求（新额度；不用于未知结果重试）</option></select></label>
 <div class="sr-field">
 <label for="sr-question">提问（解释 / 质疑 / 假设调整 / 资料不足，回答绑定当版报告）</label>
 <textarea id="sr-question" name="question" rows="3" maxlength="2000" required placeholder="例：估值章的 PE 假设为什么取 8 倍下限？"></textarea>
@@ -962,6 +967,8 @@ ${chatHtml}
 <form method="post" action="/reports/${escapeHtml(report.reportId)}/revise" class="sr-form">
 <input type="hidden" name="_csrf" value="${escapeHtml(args.csrf)}">
 <input type="hidden" name="report_version" value="${report.version}">
+<input type="hidden" name="request_key" value="${randomUUID()}">
+<label><select name="intent_mode"><option value="REUSE">继续同内容原请求（刷新或断线后重试）</option><option value="NEW">明确发起新请求（新额度；不用于未知结果重试）</option></select></label>
 <div class="sr-field">
 <label for="sr-revise-emphasis">新的关注点 / 修订说明</label>
 <textarea id="sr-revise-emphasis" name="emphasis" rows="2" maxlength="500" placeholder="例：补充对毛利率拐点的检验"></textarea>

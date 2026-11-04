@@ -1,3 +1,4 @@
+import { keepLeaseAlive, type ExecutionLease } from '../kernel/lease.js';
 import { researchJInputHash } from './validation.js';
 import { researchMaterial } from './requests.js';
 /**
@@ -24,6 +25,8 @@ import { canonicalSha256 } from '../canonical.js';
 import type { ModelCallContract, PlanAuthBudget, ResearchBusinessKey, AOutput, JOutput } from '../contracts.js';
 
 const HOLDER = `p2-int-${randomUUID()}`;
+let testLease: ExecutionLease;
+let testKeeper: ReturnType<typeof keepLeaseAlive>;
 const schema = `p2_int_${randomUUID().replaceAll('-', '').slice(0, 12)}`;
 const admin = createPool();
 let isolated: import('pg').Pool;
@@ -33,11 +36,13 @@ const store = new ArtifactStore('data/artifacts');
 test.before(async () => {
   await applySchema(admin, schema);
   isolated = createPool({ schema });
-  await acquireExecutorLock(isolated, HOLDER);
+  testLease = (await acquireExecutorLock(isolated, HOLDER)).lease;
+  testKeeper = keepLeaseAlive(isolated, testLease);
 });
 
 test.after(async () => {
-  try { await releaseExecutorLock(isolated, HOLDER); } catch { /* 已释放 */ }
+  await testKeeper?.stop();
+  try { await releaseExecutorLock(isolated, testLease); } catch { /* 已释放 */ }
   await isolated?.end().catch(() => {});
   await dropSchema(admin, schema);
   await admin.end();
@@ -81,7 +86,7 @@ test('P2 全链：真实材料组装 → 模拟 A/J → 清单 → 结论 → �
   const a = await runModelCall<AOutput>(isolated, {
     contract: contractA, budget: BUDGET,
     modelFn: async (ctx) => (await transport.dispatch(ctx.contract, aInput)) as AOutput,
-    simulated: true, holderId: HOLDER,
+    simulated: true, lease: testLease,
   });
   assert.equal(a.permit.state, 'SUCCEEDED');
   assert.equal(a.permit.simulated, true);
@@ -105,7 +110,7 @@ test('P2 全链：真实材料组装 → 模拟 A/J → 清单 → 结论 → �
   const j = await runModelCall<JOutput>(isolated, {
     contract: contractJ, budget: BUDGET,
     modelFn: async (ctx) => (await transport.dispatch(ctx.contract, { inputHash: jInputHash, subjectKind: 'STOCK' as const, aOutput: a.output, checklist })) as JOutput,
-    simulated: true, holderId: HOLDER,
+    simulated: true, lease: testLease,
   });
   assert.equal(j.permit.state, 'SUCCEEDED');
   assert.equal(j.output.verdicts.length, checklist.items.length, 'J 恰好逐项裁决');
@@ -136,7 +141,7 @@ test('P2 全链：真实材料组装 → 模拟 A/J → 清单 → 结论 → �
     () => runModelCall<AOutput>(isolated, {
       contract: contractA, budget: BUDGET,
       modelFn: async (ctx) => (await transport.dispatch(ctx.contract, aInput)) as AOutput,
-      simulated: true, holderId: HOLDER,
+      simulated: true, lease: testLease,
     }),
     (err: unknown) => (err as { code?: string }).code === 'BUSINESS_KEY_ALREADY_SENT',
     'send-once 拒绝',
@@ -166,14 +171,14 @@ test('P2 全链：宽基标的（ETF 七维）', async () => {
   };
   const a = await runModelCall<AOutput>(isolated, {
     contract, budget: BUDGET, modelFn: async (ctx) => (await transport.dispatch(ctx.contract, aInput)) as AOutput,
-    simulated: true, holderId: HOLDER,
+    simulated: true, lease: testLease,
   });
   const checklist = deriveChecklist(a.output, assembled.package.seals[0]!.manifestHash);
   const jInputHash = researchJInputHash(assembled.package, a.output, checklist);
   const j = await runModelCall<JOutput>(isolated, {
     contract: { ...contract, stage: 'J', inputHash: jInputHash }, budget: BUDGET,
     modelFn: async (ctx) => (await transport.dispatch(ctx.contract, { inputHash: jInputHash, subjectKind: 'BROAD_ETF' as const, aOutput: a.output, checklist })) as JOutput,
-    simulated: true, holderId: HOLDER,
+    simulated: true, lease: testLease,
   });
   const conclusion = await persistConclusion(isolated, {
     businessKey,

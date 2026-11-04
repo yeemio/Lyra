@@ -121,6 +121,7 @@ export interface PlanAuthBudget {
   maxModelCallsPerWeek: number;
   maxInputBytes: number; // 输入预算；超预算 INPUT_OVER_BUDGET 阻断（EK-4.4/4.5）
   maxInFlight: 2; // 并发上限（EK-2.3）
+  scopeLimits?: { weekly: number; postEvent: number }; // 显式授权；缺省冻结常态 60/10，不自动扩容
 }
 
 export type KernelErrorCode =

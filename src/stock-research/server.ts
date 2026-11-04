@@ -1,3 +1,7 @@
+import { resumeSrTask } from './store.js';
+import { KernelError } from '../contracts.js';
+import { withExecutionLease } from '../kernel/lease.js';
+import { createRevisionRequest } from './store-requests.js';
 /**
  * Lyra · sr 报告产品服务（R31）：SaaS 候选首版的唯一 HTTP 入口。
  *
@@ -369,7 +373,16 @@ const handleTaskPage: Handler = async (ctx) => {
   if (!task) return send(ctx.res, 404, renderErrorPage(404, '任务不存在或不属于当前账户。'));
   const steps = await listSteps(ctx.deps.srPool, taskId);
   const reports = await listReportVersionSummaries(ctx.deps.srPool, taskId);
-  send(ctx.res, 200, renderTaskPage({ task, steps, reports, account: { username: auth.username, role: auth.role, displayName: (await getAccount(ctx.deps.srPool, auth.accountId))?.displayName ?? auth.username } }));
+  send(ctx.res, 200, renderTaskPage({ task, steps, reports, csrf: auth.csrfToken, account: { username: auth.username, role: auth.role, displayName: (await getAccount(ctx.deps.srPool, auth.accountId))?.displayName ?? auth.username } }));
+};
+
+const handleTaskResume: Handler = async (ctx) => {
+  const auth = requireAuth(ctx); if (!auth) return;
+  const body = await readBody(ctx.req); if (!requireCsrf(ctx, body)) return;
+  const taskId = ctx.url.pathname.split('/')[2] ?? '';
+  try { await resumeSrTask(ctx.deps.srPool, auth.accountId, taskId); }
+  catch (error) { return send(ctx.res, 409, renderErrorPage(409, error instanceof Error ? error.message : String(error))); }
+  redirect(ctx.res, `/tasks/${taskId}`);
 };
 
 export function parseReportVersion(value: unknown, required = false): number | undefined {
@@ -434,13 +447,6 @@ const handleChatPost: Handler = async (ctx) => {
   if (!question) return send(ctx.res, 400, renderErrorPage(400, '问题不能为空。'));
   const account = await getAccount(ctx.deps.srPool, auth.accountId);
   const quota = account?.quota ?? defaultTrialQuota();
-  if (ctx.deps.config.mode !== 'local') {
-    const callReserve = await reserveQuota(ctx.deps.srPool, auth.accountId, 'MODEL_CALL', quota.monthlyModelCalls);
-    if (!callReserve.ok) {
-      send(ctx.res, 429, renderErrorPage(429, `本月模型调用额度已用完（${callReserve.used}/${callReserve.limit}）。报告阅读不受影响。`));
-      return;
-    }
-  }
   const deps = ctx.deps;
   try {
     const { askReportQuestion } = await import('./engine.js');
@@ -458,11 +464,15 @@ const handleChatPost: Handler = async (ctx) => {
         reportVersion: report.version,
         question,
         questionKind: classifyQuestion(question),
+        ...(body.request_key === undefined || body.intent_mode === 'REUSE' ? {} : { requestKey: String(body.request_key) }),
+        ...(deps.config.mode === 'local' ? {} : { quotaLimit: quota.monthlyModelCalls }),
       },
     );
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    send(ctx.res, 500, renderErrorPage(500, `回答失败：${message.slice(0, 300)}。额度未消耗成功调用；请重试或稍后再问。`));
+    const code = err instanceof KernelError ? err.code : 'REQUEST_FAILED';
+    const status = code === 'ACCOUNT_QUOTA_EXCEEDED' ? 429 : ['REQUEST_PENDING','REQUEST_UNKNOWN','REQUEST_INTENT_CONFLICT','EXECUTION_LOCK_HELD'].includes(code) ? 409 : 500;
+    send(ctx.res, status, renderErrorPage(status, `请求状态：${message.slice(0, 300)}。重投同一请求沿用原调用；未知结果保留预约及可能费用，须先核实原尝试。`));
     return;
   }
   redirect(ctx.res, `/reports/${reportId}?v=${report.version}#chat`);
@@ -483,30 +493,12 @@ const handleRevisePost: Handler = async (ctx) => {
   const useNewCutoff = String(body.new_cutoff ?? '') === '1';
   const account = await getAccount(ctx.deps.srPool, auth.accountId);
   const quota = account?.quota ?? defaultTrialQuota();
-  const reserve = ctx.deps.config.mode === 'local'
-    ? { ok: true, used: 0, limit: 0, period: 'local' }
-    : await reserveQuota(ctx.deps.srPool, auth.accountId, 'REPORT_TASK', quota.monthlyReportTasks);
-  if (!reserve.ok) {
-    send(ctx.res, 429, renderErrorPage(429, `本月研究任务额度已用完（${reserve.used}/${reserve.limit}）。`));
-    return;
-  }
-  const cutoff = useNewCutoff ? new Date().toISOString() : report.cutoff; // 不勾选则沿用原截点（同资料下的假设修订）
-  const idemKey = sha256([auth.accountId, report.subject, report.focus, 'REVISE', cutoff.slice(0, 10), emphasis ?? '', Date.now()].join('|'));
-  const { task } = await createTask(ctx.deps.srPool, {
-    accountId: auth.accountId,
-    subject: report.subject,
-    subjectName: report.subjectName,
-    focus: report.focus,
-    emphasis,
-    horizon: report.horizon,
-    cutoff,
-    idemKey,
-    revisedFromTaskId: report.taskId,
-    methodVersion: 'sr-m1',
-    adapterVersion: 'pool-frozen-1',
-    planAuthVersion: 'sr-auth-1',
+  const { task } = await createRevisionRequest(ctx.deps.srPool, {
+    accountId: auth.accountId, report, emphasis, newCutoff: useNewCutoff,
+    ...(body.request_key === undefined || body.intent_mode === 'REUSE' ? {} : { key: String(body.request_key) }),
+    ...(ctx.deps.config.mode === 'local' ? {} : { quotaLimit: quota.monthlyReportTasks }),
+    methodVersion: 'sr-m1', adapterVersion: 'pool-frozen-1', planAuthVersion: 'sr-auth-1',
   });
-  await recordUsageEvent(ctx.deps.srPool, auth.accountId, 'TASK_REVISED', { taskId: task.taskId, from: report.taskId }, task.taskId);
   redirect(ctx.res, `/tasks/${task.taskId}`);
 };
 
@@ -735,6 +727,7 @@ export function createSrServer(deps: SrFullDeps): Server {
     { method: 'GET', pattern: /^\/api\/strategies\/601919\/sources\/[a-z0-9-]+$/, handler: handleRealStrategySource },
     { method: 'POST', pattern: /^\/tasks$/, handler: handleTaskCreate },
     { method: 'GET', pattern: /^\/tasks\/[0-9a-f-]+$/, handler: handleTaskPage },
+    { method: 'POST', pattern: /^\/tasks\/[0-9a-f-]+\/resume$/, handler: handleTaskResume },
     { method: 'GET', pattern: /^\/reports\/[0-9a-f-]+$/, handler: handleReportPage },
     { method: 'GET', pattern: /^\/reports\/[0-9a-f-]+\/pdf$/, handler: handleReportPdf },
     { method: 'POST', pattern: /^\/reports\/[0-9a-f-]+\/chat$/, handler: handleChatPost },
@@ -785,37 +778,26 @@ export interface SrWorkerHandle {
 }
 
 export async function startSrWorker(deps: SrFullDeps): Promise<SrWorkerHandle> {
-  const holder = `sr-worker-${process.pid}-${randomUUID().slice(0, 8)}`;
-  await acquireSrEngineLock(deps.srPool, holder);
-  await srBootRecovery(deps.srPool); // 非闭合调用 → RECONCILING（页面如实展示，零自动调用）
+  await withExecutionLease(deps.srPool, 'sr', async () => { await srBootRecovery(deps.srPool); });
   let stopped = false;
-  const loop = async () => {
+  const loop = (async () => {
     while (!stopped) {
       try {
-        await heartbeatSrEngineLock(deps.srPool, holder);
-        const task = await claimQueuedTask(deps.srPool, holder);
-        if (!task) {
-          await new Promise((r) => setTimeout(r, 1500));
-          continue;
-        }
-        await runSrTask(
-          { srPool: deps.srPool, dataPool: deps.dataPool, transport: deps.transport, budget: deps.budget, outputDir: deps.outputDir ?? SR_OUTPUT_DIR },
-          task.taskId,
-        );
-        await recordUsageEvent(deps.srPool, task.accountId, 'TASK_FINISHED', { taskId: task.taskId }, task.taskId);
+        await withExecutionLease(deps.srPool, 'sr', async ({ lease }) => {
+          const task = await claimQueuedTask(deps.srPool, lease);
+          if (!task) return;
+          await runSrTask({ srPool: deps.srPool, dataPool: deps.dataPool, transport: deps.transport,
+            budget: deps.budget, outputDir: deps.outputDir ?? SR_OUTPUT_DIR, lease }, task.taskId);
+          await recordUsageEvent(deps.srPool, task.accountId, 'TASK_FINISHED', { taskId: task.taskId }, task.taskId);
+        });
       } catch (err) {
-        // 引擎自身已把任务落 FAILED；此处只避免 worker 崩溃
-        if (!stopped) await new Promise((r) => setTimeout(r, 2000));
+        // A lost lease ends this worker; a stale worker never silently upgrades its generation.
+        if (err instanceof KernelError && ['EXECUTION_LOCK_HELD','EXECUTION_LEASE_REQUIRED'].includes(err.code)) stopped = true;
       }
+      if (!stopped) await new Promise((r) => setTimeout(r, 1500));
     }
-  };
-  void loop();
-  return {
-    stop: async () => {
-      stopped = true;
-      await releaseSrEngineLock(deps.srPool, holder).catch(() => undefined);
-    },
-  };
+  })();
+  return { stop: async () => { stopped = true; await loop; } };
 }
 
 // ===== 启动入口（CLI：node --import tsx src/stock-research/server.ts）=====

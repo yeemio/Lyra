@@ -63,7 +63,7 @@ async function insertPermit(row: {
       randomUUID(), row.stage, row.subject, row.researchKind, row.cutoff,
       createHash('sha256').update(`${row.subject}:${row.researchKind}:${row.stage}`).digest('hex'),
       row.deadline, row.state,
-      row.state === 'PREPARED' ? null : new Date('2026-10-20T10:00:00Z'),
+      row.state === 'PREPARED' ? null : new Date((row.createdAt ?? new Date('2026-10-20T09:00:00Z')).getTime() + 3_600_000),
       row.settledAt, row.failCode, row.simulated ?? true,
       row.createdAt ?? new Date('2026-10-20T09:00:00Z'),
     ],
@@ -117,9 +117,9 @@ before(async () => {
   // key3（600003 POST_EVENT）：A SUCCEEDED 但迟到（LATE_COMPLETED），J 窗内 → 完成但计 1 次未按窗
   await insertPermit({ subject: '600003', researchKind: 'POST_EVENT', stage: 'A', state: 'SUCCEEDED', failCode: 'LATE_COMPLETED', settledAt: new Date('2026-10-20T12:30:00Z'), deadline, cutoff });
   await insertPermit({ subject: '600003', researchKind: 'POST_EVENT', stage: 'J', state: 'SUCCEEDED', failCode: null, settledAt: new Date('2026-10-20T11:30:00Z'), deadline, cutoff });
-  // key4（600004 WEEKLY）：A UNKNOWN → unknown=1
-  await insertPermit({ subject: '600004', researchKind: 'WEEKLY', stage: 'A', state: 'UNKNOWN', failCode: 'SILENCE_AFTER_SEND', settledAt: new Date('2026-10-20T11:00:00Z'), deadline, cutoff, simulated: false });
-  // 窗外行（不计入）：上周创建
+  // key4（600004 WEEKLY）：A 超时 UNKNOWN，仍计实际发送和未按窗完成。
+  await insertPermit({ subject: '600004', researchKind: 'WEEKLY', stage: 'A', state: 'UNKNOWN', failCode: 'DEADLINE_EXCEEDED', settledAt: new Date('2026-10-20T12:01:00Z'), deadline, cutoff, simulated: false });
+  // 窗外行（不计入）：上周创建且上周发送
   await insertPermit({ subject: '600009', researchKind: 'WEEKLY', stage: 'A', state: 'SUCCEEDED', failCode: null, settledAt: new Date('2026-10-10T11:00:00Z'), deadline: new Date('2026-10-10T12:00:00Z'), cutoff: new Date('2026-10-10T10:00:00Z'), createdAt: new Date('2026-10-10T09:00:00Z') });
 
   // ---- seal_manifest：2 行本周前（GAP_A），3 行本周（GAP_A / GAP_A+GAP_B / GAP_B）----
@@ -190,12 +190,12 @@ test('SC-11.4 真实采集：permit 各态 / 按窗完成 / 缺口差 / 封存�
   assert.equal(detail.permits.postEventCalls, 2);
   assert.equal(detail.permits.researchKeys, 4);
   assert.equal(detail.permits.researchKeysOnWindowCompleted, 2);
-  assert.equal(detail.permits.notOnWindow, 2);
+  assert.equal(detail.permits.notOnWindow, 3);
   assert.equal(detail.permits.sendOnceRejections, null, 'send-once 拒绝库面不可观测 → null（不猜零）');
 
   // 周报端口字段映射
   assert.deepEqual(report.windowCompletion, { onWindowCompleted: 2, total: 4 });
-  assert.equal(report.notOnWindow, 2);
+  assert.equal(report.notOnWindow, 3);
   assert.equal(report.unknown, 1);
   assert.equal(report.paused, 0);
   assert.equal(report.blocked, 1);

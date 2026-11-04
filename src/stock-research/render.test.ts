@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import type { ChatMessage, ReportDocument, ReportSection, SrTask } from './contracts.js';
-import { renderDashboard, renderLoginPage, renderMarkdown, renderReportPage, renderErrorPage } from './render.js';
+import { renderDashboard, renderLoginPage, renderMarkdown, renderReportPage, renderTaskPage, renderErrorPage } from './render.js';
 
 function section(p: Partial<ReportSection>): ReportSection {
   return { key: 'summary', title: '首页与研究摘要', narrative: '', findings: [], tables: [], citations: [], gaps: [], ...p };
@@ -121,6 +121,27 @@ const pool = {
   ],
   etfs: [{ code: '510300', name: '沪深300ETF' }],
 };
+
+it('PR4 表单默认重投原请求；新意图键和原任务恢复保留 CSRF（仅内容断言）', () => {
+  const doc = report('synthetic');
+  const html = () => renderReportPage({ report: doc, versions: [doc], tablesById: {}, messages: [], csrf: 'csrf-synthetic' });
+  const first = html(), second = html();
+  const keys = (value: string) => [...value.matchAll(/name="request_key" value="([^"]+)"/g)].map((match) => match[1]);
+  assert.equal(keys(first).length, 2);
+  assert.equal(new Set([...keys(first), ...keys(second)]).size, 4, '显式新意图用独立键，刷新默认不采纳新键');
+  assert.equal((first.match(/name="intent_mode"><option value="REUSE">/g) ?? []).length, 2);
+  assert.equal((first.match(/<option value="NEW">/g) ?? []).length, 2);
+  assert.equal((first.match(/name="report_version" value="1"/g) ?? []).length, 2);
+  const forms = [...first.matchAll(/<form method="post" action="\/reports\/[^\"]+\/(?:chat|revise)"[^>]*>[\s\S]*?<\/form>/g)];
+  assert.equal(forms.length, 2);
+  for (const form of forms) assert.ok(form[0].includes('name="_csrf" value="csrf-synthetic"'));
+  const task = srTask({ status: 'FAILED', error: { code: 'REQUEST_UNKNOWN', message: '<untrusted>' } });
+  const failed = renderTaskPage({ task, steps: [], reports: [], csrf: 'csrf-synthetic' });
+  assert.ok(failed.includes(`action="/tasks/${task.taskId}/resume"`));
+  assert.ok(failed.includes('name="_csrf" value="csrf-synthetic"') && failed.includes('&lt;untrusted&gt;'));
+  assert.ok(!renderTaskPage({ task: srTask(), steps: [], reports: [], csrf: 'csrf-synthetic' }).includes('/resume'));
+  assert.ok(!renderTaskPage({ task, steps: [], reports: [] }).includes('/resume'));
+});
 
 function dashboardHtml(tasks: SrTask[], usedTask = 1, usedCall = 20): string {
   return renderDashboard({

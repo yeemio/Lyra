@@ -27,15 +27,20 @@ import { calendarCoverage, isTradingDay, loadTradeCalendarTable, tradingDaysBetw
 import { ArtifactStore } from '../artifacts/store.js';
 import { createPool } from '../db/pool.js';
 import { canonicalSha256 } from '../canonical.js';
+import { withTransaction } from '../db/exec.js';
+import { assertLease } from '../kernel/lease.js';
+import { validatePostEventContext } from '../research/inheritance.js';
+import { type ResearchSnapshot } from '../research/gate-m-checkpoint.js';
 import { validDispositions, type AOutput, type JOutput, type PlanAuthBudget, type SubjectKind } from '../contracts.js';
 import { readConclusion } from '../db/conclusion.js';
 import { persistResearchConclusion } from '../research/trace.js';
 import { buildARequest, buildJRequest } from '../research/requests.js';
 import { validateResearchA, validateResearchJ } from '../research/validation.js';
 import { backfillSettlement } from '../conclusion/settlement.js';
-import { runModelCall } from '../kernel/executor.js';
-import { acquireExecutorLock, heartbeatExecutorLock, releaseExecutorLock } from '../kernel/lock.js';
-import { selectTransport, UnauthorizedTransport, type ModelTransport } from '../kernel/transport.js';
+import { runGateM } from '../research/gate-m.js';
+import { acquireExecutorLock, releaseExecutorLock } from '../kernel/lock.js';
+import { keepLeaseAlive, type ExecutionLease } from '../kernel/lease.js';
+import { preflightTransport, selectTransport, UnauthorizedTransport, type ModelTransport } from '../kernel/transport.js';
 import { SolTransport } from '../kernel/sol-transport.js';
 import { deriveChecklist } from '../research/checklist.js';
 import { assembleResearchInput, type InputBudget } from '../research/inputs.js';
@@ -57,6 +62,7 @@ import {
 import {
   buildSchedulePlan,
   persistAdmissions,
+  loadAdmissions,
   persistSchedulePlan,
 } from './plan.js';
 import { nightSubjects, rotationTableFromPool, type PoolOrderSource, type RotationSubject } from './weekly.js';
@@ -137,6 +143,7 @@ async function mergedPostEventsOfDay(
   dataPool: Pool,
   date: string,
   now: Date,
+  excluded: ReadonlySet<string> = new Set(),
 ): Promise<{ merged: MergedPostEvent[]; skippedSubjects: { subject: string; code: string }[]; anchors: Map<string, PostEventTriggerEvent> }> {
   const dayStart = shanghaiInstant(date, '00:00:00');
   const dayEnd = new Date(dayStart.getTime() + 86_400_000);
@@ -149,6 +156,7 @@ async function mergedPostEventsOfDay(
   const admitted: AdmissionRecord[] = [];
   const byId = new Map<string, PostEventTriggerEvent>();
   for (const row of res.rows) {
+    if (excluded.has(row.event_id)) continue;
     if (!/^\d{6}$/.test(row.subject)) {
       skippedSubjects.push({ subject: row.subject, code: 'EVENT_SUBJECT_MALFORMED' });
       continue;
@@ -309,7 +317,7 @@ export interface NightlyRunOutcome {
 
 interface CommitContext {
   deadline: string;
-  holderId: string;
+  lease: ExecutionLease;
   /** 结论/permit 版本轴（skeleton 或 R30 真实身份，由 runNightly 按传输推导）。 */
   planAuthVersion: string;
   transport: ModelTransport;
@@ -321,80 +329,17 @@ async function commitWeeklySubject(
   ctx: CommitContext,
   plan: NightlyEntryPlan,
 ): Promise<{ inputHash: string; inputBytes: number; permitIds: string[]; conclusionId: string; note: string }> {
-  const assembled = await assembleResearchInput(deps.dataPool, deps.store, {
-    subjectKind: plan.subjectKind,
-    subject: plan.subject,
-    cutoff: plan.cutoff,
-    budget: NIGHTLY_INPUT_BUDGET,
-    versions: {
-      methodVersion: SKELETON_METHOD_VERSION,
-      adapterVersion: SKELETON_ADAPTER_VERSION,
-      planAuthVersion: ctx.planAuthVersion,
-    },
-    researchKind: 'WEEKLY',
-    poolInfoFile: ctx.poolInfoFile,
+  const done = await runGateM({ ...deps, transport: ctx.transport }, {
+    subjectKind: plan.subjectKind, subject: plan.subject, cutoff: plan.cutoff, execute: true,
+    budget: { ...SKELETON_BUDGET, planAuthVersion: ctx.planAuthVersion },
+    versions: { methodVersion: SKELETON_METHOD_VERSION, adapterVersion: SKELETON_ADAPTER_VERSION, planAuthVersion: ctx.planAuthVersion },
+    inputBudget: NIGHTLY_INPUT_BUDGET, poolInfoFile: ctx.poolInfoFile, deadline: ctx.deadline, lease: ctx.lease,
+    validatePackage: false,
   });
-  const businessKey = assembled.package.businessKey;
-  const manifest = assembled.package.seals[0];
-  if (manifest === undefined) throw new NightlyError('SEAL_MISSING', `${plan.subject} 输入包无封存 manifest`);
-  const pkg = assembled.package;
-  const simulated = ctx.transport.describe().simulated;
-  const aRequest = buildARequest(pkg, simulated);
-  const a = await runModelCall<AOutput>(deps.execPool, {
-    contract: {
-      businessKey,
-      stage: 'A',
-      inputHash: assembled.inputHash,
-      inputBytes: aRequest.inputBytes,
-      methodVersion: SKELETON_METHOD_VERSION,
-      planAuthVersion: ctx.planAuthVersion,
-      deadline: ctx.deadline,
-    },
-    budget: SKELETON_BUDGET,
-    modelFn: async (c) =>
-      validateResearchA(await ctx.transport.dispatch(c.contract, aRequest.payload), pkg, simulated),
-    simulated: ctx.transport.describe().simulated,
-    holderId: ctx.holderId,
-  });
-  const checklist = deriveChecklist(a.output, manifest.manifestHash);
-  const jRequest = buildJRequest(pkg, a.output, checklist, simulated);
-  const jInputHash = jRequest.inputHash;
-  const j = await runModelCall<JOutput>(deps.execPool, {
-    contract: {
-      businessKey,
-      stage: 'J',
-      inputHash: jInputHash,
-      inputBytes: jRequest.inputBytes,
-      methodVersion: SKELETON_METHOD_VERSION,
-      planAuthVersion: ctx.planAuthVersion,
-      deadline: ctx.deadline,
-    },
-    budget: SKELETON_BUDGET,
-    modelFn: async (c) =>
-      validateResearchJ(await ctx.transport.dispatch(c.contract, jRequest.payload), pkg, a.output, checklist, simulated),
-    simulated: ctx.transport.describe().simulated,
-    holderId: ctx.holderId,
-  });
-  const conclusion = await persistResearchConclusion(deps.execPool, deps.store, {
-    businessKey,
-    methodVersion: SKELETON_METHOD_VERSION,
-    adapterVersion: SKELETON_ADAPTER_VERSION,
-    planAuthVersion: ctx.planAuthVersion,
-    aOutput: a.output,
-    researchInput: pkg,
-    checklist,
-    jOutput: j.output,
-    manifest,
-    inheritance: null,
-    changeReason: j.output.changedFromA ? j.output.changeReason : null,
-  });
-  return {
-    inputHash: assembled.inputHash,
-    inputBytes: assembled.inputBytes,
-    permitIds: [a.permit.permitId, j.permit.permitId],
-    conclusionId: conclusion.conclusionId,
-    note: '周度轮转（无继承面，STANDALONE）',
-  };
+  if (done.mode !== 'execute') throw new NightlyError('EXECUTION_MODE_INVALID', 'Weekly commit returned a preview');
+  return { inputHash: done.assembled.inputHash, inputBytes: done.assembled.inputBytes,
+    permitIds: [done.permits.a!.permitId, done.permits.j.permitId], conclusionId: done.conclusion.conclusionId,
+    note: '周度轮转（原业务检查点可核验恢复；STANDALONE）' };
 }
 
 // ===== 主循环 =====
@@ -446,7 +391,11 @@ export async function runNightly(deps: NightlyDeps, opts: NightlyOptions): Promi
   const weekStart = shanghaiInstant(mondayOfWeek(opts.date), '00:00:00').toISOString();
 
   // 2) 当日事件（SC-3.2 合并）
-  const { merged, skippedSubjects, anchors } = await mergedPostEventsOfDay(deps.dataPool, opts.date, now);
+  const previousAdmissions = mode === 'commit' ? (await loadAdmissions(deps.execPool)).filter((a) =>
+    a.planId === `plan:${SKELETON_PLAN_AUTH_VERSION}:${table.poolVersion}` && a.started &&
+    a.queueClass === 'POST_EVENT' && shanghaiWall(new Date(a.cutoff)).date === opts.date) : [];
+  const excluded = new Set(previousAdmissions.flatMap((a) => a.triggerEventIds));
+  const { merged, skippedSubjects, anchors } = await mergedPostEventsOfDay(deps.dataPool, opts.date, now, excluded);
   for (const m of merged) m.inPool = poolStocks.has(m.subject);
 
   log(
@@ -461,9 +410,10 @@ export async function runNightly(deps: NightlyDeps, opts: NightlyOptions): Promi
   );
 
   // 3) 预算闸（SC-8.1/8.4）：本周已用量按 exec_permit 真实计数（dry 不增量，如实注明）
+  const budgetWeekStart = mode === 'commit' ? (await deps.execPool.query<{ start: Date }>("select date_trunc('week',clock_timestamp() at time zone 'Asia/Shanghai') at time zone 'Asia/Shanghai' as start")).rows[0]!.start.toISOString() : weekStart;
   const usedRes = await deps.execPool.query<{ research_kind: string; n: string }>(
-    'select research_kind, count(*)::text as n from exec_permit where created_at >= $1 group by research_kind',
-    [weekStart],
+    "select research_kind,count(*)::text as n from exec_permit where sent_at >= $1::timestamptz and sent_at < $1::timestamptz+interval '7 days' group by research_kind",
+    [budgetWeekStart],
   );
   let weeklyUsed = 0;
   let postEventUsed = 0;
@@ -475,7 +425,7 @@ export async function runNightly(deps: NightlyDeps, opts: NightlyOptions): Promi
   const postEventUsedBefore = postEventUsed;
   const guard0 = budgetGuard({ weeklyUsed, postEventUsed, postEventAuthCap: POST_EVENT_BASELINE_PER_WEEK });
   const budgetView: NightlyBudgetView = {
-    weekStart,
+    weekStart: budgetWeekStart,
     weeklyUsedBefore,
     postEventUsedBefore,
     guardOk: guard0.ok,
@@ -494,7 +444,7 @@ export async function runNightly(deps: NightlyDeps, opts: NightlyOptions): Promi
   const transport = deps.transport ?? selectTransport({ provider });
   const transportSimulated = transport.describe().simulated;
   const planAuthVersion = transportSimulated ? SKELETON_PLAN_AUTH_VERSION : REAL_PLAN_AUTH_VERSION;
-  if (transportSimulated && provider === 'real') {
+  if (transport instanceof UnauthorizedTransport) {
     log(
       `[lyra-nightly] transport=real → UnauthorizedTransport（真实模型通道未授权，Gate-M 有界授权另立合同）；` +
         `本骨架对全部标的记 BLOCKED/MODEL_PROVIDER_UNAUTHORIZED，不组装、不落 permit、不调用`,
@@ -503,12 +453,6 @@ export async function runNightly(deps: NightlyDeps, opts: NightlyOptions): Promi
 
   // 5) commit 前置：晚间执行截止（SC-3.5 的 23:30；EK-6.1 显式计算，不从模板继承）
   const deadline = shanghaiInstant(opts.date, WEEKLY_DEADLINE).toISOString();
-  if (mode === 'commit' && now.getTime() >= new Date(deadline).getTime()) {
-    throw new NightlyError(
-      'NIGHTLY_COMMIT_DEADLINE_PAST',
-      `${opts.date} 晚间截止 ${deadline} 已过（真实时钟 ${now.toISOString()}）：commit 模式只用于当晚在窗运行；历史夜请用 --dry`,
-    );
-  }
 
   // 条目队列：事件后（SC-5.1 优先）→ 轮转
   interface Runnable {
@@ -534,6 +478,23 @@ export async function runNightly(deps: NightlyDeps, opts: NightlyOptions): Promi
   const pushEntry = (e: NightlyEntryResult): number => entries.push(e) - 1;
 
   // 池外事件标的：准入已合并登记，研究面 SKIPPED（研究宇宙 = 冻结池 30 标的，R24）
+  for (const admission of previousAdmissions) {
+    if ((admission.subjectKind !== 'STOCK' && admission.subjectKind !== 'BROAD_ETF') || admission.researchKind !== 'POST_EVENT') throw new NightlyError('NIGHTLY_ADMISSION_INVALID');
+    const saved = (await deps.execPool.query<{ snapshot: ResearchSnapshot }>(`select snapshot from research_execution
+      where business_key->>'subject'=$1 and business_key->>'researchKind'='POST_EVENT'
+        and (business_key->>'cutoff')::timestamptz=$2::timestamptz`, [admission.subject, admission.cutoff])).rows[0];
+    let anchor = saved ? validatePostEventContext(saved.snapshot.assembled.package)?.event ?? null : null;
+    if (!anchor) {
+      const row = (await deps.dataPool.query<EventRow>(`select event_id,subject,type,subtype,event_time,evidence_fact_id,attrs
+        from events where event_id=any($1::text[]) and event_time=$2::timestamptz order by event_id limit 1`, [admission.triggerEventIds, admission.cutoff])).rows[0];
+      if (row) anchor = { eventId: row.event_id, subject: row.subject, type: row.type, subtype: row.subtype,
+        eventTime: row.event_time.toISOString(), evidenceFactId: row.evidence_fact_id, attrs: row.attrs as Record<string, unknown> };
+    }
+    if (!runnable.some((r) => r.plan.entryId === admission.admissionId)) runnable.push({ plan: {
+      entryId: admission.admissionId, queueClass: admission.queueClass, subjectKind: admission.subjectKind,
+      subject: admission.subject, researchKind: admission.researchKind, cutoff: admission.cutoff,
+      detectedAt: admission.detectedAt, triggerEventIds: admission.triggerEventIds }, anchor });
+  }
   for (const m of merged.filter((x) => !x.inPool)) {
     const plan: NightlyEntryPlan = {
       entryId: `adm:POST_EVENT:STOCK:${m.subject}:${m.cutoff}`,
@@ -579,18 +540,33 @@ export async function runNightly(deps: NightlyDeps, opts: NightlyOptions): Promi
     });
   }
 
-  // 6) 执行（holder 纪律：commit 整晚持锁，条目间心跳）
-  const holderId = `nightly-skeleton-${randomUUID()}`;
-  let holderHeld = false;
-  if (mode === 'commit') {
-    await acquireExecutorLock(deps.execPool, holderId);
-    holderHeld = true;
+  if (mode === 'commit' && now.getTime() >= Date.parse(deadline)) {
+    // Late deterministic publication is allowed only when every queued A/J already has a successful checkpoint.
+    // New/unfinished work retains the scheduling deadline, in addition to the database SENT guard.
+    for (const { plan } of runnable) {
+      const done = await deps.execPool.query<{ n: string }>(`select count(*)::text as n from exec_permit
+        where subject_kind=$1 and subject=$2 and research_kind=$3 and cutoff=$4::timestamptz
+          and state='SUCCEEDED' and response_checkpoint is not null and response_hash is not null`,
+      [plan.subjectKind, plan.subject, plan.researchKind, plan.cutoff]);
+      if (Number(done.rows[0]!.n) !== 2) throw new NightlyError('NIGHTLY_COMMIT_DEADLINE_PAST', '晚间截止已过，仍有缺少成功 A/J 检查点的任务');
+    }
   }
+
+  // 6) 执行（holder 纪律：commit 整晚持锁，条目间心跳）
+  const schedulePlan = buildSchedulePlan({ planAuthVersion,
+    poolInfo: { frozenAt: poolOrder.frozenAt, stocks: poolOrder.stocks, etfs: poolOrder.etfs }, createdAt: now.toISOString() });
+  const holderId = `nightly-skeleton-${randomUUID()}`;
+  const lease = mode === 'commit' ? (await acquireExecutorLock(deps.execPool, holderId)).lease : undefined;
+  const keeper = lease ? keepLeaseAlive(deps.execPool, lease) : undefined;
+  const ownedWrite = <T>(fn: (tx: Pool) => Promise<T>) => withTransaction(deps.execPool, async (tx) => {
+    await assertLease(tx, lease!, true); const value = await fn(tx as unknown as Pool); await assertLease(tx, lease!); return value;
+  });
   const admissionRecords: AdmissionRecord[] = [];
   let permitsCreated = 0;
   let conclusionsCreated = 0;
   try {
-    const ctx: CommitContext = { deadline, holderId, transport, poolInfoFile, planAuthVersion };
+    if (mode === 'commit') await ownedWrite((tx) => persistSchedulePlan(tx, schedulePlan));
+    const ctx: CommitContext = { deadline, lease: lease!, transport, poolInfoFile, planAuthVersion };
     for (let i = 0; i < runnable.length; i += 1) {
       const r = runnable[i] as Runnable;
       const plan = r.plan;
@@ -610,8 +586,10 @@ export async function runNightly(deps: NightlyDeps, opts: NightlyOptions): Promi
       }
 
       // 预算闸复查（commit 模式下逐条目以真实增量重估）
-      const guard = budgetGuard({ weeklyUsed, postEventUsed, postEventAuthCap: POST_EVENT_BASELINE_PER_WEEK });
-      if (!guard.ok && (plan.researchKind === 'POST_EVENT' ? guard.scope === 'POST_EVENT' : guard.scope === 'WEEKLY')) {
+      const guard = budgetGuard({ weeklyUsed, postEventUsed, postEventAuthCap: POST_EVENT_BASELINE_PER_WEEK,
+        scope: plan.researchKind === 'POST_EVENT' ? 'POST_EVENT' : 'WEEKLY', requiredCalls: 2 });
+      // Commit admission is enforced atomically with SENT; an existing A/J checkpoint may need zero/one new calls.
+      if (mode === 'dry' && !guard.ok) {
         const code = guard.scope === 'POST_EVENT' ? 'BUDGET_STOPPED_POST_EVENT' : 'BUDGET_DEFERRED';
         const idx = pushEntry({
           ...base(plan),
@@ -644,13 +622,20 @@ export async function runNightly(deps: NightlyDeps, opts: NightlyOptions): Promi
         continue;
       }
 
-      // commit：单标的失败不中断整晚（SR-10.4 形态），如实记 FAILED 具名
+      // Persist admission before execution; actual receipts, including a partially failed chain, are reconciled below.
+      await keeper!.assert();
+      const receiptArgs = [plan.subjectKind, plan.subject, plan.researchKind, plan.cutoff];
+      const receipts = async () => (await deps.execPool.query<{ permit_id: string; sent_at: Date | null }>(
+        'select permit_id,sent_at from exec_permit where subject_kind=$1 and subject=$2 and research_kind=$3 and cutoff=$4', receiptArgs)).rows;
+      const beforeReceipts = await receipts();
+      const beforeConclusion = await deps.execPool.query("select conclusion_id from conclusion where business_key->>'subjectKind'=$1 and business_key->>'subject'=$2 and business_key->>'researchKind'=$3 and (business_key->>'cutoff')::timestamptz=$4::timestamptz", receiptArgs);
+      await ownedWrite((tx) => persistAdmissions(tx, schedulePlan.planId, [admissionRecordOf(plan, true, beforeReceipts.some((p) => p.sent_at !== null), null)]));
       try {
         const done =
           plan.researchKind === 'POST_EVENT'
             ? await commitPostEvent(deps, ctx, plan, r.anchor, { now, weekStart })
             : await commitWeeklySubject(deps, ctx, plan);
-        const idx = pushEntry({
+        pushEntry({
           ...base(plan),
           status: 'PASS',
           code: null,
@@ -660,18 +645,25 @@ export async function runNightly(deps: NightlyDeps, opts: NightlyOptions): Promi
           permitIds: done.permitIds,
           conclusionId: done.conclusionId,
         });
-        permitsCreated += done.permitIds.length;
-        conclusionsCreated += 1;
-        if (plan.researchKind === 'POST_EVENT') postEventUsed += done.permitIds.length;
-        else weeklyUsed += done.permitIds.length;
+        if (beforeConclusion.rowCount === 0) conclusionsCreated += 1;
         admissionRecords.push(admissionRecordOf(plan, true, true, null));
-        log(entryLine(entries[idx] as NightlyEntryResult, seq));
       } catch (error) {
-        const idx = pushEntry({ ...base(plan), status: 'FAILED', code: errorCode(error), detail: errorMessage(error) });
+        pushEntry({ ...base(plan), status: 'FAILED', code: errorCode(error), detail: errorMessage(error) });
         admissionRecords.push(admissionRecordOf(plan, true, false, null));
-        log(entryLine(entries[idx] as NightlyEntryResult, seq));
       }
-      if (holderHeld) await heartbeatExecutorLock(deps.execPool, holderId).catch(() => {});
+      const afterReceipts = await receipts();
+      permitsCreated += afterReceipts.filter((p) => !beforeReceipts.some((b) => b.permit_id === p.permit_id)).length;
+      const lastEntry = entries[entries.length - 1]!;
+      lastEntry.permitIds = afterReceipts.map((p) => p.permit_id);
+      const lastAdmission = admissionRecords[admissionRecords.length - 1]!;
+      lastAdmission.sent = afterReceipts.some((p) => p.sent_at !== null);
+      await keeper!.assert();
+      await ownedWrite((tx) => persistAdmissions(tx, schedulePlan.planId, [lastAdmission]));
+      log(entryLine(lastEntry, seq));
+      const actualUsage = await deps.execPool.query<{ research_kind: string; n: string }>(
+        "select research_kind,count(*)::text as n from exec_permit where sent_at >= $1::timestamptz and sent_at < $1::timestamptz+interval '7 days' group by research_kind", [budgetWeekStart]);
+      weeklyUsed = actualUsage.rows.filter((x) => x.research_kind !== 'POST_EVENT').reduce((n, x) => n + Number(x.n), 0);
+      postEventUsed = actualUsage.rows.filter((x) => x.research_kind === 'POST_EVENT').reduce((n, x) => n + Number(x.n), 0);
     }
 
     // 7) 调度落档（仅 commit）：W17 计划 + 本晚准入（blocked 带 BLOCKED: 标注，供周末指标采集）
@@ -681,15 +673,18 @@ export async function runNightly(deps: NightlyDeps, opts: NightlyOptions): Promi
         poolInfo: { frozenAt: poolOrder.frozenAt, stocks: poolOrder.stocks, etfs: poolOrder.etfs },
         createdAt: now.toISOString(),
       });
-      await persistSchedulePlan(deps.execPool, plan);
-      await persistAdmissions(deps.execPool, plan.planId, admissionRecords);
+      await ownedWrite(async (tx) => {
+        await persistSchedulePlan(tx, plan);
+        await persistAdmissions(tx, plan.planId, admissionRecords);
+      });
       log(
         `[lyra-nightly] 调度落档：plan=${plan.planId}（${SKELETON_PLAN_AUTH_VERSION}）准入 ${String(admissionRecords.length)} 条` +
           `（blocked ${String(admissionRecords.filter((a) => a.annotation !== null && a.annotation.startsWith('BLOCKED:')).length)}）`,
       );
     }
   } finally {
-    if (holderHeld) await releaseExecutorLock(deps.execPool, holderId).catch(() => {});
+    await keeper?.stop();
+    if (lease) await releaseExecutorLock(deps.execPool, lease);
   }
 
   // 8) 小结
@@ -784,10 +779,16 @@ async function dryPreview(
     researchKind: plan.researchKind,
     poolInfoFile: ctx.poolInfoFile,
   });
+  const transport = deps.transport ?? selectTransport({ provider: 'simulated' });
+  const request = buildARequest(assembled.package, transport.describe().simulated);
+  await preflightTransport(transport, { businessKey: assembled.package.businessKey, stage: 'A',
+    inputHash: request.inputHash, inputBytes: request.inputBytes, methodVersion: SKELETON_METHOD_VERSION,
+    planAuthVersion: ctx.planAuthVersion, deadline: shanghaiInstant(shanghaiWall(ctx.now).date, WEEKLY_DEADLINE).toISOString() }, request.payload);
+  if (plan.researchKind === 'POST_EVENT') notes.push('事件上下文与J仍待执行时按原准入组装；本预览不替代该预检');
   return {
-    inputHash: assembled.inputHash,
-    inputBytes: assembled.inputBytes,
-    note: notes.join(' ') + (notes.length > 0 ? ' ' : '') + `prompt面=输入包 ${String(assembled.inputBytes)} 字节（L0/L1/L2 全量）`,
+    inputHash: request.inputHash,
+    inputBytes: request.inputBytes,
+    note: notes.join(' ') + (notes.length > 0 ? ' ' : '') + `A prompt=${String(request.inputBytes)} UTF-8字节（含指令与实际输入；已无外发预检）`,
   };
 }
 
@@ -810,8 +811,8 @@ async function commitPostEvent(
     {
       event: anchor,
       inheritance: prior === null ? null : { priorConclusion: prior },
-      budget: SKELETON_BUDGET,
-      holderId: ctx.holderId,
+      budget: { ...SKELETON_BUDGET, planAuthVersion: ctx.planAuthVersion },
+      lease: ctx.lease,
       versions: { methodVersion: SKELETON_METHOD_VERSION, adapterVersion: SKELETON_ADAPTER_VERSION },
       inputBudget: NIGHTLY_INPUT_BUDGET,
       detectedAt: plan.detectedAt ?? anchor.eventTime,
@@ -981,7 +982,7 @@ interface CliArgs {
   now?: string;
 }
 
-function parseCliArgs(argv: string[]): CliArgs {
+export function parseCliArgs(argv: string[]): CliArgs {
   const args: CliArgs = { commit: false, dry: false, settleDue: false, transport: 'simulated' };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i] as string;
@@ -1028,13 +1029,23 @@ const USAGE = `Lyra 每交易日晚间研究循环骨架（P5 准备 W27）
   --dry         全链到 prompt 为止：组装 + 输入哈希/字节，零模型调用、零 permit、零结论（缺省）
   --commit      显式真实落库：permit + 结论 + 调度落档，全部带 planAuthVersion=pa-p5-skeleton 演练身份
   --settle-due  对占位区 UNSETTLED 结论批量结算回填（真实写 settlement 列，零模型调用；与 dry/commit 正交）
-  --transport   simulated（缺省）| real（得 UnauthorizedTransport，全部标的 BLOCKED/MODEL_PROVIDER_UNAUTHORIZED）
+  --transport   simulated（缺省）| real（dry 可预检；P5 commit 仍由 P5_PROTOCOL_FROZEN 拒绝）
   --pool-info   冻结池文件（缺省 data/research-pool.json）
   --artifacts-dir 原件库根（缺省 data/artifacts）
   --now         时钟注入（测试/重放；生产不传）
 
 安全边界：真实模型通道永不被本骨架隐式调用；--commit 对 POST_EVENT 事件键的占用会阻断该事件
 后续真实研究（send-once），CLI 输出告警，清理由 Owner 决策。`;
+
+/** The production CLI and the isolated no-egress test use this same argument-to-dependency wiring. */
+export function runNightlyCli(argv: string[], deps: NightlyDeps, realTransport: () => ModelTransport = () => new SolTransport(), log?: (line: string) => void) {
+  const args = parseCliArgs(argv);
+  return runNightly({ ...deps, transport: args.transport === 'real' ? realTransport() : (deps.transport ?? selectTransport()) }, {
+    date: args.date ?? shanghaiWall(new Date()).date, mode: args.commit ? 'commit' : 'dry', transportProvider: args.transport,
+    ...(args.settleDue ? { settleDue: true } : {}), ...(args.poolInfo === undefined ? {} : { poolInfoFile: args.poolInfo }),
+    ...(args.now === undefined ? {} : { now: new Date(args.now) }), ...(log === undefined ? {} : { log }),
+  });
+}
 
 async function main(): Promise<void> {
   const args = parseCliArgs(process.argv.slice(2));
@@ -1043,19 +1054,8 @@ async function main(): Promise<void> {
   try {
     const calendar = await loadTradeCalendarTable(pool);
     const store = new ArtifactStore(args.artifactsDir ?? 'data/artifacts');
-    const outcome = await runNightly(
-      { dataPool: pool, execPool: pool, store, calendar },
-      {
-        date,
-        mode: args.commit ? 'commit' : 'dry',
-        ...(args.transport === 'real' ? { transportProvider: 'real' as const } : { transportProvider: 'simulated' as const }),
-        ...(args.transport === 'real' ? { transport: new SolTransport() } : {}), // R30：--transport real --commit 即真实执行（sol-high）
-        ...(args.settleDue ? { settleDue: true as const } : {}),
-        ...(args.poolInfo === undefined ? {} : { poolInfoFile: args.poolInfo }),
-        ...(args.now === undefined ? {} : { now: new Date(args.now) }),
-        log: (line) => console.log(line),
-      },
-    );
+    const outcome = await runNightlyCli(process.argv.slice(2), { dataPool: pool, execPool: pool, store, calendar }, undefined,
+      (line) => console.log(line));
     console.log(`[lyra-nightly] 完成（exit 0）：${outcome.date} 第 ${String(outcome.nth)} 晚，` +
       `rot=${outcome.rotation.length} postEvent=${outcome.postEventMerged.length} permits=${String(outcome.permitsCreated)} ` +
       `conclusions=${String(outcome.conclusionsCreated)} settleDue=${outcome.settleDue === null ? 'off' : 'on'}`);

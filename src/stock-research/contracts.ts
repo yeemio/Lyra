@@ -139,6 +139,7 @@ export interface SrCall {
 }
 
 export interface SrCallUsage {
+  wireInputBytes?: number; // preflight of full transport prompt, separately bounded before SENT
   reasoningEffort?: string;
   inputTokens?: number;
   outputTokens?: number;
@@ -417,13 +418,15 @@ export interface SrTransportDescribe {
 }
 
 export interface SrModelTransport {
+  preflight?(step: SrModelStepKind, inputHash: string, payload: unknown): Promise<{ inputHash: string; inputBytes: number }> | { inputHash: string; inputBytes: number };
   describe(step?: SrModelStepKind): SrTransportDescribe;
-  dispatch(step: SrModelStepKind, ctx: { callId: string; inputHash: string; deadline?: string }, payload: unknown): Promise<unknown>;
+  dispatch(step: SrModelStepKind, ctx: { callId: string; inputHash: string; deadline?: string; signal?: AbortSignal | undefined }, payload: unknown): Promise<unknown>;
 }
 
 // ===== 引擎依赖注入（测试可替换）=====
 
 export interface SrEngineDeps {
+  lease?: import('../kernel/lease.js').ExecutionLease;
   dataPool: import('pg').Pool; // 只读事实面（public）
   srPool: import('pg').Pool; // sr 命名空间
   transport: SrModelTransport;

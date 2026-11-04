@@ -1,3 +1,5 @@
+import { withExecutionLease, type ExecutionLease } from '../../kernel/lease.js';
+import { fencedSrWrite } from '../engine-checkpoint.js';
 /** Frozen LATEST_REVISED draft review. Execution remains in the existing sr permit space. */
 import { createHash } from 'node:crypto';
 import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
@@ -358,7 +360,7 @@ function semanticBlockers(j: JOutput | null): { code: string; detail: string }[]
 
 export interface StrategyReviewRuntimeArgs {
   sourceStore: RealStrategyStore; input: RealReviewInput; expectedInputHash: string;
-  srPool: Pool; transport: SrModelTransport; budget: SrPlanBudget; outputDir: string; holderId: string;
+  srPool: Pool; transport: SrModelTransport; budget: SrPlanBudget; outputDir: string; holderId: string; lease: ExecutionLease;
 }
 
 export async function executePreparedStrategyReview(args: {
@@ -366,7 +368,7 @@ export async function executePreparedStrategyReview(args: {
   grant?: ReviewOwnerGrant; realCallsEnabled: boolean; now?: Date;
   permitStoreOrigin: 'BUSINESS_SR_DATABASE' | 'TEST_ONLY_SQL_DOUBLE';
   createTransport: () => RealSrTransport;
-  openPermitStore: () => Promise<{ srPool: Pool; holderId: string; close?: () => Promise<void> }>;
+  openPermitStore: () => Promise<{ srPool: Pool; holderId: string; lease: ExecutionLease; close?: () => Promise<void> }>;
 }): Promise<{ inputPath: string; resultPath: string; result: RealReviewResult }> {
   const { input, proposal } = args;
   if (args.expectedProposalHash !== proposal.proposalHash) throw new StrategyError('STRATEGY_REVIEW_PROPOSAL_PIN_INVALID');
@@ -405,7 +407,7 @@ export async function executePreparedStrategyReview(args: {
   try {
     const { Pool: PgPool } = await import('pg');
     if ((store.srPool instanceof PgPool) === isTestInput(input)) throw new StrategyError('STRATEGY_PERMIT_STORE_ORIGIN_INVALID');
-    return await runFrozenStrategyReview({ sourceStore: args.sourceStore, input, expectedInputHash: input.inputHash, srPool: store.srPool, holderId: store.holderId, transport, budget: proposal.budget, outputDir: proposal.outputDir }, { proposal, grant: args.grant });
+    return await runFrozenStrategyReview({ sourceStore: args.sourceStore, input, expectedInputHash: input.inputHash, srPool: store.srPool, holderId: store.holderId, lease: store.lease, transport, budget: proposal.budget, outputDir: proposal.outputDir }, { proposal, grant: args.grant });
   } finally { await store.close?.(); }
 }
 
@@ -415,18 +417,22 @@ export async function runRealStrategyReview(args: StrategyReviewRuntimeArgs): Pr
 }
 
 async function runFrozenStrategyReview(args: StrategyReviewRuntimeArgs, executionEvidence?: RealReviewResult['executionEvidence']): Promise<{ inputPath: string; resultPath: string; result: RealReviewResult }> {
+  return withExecutionLease(args.srPool, 'sr', () => runFrozenStrategyReviewOwned(args, executionEvidence), { lease: args.lease, holderId: args.holderId });
+}
+async function runFrozenStrategyReviewOwned(args: StrategyReviewRuntimeArgs, executionEvidence?: RealReviewResult['executionEvidence']): Promise<{ inputPath: string; resultPath: string; result: RealReviewResult }> {
   const { input } = args;
   if (!input.execution.accountId || !isSimulatedInput(input) && !executionEvidence) throw new StrategyError('STRATEGY_REVIEW_ACCOUNT_OR_AUTHORIZATION_MISSING');
+  const accountId = input.execution.accountId;
   if (!args.holderId || args.expectedInputHash !== input.inputHash || canonicalSha256(args.budget) !== canonicalSha256(input.execution.budget)) throw new StrategyError('STRATEGY_REVIEW_PIN_OR_BUDGET_INVALID');
   const loaded = await args.sourceStore.load();
   assertRealReviewInput(input, loaded.data, loaded.view, loaded.manifestSha256);
   const rebuilt = await freezeRealReviewInput(args.sourceStore, args.transport, input.execution);
   if (rebuilt.inputHash !== input.inputHash) throw new StrategyError('STRATEGY_REVIEW_SOURCE_OR_TRANSPORT_CHANGED');
-  await SR_PERMIT_SPACE.assertLock!(args.srPool, args.holderId);
+  await SR_PERMIT_SPACE.assertLock!(args.srPool, args.lease);
   await SR_PERMIT_SPACE.assertRunning(args.srPool);
-  await registerSrFrozenReview(args.srPool, { taskId: input.taskId, accountId: input.execution.accountId, subject: input.businessKey.subject, subjectName: input.subjectName,
+  await fencedSrWrite(args.srPool, args.lease, (tx) => registerSrFrozenReview(tx, { taskId: input.taskId, accountId, subject: input.businessKey.subject, subjectName: input.subjectName,
     focus: 'FULL', emphasis: `FROZEN_STRATEGY_REVIEW:${input.inputHash}`, horizon: 'MID_TERM', cutoff: input.businessKey.cutoff, idemKey: canonicalSha256(input.businessKey), methodVersion: input.reviewMethodVersion, adapterVersion: input.dataAdapterVersion, planAuthVersion: input.execution.budget.planAuthVersion,
-    steps: [{ stepId: input.stepIds.A, stepKind: 'A_FINAL', sequence: 1 }, { stepId: input.stepIds.CHECKLIST, stepKind: 'CHECKLIST', sequence: 2 }, { stepId: input.stepIds.J, stepKind: 'JUDGE', sequence: 3 }] });
+    steps: [{ stepId: input.stepIds.A, stepKind: 'A_FINAL', sequence: 1 }, { stepId: input.stepIds.CHECKLIST, stepKind: 'CHECKLIST', sequence: 2 }, { stepId: input.stepIds.J, stepKind: 'JUDGE', sequence: 3 }] }));
   const directory = join(args.outputDir, input.taskId);
   await mkdir(directory, { recursive: true });
   const inputPath = join(directory, 'input.json');
@@ -447,23 +453,23 @@ async function runFrozenStrategyReview(args: StrategyReviewRuntimeArgs, executio
     }
     if (call && (call.sentAt || ['SENT', 'UNKNOWN', 'SUCCEEDED'].includes(call.state))) throw new StrategyError(call.state === 'UNKNOWN' ? 'STRATEGY_REVIEW_UNKNOWN_REQUIRES_OWNER' : 'STRATEGY_REVIEW_SENT_WITHOUT_RECOVERABLE_OUTPUT', role);
     if (step.note) throw new StrategyError('STRATEGY_REVIEW_PINNED_OUTPUT_MISSING', role);
-    await updateStep(args.srPool, step.stepId, { status: 'RUNNING', started: true });
+    await fencedSrWrite(args.srPool, args.lease, (tx) => updateStep(tx, step.stepId, { status: 'RUNNING', started: true }));
     let artifact: RealReviewArtifact<T> | null = null;
     await callSrModel({ srPool: args.srPool, transport: args.transport, budget: args.budget }, {
       contract: { taskId: input.taskId, stepId: step.stepId, methodVersion: input.reviewMethodVersion, planAuthVersion: input.execution.budget.planAuthVersion, deadline: input.execution.deadlines[role] },
-      modelStep: role === 'A' ? 'A_FINAL' : 'JUDGE', input: payload, validate, holderId: args.holderId, expectedTransport: input.execution.transports[role],
+      modelStep: role === 'A' ? 'A_FINAL' : 'JUDGE', input: payload, validate, holderId: args.holderId, lease: args.lease, fixedDeadline: true, expectedTransport: input.execution.transports[role],
       afterValidated: async (output, permit, desc) => {
         artifact = hashObject({ schema: 'lyra-real-strategy-review-artifact-v1' as const, role, inputHash: input.inputHash, evidenceBundleHash: input.evidenceBundleHash, aHash, checklistHash,
           receipt: receiptBinding(permit, desc), output: structuredClone(output), outputHash: canonicalSha256(output) });
         await immutableJson(path, artifact);
-        // Pin before SUCCEEDED settlement so a crash cannot leave an unbound recoverable output.
-        await updateStep(args.srPool, step.stepId, { note: `strategy-artifact:${artifact.artifactHash}` });
+        // The common executor has already atomically saved SUCCEEDED and the original response; pin this derived archive under the same lease.
+        await fencedSrWrite(args.srPool, args.lease, (tx) => updateStep(tx, step.stepId, { note: `strategy-artifact:${artifact!.artifactHash}` }));
       },
     });
     const settled = await srFindCallByStep(args.srPool, input.taskId, step.stepId);
     if (!artifact || !settled) throw new StrategyError('STRATEGY_REVIEW_SETTLED_OUTPUT_MISSING');
     assertArtifact(artifact, role, input, payload, settled, aHash, checklistHash);
-    await updateStep(args.srPool, step.stepId, { status: 'SUCCEEDED', finished: true });
+    await fencedSrWrite(args.srPool, args.lease, (tx) => updateStep(tx, step.stepId, { status: 'SUCCEEDED', finished: true }));
     return artifact;
   };
   try {
@@ -473,7 +479,7 @@ async function runFrozenStrategyReview(args: StrategyReviewRuntimeArgs, executio
     const checklistStep = (await listSteps(args.srPool, input.taskId)).find((s) => s.stepId === input.stepIds.CHECKLIST)!;
     if (checklistStep.note && checklistStep.note !== `strategy-artifact:${checkpoint.artifactHash}`) throw new StrategyError('STRATEGY_CHECKLIST_PIN_INVALID');
     await immutableJson(join(directory, 'checklist.json'), checkpoint);
-    await updateStep(args.srPool, checklistStep.stepId, { status: 'SUCCEEDED', note: `strategy-artifact:${checkpoint.artifactHash}`, finished: true });
+    await fencedSrWrite(args.srPool, args.lease, (tx) => updateStep(tx, checklistStep.stepId, { status: 'SUCCEEDED', note: `strategy-artifact:${checkpoint.artifactHash}`, finished: true }));
     j = await run('J', strategyJInput(input, a.output, checklist), (value) => validateJ(value, a!.output, checklist!), a.artifactHash, checklist.checklistHash);
   } catch (e) {
     failure = { code: errorCode(e), message: e instanceof Error ? e.message : String(e) };
@@ -500,7 +506,7 @@ async function runFrozenStrategyReview(args: StrategyReviewRuntimeArgs, executio
   const result: RealReviewResult = { ...core, resultHash: canonicalSha256(core) };
   const resultPath = join(directory, `result-${result.resultHash}.json`);
   await immutableJson(resultPath, result);
-  await updateTask(args.srPool, input.taskId, { status: failure ? 'FAILED' : 'PARTIAL', ...(failure ? { error: failure } : {}) });
+  await fencedSrWrite(args.srPool, args.lease, (tx) => updateTask(tx as unknown as Pool, input.taskId, { status: failure ? 'FAILED' : 'PARTIAL', ...(failure ? { error: failure } : {}) }));
   return { inputPath, resultPath, result };
 }
 

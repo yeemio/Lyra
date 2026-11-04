@@ -25,7 +25,8 @@ import { freezeBenchmark } from '../conclusion/benchmark.js';
 import { asOfFacts, insertFact } from '../pintime/facts.js';
 import { validatePostEventContext } from '../research/inheritance.js';
 import type { ResearchTrace } from '../research/validation.js';
-import { runNightly, SKELETON_PLAN_AUTH_VERSION, type NightlyEntryResult } from './nightly.js';
+import { runNightly, runNightlyCli, SKELETON_PLAN_AUTH_VERSION, type NightlyEntryResult } from './nightly.js';
+import { SimulatedTransport, UnauthorizedTransport, type ModelTransport } from '../kernel/transport.js';
 
 const schema = `w27_n_${randomUUID().replaceAll('-', '').slice(0, 12)}`;
 const admin = createPool();
@@ -236,7 +237,23 @@ test('dry：轮转 6 只 + 事件合并（截点取最晚）+ 池外跳过；零
 });
 
 test('commit（simulated）：7 研究全 PASS，permit/结论落库且 pa-p5-skeleton 身份可查，锁释放', async () => {
-  const out = await runNightly(deps(), { date: DATE, mode: 'commit', now: NOW_EVENING, poolInfoFile });
+  const inner = new SimulatedTransport(); let factoryCalls = 0, dispatches = 0;
+  const strictNoEgress: ModelTransport = { describe: () => inner.describe(), preflight: (call, payload) => {
+    inner.preflight(call, payload);
+    const p = payload as { prompt: string; inputHash: string; subjectKind: string };
+    assert.ok(p.prompt.includes(call.inputHash));
+    assert.equal(call.inputBytes, Buffer.byteLength(p.prompt, 'utf8'));
+    assert.equal(p.inputHash, call.inputHash); assert.equal(p.subjectKind, call.businessKey.subjectKind);
+  }, dispatch: async (call, payload) => {
+    dispatches++;
+    const sent = await pool.query(`select state from exec_permit where subject_kind=$1 and subject=$2 and research_kind=$3 and cutoff=$4 and stage=$5`,
+      [call.businessKey.subjectKind, call.businessKey.subject, call.businessKey.researchKind, call.businessKey.cutoff, call.stage]);
+    assert.equal(sent.rows[0].state, 'SENT'); return inner.dispatch(call, payload);
+  } };
+  // Same CLI factory slot as --transport real, explicitly simulated and incapable of external calls.
+  const out = await runNightlyCli(['--date', DATE, '--commit', '--transport', 'real', '--now', NOW_EVENING.toISOString(), '--pool-info', poolInfoFile],
+    deps(), () => { factoryCalls++; return strictNoEgress; });
+  assert.equal(factoryCalls, 1); assert.equal(dispatches, 14);
   assert.deepEqual(out.tally, { DRY: 0, PASS: 7, FAILED: 0, BLOCKED: 0, SKIPPED: 1 });
   assert.equal(out.permitsCreated, 14);
   assert.equal(out.conclusionsCreated, 7);
@@ -303,10 +320,11 @@ test('commit（transport=real）：P5_PROTOCOL_FROZEN，在计划/准入/permit 
   const beforeConclusions = await countOf('conclusion');
   const beforePlans = await countOf('schedule_plan');
   const beforeAdmissions = await countOf('schedule_admission');
-  await assert.rejects(() => runNightly(deps(), {
-    date: fixtureDay(7), mode: 'commit', now: new Date(`${fixtureDay(7)}T13:00:00Z`), poolInfoFile,
-    transportProvider: 'real',
-  }), (error: unknown) => (error as { code?: string }).code === 'P5_PROTOCOL_FROZEN');
+  let selected = 0;
+  await assert.rejects(() => runNightlyCli(['--date', fixtureDay(7), '--commit', '--transport', 'real', '--pool-info', poolInfoFile],
+    deps(), () => { selected++; return new UnauthorizedTransport(); }),
+    (error: unknown) => (error as { code?: string }).code === 'P5_PROTOCOL_FROZEN');
+  assert.equal(selected, 1);
   assert.equal(await countOf('exec_permit'), beforePermits, 'blocked 不入 permit 表');
   assert.equal(await countOf('conclusion'), beforeConclusions);
   assert.equal(await countOf('schedule_plan'), beforePlans);
@@ -345,7 +363,12 @@ test('防御：非交易日具名拒绝；commit 截止已过具名拒绝', asyn
     (e: unknown) => (e as { code?: string }).code === 'NIGHTLY_NOT_TRADING_DAY',
   );
   await assert.rejects(
-    () => runNightly(deps(), { date: DATE, mode: 'commit', now: new Date(`${fixtureDay(1)}T02:00:00Z`), poolInfoFile }),
+    () => runNightly(deps(), { date: fixtureDay(7), mode: 'commit', now: new Date(`${fixtureDay(8)}T02:00:00Z`), poolInfoFile }),
     (e: unknown) => (e as { code?: string }).code === 'NIGHTLY_COMMIT_DEADLINE_PAST',
   );
+  const before = await countOf('exec_permit');
+  const replay = await runNightly(deps(), { date: DATE, mode: 'commit', now: new Date(`${fixtureDay(1)}T02:00:00Z`), poolInfoFile });
+  assert.equal(replay.tally.PASS, 7, '截止后仅恢复已有成功 A/J 的确定性发布');
+  assert.equal(replay.permitsCreated, 0); assert.equal(replay.conclusionsCreated, 0);
+  assert.equal(await countOf('exec_permit'), before);
 });

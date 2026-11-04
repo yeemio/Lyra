@@ -424,8 +424,8 @@ export class SolTransport implements ModelTransport {
     }
   }
 
-  describe(): { provider: string; simulated: boolean } {
-    return { provider: 'codex-native', simulated: false };
+  describe(): { provider: string; simulated: boolean; modelId: string; effort: string } {
+    return { provider: 'codex-native', simulated: false, modelId: this.config.model, effort: this.config.reasoningEffort };
   }
 
   /** 静态构造调用计划（无 fs、无 spawn）：预览与 dispatch 共用。paths 为占位时标注。 */
@@ -462,13 +462,18 @@ export class SolTransport implements ModelTransport {
     return this.buildPlan(call, bound);
   }
 
+  async preflight(call: ModelCallContract, payload: unknown): Promise<void> {
+    await this.preview(call, payload);
+  }
+
   /**
    * 一次真实模型调用：构造调用目录（schema/prompt 落盘，证据保留）→ spawn codex
    * （argv 镜像 Metis；prompt 走 stdin）→ 等待退出（与超时/输出上限竞速，超限终止
    * 进程组）→ 读 final.txt → JSON 解析 → 本地权威形状校验 → 返回定型输出。
    * 任何失败只抛具名 KernelError；无重试、无凭据接触。
    */
-  async dispatch(call: ModelCallContract, payload: unknown): Promise<unknown> {
+  async dispatch(call: ModelCallContract, payload: unknown, signal?: AbortSignal): Promise<unknown> {
+    signal?.throwIfAborted();
     const bound = assertPayloadBound(call, payload);
     this.assertPromptLimit(bound.prompt);
     if (this.config.dryRun) return this.buildPlan(call, bound); // 干跑守卫：绝不 spawn
@@ -489,12 +494,12 @@ export class SolTransport implements ModelTransport {
       cwd: dir,
       stdoutPath,
       stderrPath,
-    });
+    }, signal);
 
     if (exitCode !== 0) {
       throw new KernelError(
         'MODEL_PROVIDER_EXIT_NONZERO',
-        `codex 退出码 ${String(exitCode)}${exitSignal === null ? '' : `（信号 ${exitSignal}）`}：显式失败，不重试。stderr 尾部：${stderrTail}`,
+        `codex 退出码 ${String(exitCode)}${exitSignal === null ? '' : `（信号 ${exitSignal}）`}：本地进程退出不足以证明远端失败，不重试。stderr 尾部：${stderrTail}`,
       );
     }
 
@@ -536,7 +541,9 @@ export class SolTransport implements ModelTransport {
     plan: SolInvocationPlan,
     prompt: string,
     io: { cwd: string; stdoutPath: string; stderrPath: string },
+    signal?: AbortSignal,
   ): Promise<{ exitCode: number | null; exitSignal: string | null; stderrTail: string }> {
+    signal?.throwIfAborted();
     const { spawnFn, timeoutMs, killGraceMs, maxOutputBytes } = this.config;
     return new Promise((resolve, reject) => {
       let stderrBuf = '';
@@ -557,6 +564,7 @@ export class SolTransport implements ModelTransport {
       });
 
       const cleanup = (): void => {
+        signal?.removeEventListener('abort', abort);
         clearTimeout(deadline);
         clearTimeout(killTimer);
         clearTimeout(killSettleTimer);
@@ -592,6 +600,10 @@ export class SolTransport implements ModelTransport {
         }, killGraceMs);
       };
 
+      const abort = () => terminate(new KernelError('SILENCE_AFTER_SEND', '执行窗口或租约关闭；停止本地进程，远端结局仍未知'));
+      signal?.addEventListener('abort', abort, { once: true });
+      if (signal?.aborted) abort();
+
       child.once('error', () => {
         finish(() => reject(new KernelError('SOL_SPAWN_FAILED', `spawn ${plan.binary} 失败（ENOENT/EACCES 等）`)));
       });
@@ -619,7 +631,7 @@ export class SolTransport implements ModelTransport {
         }
       });
       child.stdin.on('error', () => {
-        terminate(new KernelError('SOL_SPAWN_FAILED', 'prompt stdin 写入失败'));
+        terminate(new KernelError('SILENCE_AFTER_SEND', 'prompt stdin 写入失败，可能已部分送达'));
       });
       child.once('close', (code, signal) => {
         // 我方主动终止（超时/输出超限）的 close 属于既定失败路径，不解读为远端退出码。

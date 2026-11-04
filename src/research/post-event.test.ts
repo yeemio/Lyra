@@ -1,3 +1,4 @@
+import { keepLeaseAlive, type ExecutionLease } from '../kernel/lease.js';
 import { researchJInputHash } from './validation.js';
 import { researchMaterial } from './requests.js';
 /**
@@ -31,6 +32,8 @@ import { assembleResearchInput } from './inputs.js';
 import { runPostEventResearch, type PostEventTriggerEvent } from './post-event.js';
 
 const HOLDER = `w20-pe-${randomUUID()}`;
+let testLease: ExecutionLease;
+let testKeeper: ReturnType<typeof keepLeaseAlive>;
 const schema = `w20_pe_${randomUUID().replaceAll('-', '').slice(0, 12)}`;
 const admin = createPool();
 let isolated: Pool;
@@ -50,12 +53,14 @@ const REPLAY_DEADLINE_MS = 120_000;
 before(async () => {
   await applySchema(admin, schema);
   isolated = createPool({ schema });
-  await acquireExecutorLock(isolated, HOLDER);
+  testLease = (await acquireExecutorLock(isolated, HOLDER)).lease;
+  testKeeper = keepLeaseAlive(isolated, testLease);
 });
 
 after(async () => {
+  await testKeeper?.stop();
   try {
-    await releaseExecutorLock(isolated, HOLDER);
+    await releaseExecutorLock(isolated, testLease);
   } catch {
     /* 已释放 */
   }
@@ -124,7 +129,7 @@ async function buildWeeklyPrior(cutoff: string): Promise<ConclusionObject> {
     modelFn: async (ctx) =>
       (await transport.dispatch(ctx.contract, { inputHash: assembled.inputHash, subjectKind: 'STOCK', subject, material })) as AOutput,
     simulated: true,
-    holderId: HOLDER,
+    lease: testLease,
   });
   const checklist = deriveChecklist(a.output, assembled.package.seals[0]!.manifestHash);
   const jInputHash = researchJInputHash(assembled.package, a.output, checklist);
@@ -142,7 +147,7 @@ async function buildWeeklyPrior(cutoff: string): Promise<ConclusionObject> {
     modelFn: async (ctx) =>
       (await transport.dispatch(ctx.contract, { inputHash: jInputHash, subjectKind: 'STOCK', aOutput: a.output, checklist })) as JOutput,
     simulated: true,
-    holderId: HOLDER,
+    lease: testLease,
   });
   const prior = await persistResearchConclusion(isolated, store, {
     businessKey,
@@ -182,7 +187,7 @@ test('SC-7.1 + RM §7 INHERITED 全链：真实事件（600519 业绩预告 2018
       event,
       inheritance: { priorConclusion: prior },
       budget: BUDGET,
-      holderId: HOLDER,
+      lease: testLease,
       versions: VERSIONS,
       now: new Date('2018-02-01T00:30:00.000Z'), // 检测命中后即时启动（SC-3.3）
       deadline: replayDeadline, // 历史事件重放截止（显式、落 permit 可审计）
@@ -250,7 +255,7 @@ test('SC-7.1 STANDALONE 全链：真实事件（600519 增速变化 2017-10-26�
       event,
       inheritance: null,
       budget: BUDGET,
-      holderId: HOLDER,
+      lease: testLease,
       versions: VERSIONS,
       now: new Date('2017-10-26T16:30:00.000Z'),
       deadline: new Date(Date.now() + REPLAY_DEADLINE_MS).toISOString(),
@@ -282,7 +287,7 @@ test('RM §7.1 继承资格不满足（方法版本不兼容）→ 不继承，�
       event,
       inheritance: { priorConclusion: realPrior },
       budget: BUDGET,
-      holderId: HOLDER,
+      lease: testLease,
       versions: { methodVersion: 'method@p2-v2-20261103', adapterVersion: VERSIONS.adapterVersion }, // 资格破坏：方法版本不兼容
       now: new Date('2018-09-03T01:00:00.000Z'),
       deadline: new Date(Date.now() + REPLAY_DEADLINE_MS).toISOString(),
@@ -306,7 +311,7 @@ test('SC-3.3 启动闸：次日 08:00 后新启动具名拒绝 POST_EVENT_START_
           event,
           inheritance: null,
           budget: BUDGET,
-          holderId: HOLDER,
+          lease: testLease,
           versions: VERSIONS,
           now: new Date('2018-10-08T01:00:00.000Z'), // 晚于 latestStart 2018-10-08T00:00Z（国庆顺延后的次日 08:00）
         },

@@ -59,7 +59,7 @@ async function injectedPlan(fault: 'NONE' | 'A_UNKNOWN' | 'J_NARROWED' = 'NONE')
   let transportFactories = 0, storeFactories = 0;
   const args = { sourceStore, ...prepared, expectedProposalHash: prepared.proposal.proposalHash, grant, realCallsEnabled: true, permitStoreOrigin: 'TEST_ONLY_SQL_DOUBLE' as const,
     createTransport: () => { transportFactories++; return new RealSrTransport({ ...config, enabled: true }, runner); },
-    openPermitStore: async () => { storeFactories++; return { srPool: pool.asPool(), holderId: pool.holderId }; } };
+    openPermitStore: async () => { storeFactories++; return { srPool: pool.asPool(), holderId: pool.holderId, lease: pool.lease }; } };
   return { ...prepared, grant, args, pool, runner, calls, counts: () => ({ transportFactories, storeFactories }) };
 }
 
@@ -138,7 +138,7 @@ test('旧模拟成功与UNKNOWN恢复沿原身份零发送，原R1/R2证据不�
     const original = dirname(entry.resultPath), input = JSON.parse(await readFile(join(original, 'input.json'), 'utf8')) as RealReviewInput;
     const pool = new IsolatedSrPool(JSON.parse(await readFile(join(original, 'isolated-sr-snapshot.json'), 'utf8')) as IsolatedSrSnapshot), outputDir = join(directory, 'TEST_ONLY', `legacy-${entry.fault}`), target = join(outputDir, input.taskId);
     await mkdir(target, { recursive: true }); for (const name of ['input.json', 'a.json', 'checklist.json', 'j.json']) { try { await copyFile(join(original, name), join(target, name)); } catch (e) { if (!(e && typeof e === 'object' && 'code' in e && e.code === 'ENOENT')) throw e; } }
-    let dispatches = 0; const result = await runRealStrategyReview({ sourceStore, input, expectedInputHash: input.inputHash, srPool: pool.asPool(), transport: { describe: (step) => input.execution.transports[step === 'JUDGE' ? 'J' : 'A'], dispatch: async () => { dispatches++; throw new Error('LEGACY_RESEND_FORBIDDEN'); } }, budget: input.execution.budget, outputDir, holderId: pool.holderId });
+    let dispatches = 0; const result = await runRealStrategyReview({ sourceStore, input, expectedInputHash: input.inputHash, srPool: pool.asPool(), transport: { describe: (step) => input.execution.transports[step === 'JUDGE' ? 'J' : 'A'], dispatch: async () => { dispatches++; throw new Error('LEGACY_RESEND_FORBIDDEN'); } }, budget: input.execution.budget, outputDir, holderId: pool.holderId, lease: pool.lease });
     assert.equal(result.result.resultHash, entry.resultHash); assert.equal(dispatches, 0); evidence.push({ name: `legacy-recovery:${entry.fault}`, resultHash: result.result.resultHash, dispatches });
   }
 });

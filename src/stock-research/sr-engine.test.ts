@@ -25,6 +25,7 @@ import { SimSrTransport, RealSrTransport, realTransportConfigFromEnv } from './t
 import { askReportQuestion, runSrTask } from './engine.js';
 import {
   createTask,
+  getTask,
   getReportByTaskAndVersion,
   listReportVersions,
   srBootRecovery,
@@ -71,7 +72,7 @@ interface Deps {
 }
 
 function depsWith(transport: SrModelTransport): Deps {
-  return { srPool, dataPool, transport, budget: defaultSrPlanBudget(), outputDir: outDir };
+  return { srPool, dataPool, transport, budget: { ...defaultSrPlanBudget(), maxModelCallsPerWeek: 1000 }, outputDir: outDir };
 }
 
 async function newTask(subject: string, cutoff: string, emphasis: string | null = null) {
@@ -208,8 +209,7 @@ describe('sr 引擎：中断恢复与调用身份', () => {
     const callsBefore = (await callRows()).length;
     const second = await runSrTask(depsWith(new SimSrTransport()), task.taskId);
     assert.equal(second.task.status, 'FAILED', '同输入重跑必须失败（不得换 ID 重发）');
-    assert.ok(JSON.stringify(second.task.error).includes('SENT_CHAIN_BLOCKED') || JSON.stringify(second.task.error).includes('一次发送'),
-      `错误应说明发送链阻断：${JSON.stringify(second.task.error)}`);
+    assert.equal(second.task.error?.code, 'SR_CHECKPOINT_MISSING', '已发但无可信成功检查点，拒绝重发');
     assert.equal((await callRows()).length, callsBefore, '零新增调用');
     const stepsAfter = (await srPool.query(`select count(*)::int n from sr_step where task_id=$1`, [task.taskId])).rows[0].n;
     assert.equal(stepsAfter, stepsBefore, '无自动新步骤');
@@ -227,10 +227,9 @@ describe('sr 引擎：中断恢复与调用身份', () => {
 
     // 引擎恢复扫描 → RECONCILING；此时重跑被恢复守卫拦截（零调用）
     await srBootRecovery(srPool);
-    const blocked = await runSrTask(depsWith(new SimSrTransport()), task.taskId);
-    assert.equal(blocked.task.status, 'FAILED');
+    await assert.rejects(runSrTask(depsWith(new SimSrTransport()), task.taskId), { code: 'RECOVERY_CONFIRM_REQUIRED' });
+    assert.equal((await getTask(srPool, task.taskId))!.status, 'FAILED', '未认领任务保持原状态');
     assert.equal((await callRows()).length, callsBefore, 'RECONCILING 下零新调用');
-    assert.ok(JSON.stringify(blocked.task.error).includes('RECOVERY'), `错误应含恢复提示：${JSON.stringify(blocked.task.error)}`);
 
     // 〔R2〕Owner 退役 + 恢复确认后：同输入仍不得自动重发（退役不是重采样许可）；
     // 重新生成的正道 = 显式新任务（修订），新任务身份 + 新授权记录。
@@ -238,6 +237,7 @@ describe('sr 引擎：中断恢复与调用身份', () => {
     await srConfirmRecovery(srPool, 'owner-test');
     const third = await runSrTask(depsWith(new SimSrTransport()), task.taskId);
     assert.equal(third.task.status, 'FAILED', '退役后同输入仍不自动重发');
+    assert.equal(third.task.error?.code, 'REQUEST_UNKNOWN', '退役不合成成功检查点');
     assert.equal((await callRows()).length, callsBefore, '退役前后零新增调用');
     // 正道：显式新任务可完整重做（新身份、新调用）
     const redo = await newTask('600519', '2026-10-24T16:00:00.000Z');

@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 /**
  * Lyra · sr 空间模型传输层（R31）。
  *
@@ -785,40 +786,36 @@ export function realTransportConfigFromEnv(env: NodeJS.ProcessEnv): RealTranspor
 
 /** 最小子进程面（与 sol-transport 同构；测试可注入假 runner，离线验证全部逻辑）。 */
 export interface RealRunner {
-  run(args: string[], opts: { cwd: string; stdin: string; windowMs: number }): Promise<{ code: number; stdout: string; stderr: string }>;
+  run(args: string[], opts: { cwd: string; stdin: string; windowMs: number; signal?: AbortSignal | undefined }): Promise<{ code: number; stdout: string; stderr: string }>;
 }
 
 export function childProcessRunner(binary: string): RealRunner {
   return {
     async run(args, opts) {
+      opts.signal?.throwIfAborted();
       const { spawn } = await import('node:child_process');
+      opts.signal?.throwIfAborted();
       return await new Promise((resolve, reject) => {
-        const child = spawn(binary, args, { cwd: opts.cwd, stdio: ['pipe', 'pipe', 'pipe'] });
-        let stdout = '';
-        let stderr = '';
-        let settled = false;
-        const timer = setTimeout(() => {
+        const child = spawn(binary, args, { cwd: opts.cwd, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
+        let stdout = '', stderr = '', settled = false;
+        const finish = (error?: Error, code = -1) => {
           if (settled) return;
-          settled = true;
-          child.kill('SIGKILL');
-          reject(new KernelError('TIMEOUT', `sr 真实通道超窗（${opts.windowMs}ms）`));
-        }, opts.windowMs);
+          settled = true; clearTimeout(timer); opts.signal?.removeEventListener('abort', cancel);
+          if (error) {
+            if (child.pid) { try { process.kill(-child.pid, 'SIGKILL'); } catch { child.kill('SIGKILL'); } }
+            reject(error);
+          } else resolve({ code, stdout, stderr });
+        };
+        const cancel = () => finish(new KernelError('SILENCE_AFTER_SEND', 'sr 执行窗口或租约关闭；远端结局未知'));
+        const timer = setTimeout(() => finish(new KernelError('TIMEOUT', `sr 真实通道超窗（${opts.windowMs}ms）`)), opts.windowMs);
+        opts.signal?.addEventListener('abort', cancel, { once: true });
+        if (opts.signal?.aborted) cancel();
         child.stdout.on('data', (c: Buffer) => { stdout += c.toString('utf8'); });
         child.stderr.on('data', (c: Buffer) => { stderr += c.toString('utf8'); });
-        child.on('error', (err) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          reject(new KernelError('SR_SPAWN_FAILED', err.message));
-        });
-        child.on('close', (code) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          resolve({ code: code ?? -1, stdout, stderr });
-        });
-        child.stdin.write(opts.stdin);
-        child.stdin.end();
+        child.on('error', (err) => finish(new KernelError('SR_SPAWN_FAILED', err.message)));
+        child.on('close', (code) => finish(undefined, code ?? -1));
+        child.stdin.on('error', () => finish(new KernelError('SILENCE_AFTER_SEND', 'sr stdin 可能已部分送达')));
+        if (!settled) child.stdin.end(opts.stdin);
       });
     },
   };
@@ -997,9 +994,18 @@ export class RealSrTransport implements SrModelTransport {
     return `${STEP_INSTRUCTIONS[step]}\n\n# 输入（JSON）\n${JSON.stringify(payload, null, 1)}\n`;
   }
 
+  preflight(step: SrModelStepKind, inputHash: string, payload: unknown): { inputHash: string; inputBytes: number } {
+    const plan = this.dryRun(step, { callId: 'preflight', inputHash }, payload);
+    if (!plan.authorized) throw new KernelError('MODEL_PROVIDER_UNAUTHORIZED', 'SR real transport is not authorized');
+    const input = JSON.stringify(payload, null, 1);
+    if (createHash('sha256').update(input).digest('hex') !== inputHash) throw new KernelError('MODEL_INPUT_UNBOUND', 'SR payload hash differs');
+    const prompt = this.renderPrompt(step, payload);
+    return { inputHash: createHash('sha256').update(prompt).digest('hex'), inputBytes: Buffer.byteLength(prompt, 'utf8') };
+  }
+
   async dispatch(
     step: SrModelStepKind,
-    ctx: { callId: string; inputHash: string; deadline?: string },
+    ctx: { callId: string; inputHash: string; deadline?: string; signal?: AbortSignal | undefined },
     payload: unknown,
   ): Promise<unknown> {
     if (!this.config.enabled || !this.modelFor(step).modelId) {
@@ -1008,11 +1014,13 @@ export class RealSrTransport implements SrModelTransport {
         'sr 真实通道未启用：需要 Owner 授权（LYRA_SR_REAL_CALLS=1）与当前步骤的有效模型配置。',
       );
     }
+    ctx.signal?.throwIfAborted();
     const remainingMs = ctx.deadline === undefined ? this.config.callWindowMs : Date.parse(ctx.deadline) - Date.now();
     if (!Number.isFinite(remainingMs) || remainingMs <= 0) throw new KernelError('DEADLINE_EXCEEDED', 'sr call has no remaining explicit execution window');
     const plan = this.dryRun(step, ctx, payload);
     const prompt = this.renderPrompt(step, payload);
     const { mkdirSync, writeFileSync, readFileSync } = await import('node:fs');
+    ctx.signal?.throwIfAborted();
     const invocationDir = `${this.config.invocationsDir}/${ctx.callId}`;
     mkdirSync(invocationDir, { recursive: true });
     writeFileSync(`${invocationDir}/schema.json`, JSON.stringify(srOutputSchema(step), null, 1), 'utf8');
@@ -1021,7 +1029,7 @@ export class RealSrTransport implements SrModelTransport {
       a === `${this.config.invocationsDir}/dry-${ctx.callId}/schema.json` ? `${invocationDir}/schema.json`
       : a === `${this.config.invocationsDir}/dry-${ctx.callId}/final.txt` ? `${invocationDir}/final.txt`
       : a);
-    const result = await this.runner.run(argv, { cwd: process.cwd(), stdin: prompt, windowMs: Math.min(this.config.callWindowMs, remainingMs) });
+    const result = await this.runner.run(argv, { cwd: process.cwd(), stdin: prompt, windowMs: Math.min(this.config.callWindowMs, remainingMs), signal: ctx.signal });
     writeFileSync(`${invocationDir}/stdout.txt`, result.stdout.slice(0, 4 * 1024 * 1024), 'utf8');
     writeFileSync(`${invocationDir}/stderr.txt`, result.stderr.slice(0, 1024 * 1024), 'utf8');
     if (result.code !== 0) {

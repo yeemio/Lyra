@@ -51,8 +51,18 @@ function assertConfig(c: DshConfig) {
 export class DshSrTransport implements SrModelTransport {
   readonly config: Readonly<DshConfig>;
   constructor(config: DshConfig) { this.config = Object.freeze({ ...config }); }
-  describe() { return { provider: 'dsh-deepseek-native-sr', modelId: this.config.modelId || null, simulated: this.config.validation }; }
-  async dispatch(step: SrModelStepKind, ctx: { callId: string; inputHash: string; deadline?: string }, payload: unknown): Promise<unknown> {
+  describe() { return { provider: 'dsh-deepseek-native-sr', modelId: this.config.modelId || null, effort: this.config.effort, simulated: this.config.validation }; }
+  preflight(step: SrModelStepKind, inputHash: string, payload: unknown): { inputHash: string; inputBytes: number } {
+    if (!this.config.enabled) throw new KernelError('MODEL_PROVIDER_UNAUTHORIZED', 'DSH transport is not authorized');
+    assertConfig(this.config);
+    if (!['PLAN', 'ANALYZE', 'A_FINAL', 'JUDGE', 'CHAT_ANSWER'].includes(step)) throw new KernelError('DSH_STEP_UNSUPPORTED', step);
+    const input = JSON.stringify(payload, null, 1);
+    if (createHash('sha256').update(input).digest('hex') !== inputHash) throw new KernelError('DSH_INPUT_BINDING_INVALID', 'DSH input hash differs');
+    const prompt = `${STEP_INSTRUCTIONS[step]}\n\n# 输出 schema（本地业务校验仍为权威）\n${JSON.stringify(srOutputSchema(step))}\n\n# 输入（JSON）\n${input}\n`;
+    return { inputHash: createHash('sha256').update(prompt).digest('hex'), inputBytes: Buffer.byteLength(prompt, 'utf8') };
+  }
+  async dispatch(step: SrModelStepKind, ctx: { callId: string; inputHash: string; deadline?: string; signal?: AbortSignal | undefined }, payload: unknown): Promise<unknown> {
+    ctx.signal?.throwIfAborted();
     if (!this.config.enabled) throw new KernelError('MODEL_PROVIDER_UNAUTHORIZED', 'DSH 真实通道需要 Owner 授权（LYRA_SR_REAL_CALLS=1）；配置凭据不构成授权。');
     assertConfig(this.config);
     if (!['PLAN', 'ANALYZE', 'A_FINAL', 'JUDGE', 'CHAT_ANSWER'].includes(step)) throw new KernelError('DSH_STEP_UNSUPPORTED', 'DSH 不接收确定性或未启用的模型步骤。');
@@ -64,11 +74,15 @@ export class DshSrTransport implements SrModelTransport {
       prompt: `${STEP_INSTRUCTIONS[step]}\n\n# 输出 schema（本地业务校验仍为权威）\n${JSON.stringify(srOutputSchema(step))}\n\n# 输入（JSON）\n${input}\n` };
     const worker = new Worker(new URL(import.meta.url.endsWith('.ts') ? './dsh-worker.ts' : './dsh-worker.js', import.meta.url), { workerData: request, env: {}, execArgv: [] });
     let sent = false;
+    let cancel: (() => void) | undefined;
     try {
       return await new Promise<unknown>((resolve, reject) => {
         const uncertain = () => new KernelError(sent ? 'SILENCE_AFTER_SEND' : 'DSH_WORKER_FAILED', sent ? 'DSH 已释放一次请求，远端结局不明；不得自动重发。' : 'DSH 本地准备失败（错误详情已脱敏）。');
         const timer = setTimeout(() => reject(uncertain()), windowMs);
         const fail = (error: KernelError) => { clearTimeout(timer); reject(error); };
+        cancel = () => fail(new KernelError('SILENCE_AFTER_SEND', 'DSH 执行租约或窗口关闭，不能推断远端失败'));
+        ctx.signal?.addEventListener('abort', cancel, { once: true });
+        if (ctx.signal?.aborted) cancel();
         worker.on('message', (reply: DshWorkerReply) => {
           if (reply.type === 'sent') { sent = true; return; }
           clearTimeout(timer);
@@ -78,6 +92,6 @@ export class DshSrTransport implements SrModelTransport {
         worker.once('error', () => fail(uncertain()));
         worker.once('exit', () => fail(uncertain()));
       });
-    } finally { await worker.terminate(); }
+    } finally { if (cancel) ctx.signal?.removeEventListener('abort', cancel); await worker.terminate(); }
   }
 }

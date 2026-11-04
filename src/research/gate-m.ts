@@ -29,7 +29,9 @@ import {
   type SubjectKind,
 } from '../contracts.js';
 import type { ArtifactStore } from '../artifacts/store.js';
-import { runModelCall } from '../kernel/executor.js';
+import { withExecutionLease, type ExecutionLease } from '../kernel/lease.js';
+import { releaseUnsentReservations } from '../kernel/budget.js';
+import { coalesceResearchRun, withResearchClaim, freezeResearchSnapshot, runResearchStage, publishResearchCheckpoint } from './gate-m-checkpoint.js';
 import type { ModelTransport } from '../kernel/transport.js';
 import {
   SolTransport,
@@ -50,7 +52,6 @@ import { deriveChecklist, type DimensionCoveragePkg } from './checklist.js';
 import { simulatedModelA } from './simulated.js';
 import { renderAPrompt, renderJPrompt, buildARequest, buildJRequest, researchMaterial, assertAssembledIdentity } from './requests.js';
 import { validateResearchA, validateResearchJ, researchJInputHash } from './validation.js';
-import { persistResearchConclusion } from './trace.js';
 import { buildReportView, renderReportText, type ReportView } from './report.js';
 
 // ===== Gate-M 冻结缺省（R27 / GATE-M-APPLICATION）=====
@@ -110,6 +111,7 @@ export interface GateMOptions {
   inputBudget?: InputBudget;
   /** 执行权持有者（EK-2.1 可选防御层；真跑建议传）。 */
   holderId?: string;
+  lease?: ExecutionLease;
   /** 执行截止（EK-6.1：显式给定优先；缺省 = 每次调用发起时刻 + 60 分钟）。 */
   deadline?: string;
   /** 干跑是否跑样本包程序校验（缺省 true，只读）。 */
@@ -225,15 +227,30 @@ function coveragePkgOf(pkg: ResearchInputPackage): DimensionCoveragePkg {
 }
 
 export async function runGateM(deps: GateMDeps, opts: GateMOptions): Promise<GateMOutcome> {
-  if (opts.aFrom !== undefined) throw new KernelError('SALVAGE_A_UNBOUND', '旧 aFrom 仅凭文件名/时间猜封存，缺少原 permit 与送达包证明；可信恢复由 PR#4 单独处理');
+  if (opts.execute !== true) return runGateMInner(deps, opts);
+  if (opts.aFrom !== undefined) throw new KernelError('SALVAGE_A_UNBOUND', 'Use the original business key and persisted checkpoint, not a supplied file');
+  return coalesceResearchRun(deps.execPool, { subjectKind: opts.subjectKind ?? 'STOCK', subject: opts.subject, cutoff: opts.cutoff, researchKind: 'WEEKLY' },
+    { versions: opts.versions ?? GATE_M_VERSIONS, budget: opts.budget ?? GATE_M_PLAN_BUDGET, inputBudget: opts.inputBudget ?? GATE_M_INPUT_BUDGET, deadline: opts.deadline ?? null, transport: deps.transport.describe() },
+    () => withExecutionLease(deps.execPool, 'kernel', ({ lease }) =>
+      withResearchClaim(deps.execPool, lease, { subjectKind: opts.subjectKind ?? 'STOCK', subject: opts.subject,
+        cutoff: opts.cutoff, researchKind: 'WEEKLY' }, () => runGateMInner(deps, { ...opts, lease })), opts));
+}
+
+async function runGateMInner(deps: GateMDeps, opts: GateMOptions): Promise<GateMOutcome> {
+  if (opts.aFrom !== undefined) throw new KernelError('SALVAGE_A_UNBOUND', '文件名不能作为恢复凭证；以相同业务键重入，核验数据库中的原 permit/送达包检查点');
   const subjectKind: SubjectKind = opts.subjectKind ?? 'STOCK';
   const budget = opts.budget ?? GATE_M_PLAN_BUDGET;
   const versions = opts.versions ?? GATE_M_VERSIONS;
   if (versions.planAuthVersion !== budget.planAuthVersion) throw new KernelError('RESEARCH_INPUT_UNBOUND', '材料包与执行预算的授权版本不符');
 
   // 1) 组装 + A prompt（真实数据；组装器自带分层预算闸与 coverage）。
-  const bundle = await buildGateMPrompts(deps, { ...opts, subjectKind });
-  const { assembled } = bundle;
+  const snapshot = opts.execute === true ? await freezeResearchSnapshot(deps.execPool, deps.store, opts.lease!,
+    { subjectKind, subject: opts.subject, cutoff: opts.cutoff, researchKind: 'WEEKLY' },
+    { versions, budget, inputBudget: opts.inputBudget ?? GATE_M_INPUT_BUDGET, transport: deps.transport.describe(),
+      requestedDeadline: opts.deadline ?? null }, async () => ({ version: 1,
+      assembled: (await buildGateMPrompts(deps, { ...opts, subjectKind })).assembled,
+      deadline: opts.deadline ?? new Date(Date.now() + GATE_M_CALL_WINDOW_MS).toISOString(), metadata: null })) : null;
+  const assembled = snapshot?.assembled ?? (await buildGateMPrompts(deps, { ...opts, subjectKind })).assembled;
   assertAssembledIdentity(assembled, { subjectKind, subject: opts.subject, cutoff: opts.cutoff, researchKind: 'WEEKLY' }, versions);
   const aPrompt = renderAPrompt(assembled.package, opts.execute === true && deps.transport.describe().simulated);
   const aPromptBytes = Buffer.byteLength(aPrompt, 'utf8');
@@ -246,7 +263,7 @@ export async function runGateM(deps: GateMDeps, opts: GateMOptions): Promise<Gat
     : await validateResearchInputPackage(deps.dataPool, deps.store, pkg);
 
   const deadlineOf = (): string =>
-    opts.deadline ?? new Date(Date.now() + GATE_M_CALL_WINDOW_MS).toISOString();
+    snapshot?.deadline ?? opts.deadline ?? new Date(Date.now() + GATE_M_CALL_WINDOW_MS).toISOString();
 
   if (opts.execute !== true) {
     // ---- 干跑：J 估算 + argv 预览 + 预算检查；零 permit、零模型、零 spawn ----
@@ -283,7 +300,8 @@ export async function runGateM(deps: GateMDeps, opts: GateMOptions): Promise<Gat
   const simulated = deps.transport.describe().simulated;
   const aRequest = buildARequest(pkg, simulated);
   // A：contract.inputBytes = prompt 真实字节数（预算闸 EK-4.4 用真实口径）。
-  const a = await runModelCall<AOutput>(deps.execPool, {
+  const a = await runResearchStage<AOutput>({
+    pool: deps.execPool, lease: opts.lease!, transport: deps.transport, snapshot: snapshot!, request: aRequest,
     contract: {
       businessKey,
       stage: 'A',
@@ -293,11 +311,8 @@ export async function runGateM(deps: GateMDeps, opts: GateMOptions): Promise<Gat
       planAuthVersion: budget.planAuthVersion,
       deadline: deadlineOf(),
     },
-    budget,
-    modelFn: async (ctx) =>
-      validateResearchA(await deps.transport.dispatch(ctx.contract, aRequest.payload), pkg, simulated),
-    simulated: deps.transport.describe().simulated,
-    ...(opts.holderId === undefined ? {} : { holderId: opts.holderId }),
+    budget, reuseDeadline: opts.deadline === undefined,
+    validate: (value) => validateResearchA(value, pkg, simulated),
   });
 
   // 程序清单（无模型机械抽取；绑定真实封存 manifest）。
@@ -310,7 +325,8 @@ export async function runGateM(deps: GateMDeps, opts: GateMOptions): Promise<Gat
   // J：prompt = J_DUTIES + A 输出全文 + 清单全文 + 绑定与 schema 说明。
   const jPrompt = jRequest.payload.prompt;
   const jPromptBytes = Buffer.byteLength(jPrompt, 'utf8');
-  const j = await runModelCall<JOutput>(deps.execPool, {
+  const j = await runResearchStage<JOutput>({
+    pool: deps.execPool, lease: opts.lease!, transport: deps.transport, snapshot: snapshot!, request: jRequest,
     contract: {
       businessKey,
       stage: 'J',
@@ -318,17 +334,14 @@ export async function runGateM(deps: GateMDeps, opts: GateMOptions): Promise<Gat
       inputBytes: jPromptBytes,
       methodVersion: versions.methodVersion,
       planAuthVersion: budget.planAuthVersion,
-      deadline: deadlineOf(),
+      deadline: opts.deadline ?? new Date(Date.now() + GATE_M_CALL_WINDOW_MS).toISOString(),
     },
-    budget,
-    modelFn: async (ctx) =>
-      validateResearchJ(await deps.transport.dispatch(ctx.contract, jRequest.payload), pkg, a.output, checklist, simulated, coveragePkgOf(pkg)),
-    simulated: deps.transport.describe().simulated,
-    ...(opts.holderId === undefined ? {} : { holderId: opts.holderId }),
+    budget, reuseDeadline: opts.deadline === undefined,
+    validate: (value) => validateResearchJ(value, pkg, a.output, checklist, simulated, coveragePkgOf(pkg)),
   });
 
   // 结论落库（STANDALONE 周度；J 改判 A 候选时 changeReason 必填由构造器校验）。
-  const conclusion = await persistResearchConclusion(deps.execPool, deps.store, {
+  const conclusion = await publishResearchCheckpoint(deps.execPool, deps.store, opts.lease!, {
     businessKey,
     methodVersion: versions.methodVersion,
     adapterVersion: versions.adapterVersion,
@@ -402,6 +415,7 @@ async function main(): Promise<void> {
   const binaryArg = flag('--binary');
   const schemaArg = flag('--schema');
   const holderArg = flag('--holder');
+  let cliLease: import('../kernel/lease.js').ExecutionLease | undefined;
   const dataPool = (await import('../db/pool.js')).createPool();
   const execPool = (await import('../db/pool.js')).createPool(schemaArg === undefined ? undefined : { schema: schemaArg });
   const { ArtifactStore } = await import('../artifacts/store.js');
@@ -413,6 +427,7 @@ async function main(): Promise<void> {
   try {
     const cutoff = cutoffArg ?? (await latestClosedCutoff(dataPool, subject));
     console.log(`[gate-m] 模式 ${execute ? 'EXECUTE（真跑，2 次授权调用）' : 'DRY-RUN（零模型调用、零 spawn）'} · 标的 ${kindArg ?? 'STOCK'} ${subject} · 截点 ${cutoff}`);
+    if (execute && holderArg) cliLease = await (await import('../kernel/lease.js')).acquireLease(execPool, 'kernel', holderArg);
     const outcome = await runGateM(
       {
         dataPool,
@@ -426,7 +441,7 @@ async function main(): Promise<void> {
         cutoff,
         execute,
         ...(aFrom === undefined ? {} : { aFrom }),
-        ...(holderArg === undefined ? {} : { holderId: holderArg }),
+        ...(cliLease === undefined ? {} : { lease: cliLease }),
       },
     );
     const { assembled, validation, prompts } = outcome;
@@ -496,6 +511,9 @@ async function main(): Promise<void> {
     console.error(`[gate-m] 失败：${String(error).slice(0, 600)}`);
     process.exitCode = 2;
   } finally {
+    if (cliLease) await (await import('../kernel/lease.js')).releaseLease(execPool, cliLease).catch((error) => {
+      console.error(`[gate-m] lease release: ${String(error)}`); process.exitCode = 2;
+    });
     await dataPool.end().catch(() => {});
     await execPool.end().catch(() => {});
   }

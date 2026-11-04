@@ -37,8 +37,12 @@ function fail(detail: string): never { throw new KernelError('POST_EVENT_CONTEXT
 /** 非可序列化核验收据；仅数据库+CAS 读回可以签发，调用者不能自报先验已验证。 */
 export interface VerifiedPrior { readonly kind: 'VERIFIED_PRIOR' }
 const verifiedPriors = new WeakMap<VerifiedPrior, string>();
+export function immutablePrior(prior: PriorResearch) {
+  const { settlement: _settlement, ...conclusion } = prior.conclusion;
+  return { ...prior, conclusion };
+}
 function priorReceiptHash(prior: PriorResearch, event: PostEventTriggerEvent, admittedAt: string): string {
-  return canonicalSha256({ prior, event: { ...event, eventTime: new Date(event.eventTime).toISOString() }, admittedAt: new Date(admittedAt).toISOString() });
+  return canonicalSha256({ prior: immutablePrior(prior), event: { ...event, eventTime: new Date(event.eventTime).toISOString() }, admittedAt: new Date(admittedAt).toISOString() });
 }
 export function assertVerifiedPrior(context: PostEventContext & { basis: 'INHERITED' }, receipt?: VerifiedPrior): void {
   if (receipt === undefined || verifiedPriors.get(receipt) !== priorReceiptHash(context.prior, context.event, context.admittedAt)) fail('继承缺少数据库/CAS 原文核验收据，或先验/事件/准入时点已被修改');
