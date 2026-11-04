@@ -351,10 +351,13 @@ describe('sr 引擎：C4 差集验收点', () => {
           ];
         }
         if (step === 'ANALYZE') {
-          // 同时注入 BLOCKING 质检：引用不存在的表——发布门必须因质检阻断（而非因合法非承重未解）
+          // 表引用仍合法；只保留两个完整情景，通过 ANALYZE 合同后由 QA 拒绝三情景不完整。
           const o = out as import('./transport.js').AnalyzeOutput;
-          const sec = o.sections[0];
-          if (sec) sec.tables = [...sec.tables, 'nonexistent-table-xyz'];
+          const outlook = o.sections.find((s) => s.key === 'outlook');
+          if (outlook) {
+            assert.ok(outlook.scenarios && outlook.scenarios.length === 3, '合成通道先提供完整三情景');
+            outlook.scenarios = outlook.scenarios.slice(0, 2);
+          }
         }
         return out;
       },
@@ -363,6 +366,7 @@ describe('sr 引擎：C4 差集验收点', () => {
     // 门因 BLOCKING 质检未过（单一裁定），但不是因为合法非承重未解项
     assert.equal(res.task.status, 'PARTIAL');
     assert.equal(res.report!.status, 'PUBLISHED_RESTRICTED');
+    assert.deepEqual(res.report!.qaFindings.filter((f) => f.severity === 'BLOCKING').map((f) => f.code), ['SCENARIO_MISSING'], '仅三情景完整性触发 QA 阻断');
     assert.ok(!res.report!.gate!.passed);
     assert.ok(res.report!.gate!.reason.includes('BLOCKING') || res.report!.gate!.reason.includes('质检'),
       `阻断原因应为质检而非承重未解（${res.report!.gate!.reason}）`);
@@ -585,8 +589,8 @@ describe('sr 引擎：C4 差集验收点', () => {
   });
 
   it('〔C4-03〕QA 阻断在 ASSEMBLE 失败恢复后保持：质检结论不丢、零模型重发', async () => {
-    // 场景：注入 BLOCKING（引用不存在表）→ 正常跑完为 PARTIAL/受限；然后模拟组装失败善后
-    // （ASSEMBLE 置 FAILED + 删除报告行），重入恢复——必须仍 PARTIAL/受限，且模型调用零新增。
+    // 场景：两个合法情景通过响应合同，QA 以 SCENARIO_MISSING 阻断 → PARTIAL/受限。
+    // ASSEMBLE 置 FAILED 并保留报告行，重入恢复必须仍 PARTIAL/受限、原版本且模型调用零新增。
     const task = await newTask('002384', '2026-10-24T16:00:00.000Z');
     const inner = new SimSrTransport();
     const blocker: SrModelTransport = {
@@ -595,8 +599,11 @@ describe('sr 引擎：C4 差集验收点', () => {
         const out = await inner.dispatch(step, ctx2, payload);
         if (step === 'ANALYZE') {
           const o = out as import('./transport.js').AnalyzeOutput;
-          const sec = o.sections[0];
-          if (sec) sec.tables = [...sec.tables, 'nonexistent-table-xyz'];
+          const outlook = o.sections.find((s) => s.key === 'outlook');
+          if (outlook) {
+            assert.ok(outlook.scenarios && outlook.scenarios.length === 3, '合成通道先提供完整三情景');
+            outlook.scenarios = outlook.scenarios.slice(0, 2);
+          }
         }
         return out;
       },
@@ -604,6 +611,7 @@ describe('sr 引擎：C4 差集验收点', () => {
     const first = await runSrTask(depsWith(blocker), task.taskId);
     assert.equal(first.task.status, 'PARTIAL', '首轮：门未过（BLOCKING）');
     assert.equal(first.report!.status, 'PUBLISHED_RESTRICTED');
+    assert.deepEqual(first.report!.qaFindings.filter((f) => f.severity === 'BLOCKING').map((f) => f.code), ['SCENARIO_MISSING'], '首轮确实到达 QA 三情景完整性检查');
     const callsAfterFirst = (await callRows()).length;
 
     // 模拟组装后工作文件写失败：保留已经插入的报告，重入同一步骤不增版。
@@ -615,6 +623,7 @@ describe('sr 引擎：C4 差集验收点', () => {
     assert.equal(second.task.status, 'PARTIAL', `恢复后仍 PARTIAL（实际 ${second.task.status}，error=${JSON.stringify(second.task.error)}）`);
     assert.ok(second.task.error && second.task.error.code === 'PUBLISH_GATE_BLOCKED', '恢复后仍是发布门阻断');
     assert.equal(second.report!.status, 'PUBLISHED_RESTRICTED', '恢复后仍受限发布');
+    assert.deepEqual(second.report!.qaFindings, first.report!.qaFindings, '恢复保留完整 QA 发现');
     assert.ok(!second.report!.gate!.passed, '门未过');
     assert.ok(second.report!.gate!.reason.includes('BLOCKING') || second.report!.gate!.reason.includes('质检'), `门原因含质检阻断（${second.report!.gate!.reason}）`);
     assert.equal((await callRows()).length, callsAfterFirst, '恢复零模型重发');
