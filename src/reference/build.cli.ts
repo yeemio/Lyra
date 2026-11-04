@@ -51,7 +51,7 @@ import {
   type DailyBarInput,
   type IndexBarInput,
 } from './excess.js';
-import { applyReferenceMigration, buildGroupLibrary, saveGroupStats } from './library.js';
+import { applyReferenceMigration, buildGroupLibrary, growthReferenceLineage, loadGrowthReferenceFacts, saveGroupStats } from './library.js';
 
 const repoRoot = fileURLToPath(new URL('../../', import.meta.url));
 const SUMMARY_PATH = join(repoRoot, 'data', 'reference-library-summary.json');
@@ -74,6 +74,7 @@ interface EventRow {
   eventType: string;
   subtype: string | null;
   eventTime: string;
+  attrs: Record<string, unknown>;
 }
 
 function mapColumns(columns: string[]): { subject: string; eventType: string; eventTime: string; subtype: string | null } | null {
@@ -165,6 +166,7 @@ async function main(): Promise<void> {
         eventType,
         subtype: typeof subtypeRaw === 'string' && subtypeRaw.length > 0 ? subtypeRaw : null,
         eventTime,
+        attrs: row.attrs !== null && typeof row.attrs === 'object' && !Array.isArray(row.attrs) ? row.attrs as Record<string, unknown> : {},
       });
     }
     // ---- R25.1 消费侧过滤：回购普通进展公告不触发新实例（域合同 HISTORICAL-REFERENCE §3.6）。
@@ -185,6 +187,8 @@ async function main(): Promise<void> {
     const asOfNow = new Date(materializedAt);
     events = events.filter((e) => Date.parse(e.eventTime) <= asOfNow.getTime());
     const inputFacts = new Map<string, TimePointFact>();
+    const growthFactsBySubject = new Map<string, TimePointFact[]>();
+    const growthByEvent = new Map<string, NonNullable<NonNullable<ReferenceEventLayers['lineage']>['growth']>>();
     const load = async (query: Parameters<typeof asOfFacts>[1]): Promise<TimePointFact[]> => {
       const facts = await asOfFacts(pool, query);
       for (const f of facts) inputFacts.set(f.factId, f);
@@ -196,6 +200,17 @@ async function main(): Promise<void> {
         return await blocked('EVENT_EVIDENCE_UNBOUND', e.eventId);
       }
       inputFacts.set(f.factId, f);
+      if (e.eventType === 'PERIOD_GROWTH_DELTA') {
+        let history = growthFactsBySubject.get(e.subject);
+        if (history === undefined) {
+          history = await loadGrowthReferenceFacts(pool, e.subject, asOfNow);
+          growthFactsBySubject.set(e.subject, history);
+        }
+        const growth = growthReferenceLineage(e, history);
+        growthByEvent.set(e.eventId, growth);
+        const ids = new Set(growth.revisionFactIds);
+        for (const original of history) if (ids.has(original.factId)) inputFacts.set(original.factId, original);
+      }
     }
     const subjects = [...new Set(events.map((e) => e.subject))].sort();
     const barsBySubject = new Map<string, DailyBarInput[]>();
@@ -265,6 +280,7 @@ async function main(): Promise<void> {
       for (const g of win.dataGaps) gapCounter.set(g, (gapCounter.get(g) ?? 0) + 1);
       samples.push({
         lineage: { eventId: e.eventId, evidenceFactId: e.evidenceFactId,
+          ...(growthByEvent.has(e.eventId) ? { growth: growthByEvent.get(e.eventId)! } : {}),
           windows: win.windows.map((w) => ({ h: w.h, status: w.status, endDate: w.endDate,
             maturedAt: w.endDate !== null && (w.status === 'OK' || w.status === 'INDEX_GAP')
               ? new Date(`${w.endDate}T15:00:00+08:00`).toISOString() : null })) },

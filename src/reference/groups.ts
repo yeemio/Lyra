@@ -251,6 +251,13 @@ export interface ReferenceEventLayers {
   lineage?: {
     eventId: string;
     evidenceFactId: string;
+    /** 增速事件：初披锚点与最新修订数值分开绑定，保留原检测快照。 */
+    growth?: {
+      firstDisclosureFactId: string;
+      previousEvidenceFactId: string;
+      revisionFactIds: string[];
+      attrs: Record<string, unknown>;
+    };
     windows: { h: 1 | 5 | 20; status: string; endDate: string | null; maturedAt: string | null }[];
   };
   subject: string;

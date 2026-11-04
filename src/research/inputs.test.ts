@@ -22,6 +22,7 @@ import { createPool } from '../db/pool.js';
 import { insertFact } from '../pintime/facts.js';
 import { readConclusion, persistConclusion } from '../db/conclusion.js';
 import { simulatedModelA, simulatedModelJ } from './simulated.js';
+import { requireResolvedBenchmark } from '../conclusion/benchmark.js';
 import { deriveChecklist } from './checklist.js';
 import {
   assembleResearchInput,
@@ -257,7 +258,11 @@ test('个股组装：八维 coverage、时点纪律、封存复用、程序校�
   const gapText = pkg.dimensions.flatMap((d) => d.gap).join('\n');
   assert.match(gapText, /D7: STOCK_BASIC 截点不可见/);
   assert.match(gapText, /D7: 股权质押比例未入库/);
-  assert.match(gapText, /D8: 历史参照群组块不可得/);
+  assert.match(gapText, /D8: REFERENCE_VERSION_NOT_VISIBLE：截点前无可见参照发布/);
+  const referenceVersion = pkg.materials.find((m) => m.materialId === 'mat:8:reference-version');
+  assert.ok(referenceVersion && referenceVersion.kind === 'RECORDS');
+  assert.deepEqual(referenceVersion.records, [{ status: 'REFERENCE_VERSION_NOT_VISIBLE', cutoff: CUTOFF }]);
+  assert.equal(pkg.materials.some((m) => m.materialId === 'mat:8:reference-group-stats'), false);
   assert.match(gapText, /D5: 融资融券余额未入库/);
   assert.match(gapText, /D2: (估值历史分位与行业分位不可精确计算|本股行业截面分位不可计算)/);
 
@@ -381,18 +386,23 @@ test('ETF 组装：七维映射、跟踪指数材料、缺口声明、程序校�
   assert.deepEqual(pkg.dimensions.map((d) => d.dimension), [1, 2, 3, 4, 5, 6, 7]);
   assert.equal(pkg.seals.length, 2); // ETF + INDEX/000300
   assert.equal(pkg.benchmark?.status, 'CURRENT_PROXY'); // 当前池在2022截点没有历史观察证明
+  assert.equal(pkg.benchmark?.reason, 'ETF_MAPPING_NOT_OBSERVED_AT_CUTOFF');
+  assert.equal(pkg.benchmark?.indexCode, '000300');
+  assert.throws(() => requireResolvedBenchmark(pkg.benchmark, { subjectKind: 'BROAD_ETF', subject: '510300', cutoff: CUTOFF }), /ETF_MAPPING_NOT_OBSERVED_AT_CUTOFF/);
   assert.equal(pkg.seals[1]?.businessKey.subject, '510300'); // 同业务键（selector 不同）
   const e5etf = pkg.materials.find((m) => m.materialId === 'mat:5:etf-bar-table');
   const e5idx = pkg.materials.find((m) => m.materialId === 'mat:5:tracking-index-bar-table');
   assert.ok(e5etf && e5etf.kind === 'BAR_TABLE' && e5etf.table.rows.length === 2);
   assert.ok(e5idx && e5idx.kind === 'BAR_TABLE' && e5idx.table.rows.length === 2);
+  assert.match(e5idx.title, /当前映射代理指数（非截点已证实基准） 000300/);
   const gapText = pkg.dimensions.flatMap((d) => d.gap).join('\n');
   for (const expected of [
-    'E1: 跟踪指数估值（PE/PB）as-of 不可见',
+    'E1: 当前映射代理指数（非截点已证实基准）估值（PE/PB）as-of 不可见',
     'E2: 成分股盈利数据未入库',
     'E3: 宏观与政策数据源未接入',
     'E4: 资金流向专用数据未入库',
     'E5: 市场宽度数据未入库',
+    'E5: ETF_MAPPING_NOT_OBSERVED_AT_CUTOFF：当前映射仅为代理，不具备正式结算资格',
     'E6: 可比指数序列未纳入本轮封存',
     'E7: 历史状态参照库未建',
   ]) {

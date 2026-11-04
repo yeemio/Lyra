@@ -17,6 +17,8 @@ import { readFile } from 'node:fs/promises';
 import type { Pool } from 'pg';
 import type { TimePointFact } from '../contracts.js';
 import { canonicalJsonString, canonicalSha256 } from '../canonical.js';
+import { queryFactRows, rowToFact } from '../db/pintime.js';
+import { detectGrowthEvents, eventIdOf, type DetectedEvent, type GrowthInput } from '../events/detect.js';
 import {
   NESTED_GROUP_DECLARATION,
   REVISION_NOTICE,
@@ -291,6 +293,62 @@ function instant(value: string): string {
   return new Date(ms).toISOString();
 }
 
+/** 建库专用历史读取：保留 superseded 原行，不能用 asOfFacts 隐去初披证据。 */
+export async function loadGrowthReferenceFacts(pool: Pool, subject: string, asOf: Date): Promise<TimePointFact[]> {
+  instant(asOf.toISOString());
+  return (await queryFactRows(pool, { subjectType: 'STOCK', subjectId: subject, factKind: 'FINANCIAL' }, asOf))
+    .map(rowToFact).filter((f) => (f.typedValue as Record<string, unknown> | null)?.bsQuery === 'growth');
+}
+
+/** 用原事实重演检测器；只绑定该事件已选定的数值快照，不把后来修订套到旧事件。 */
+export function growthReferenceLineage(
+  event: Pick<DetectedEvent, 'subject' | 'eventTime' | 'evidenceFactId' | 'attrs'>,
+  facts: readonly TimePointFact[],
+): NonNullable<NonNullable<ReferenceEventLayers['lineage']>['growth']> {
+  const fail = (): never => { throw new ReferenceVersionError('REFERENCE_GROWTH_LINEAGE_UNBOUND', `${event.subject}@${event.eventTime}`); };
+  if (event.attrs === null || typeof event.attrs !== 'object') return fail();
+  const threshold = event.attrs.threshold;
+  if (typeof threshold !== 'number' || !Number.isFinite(threshold) || threshold <= 0) return fail();
+  const rows: { fact: TimePointFact; input: GrowthInput }[] = [];
+  for (const fact of facts) {
+    const v = fact.typedValue as Record<string, unknown> | null;
+    if (fact.subjectType !== 'STOCK' || fact.subjectId !== event.subject || fact.factKind !== 'FINANCIAL' || v?.bsQuery !== 'growth') continue;
+    if (typeof v.statDate !== 'string' || typeof v.pubDate !== 'string') return fail();
+    const y = v.YOYNI;
+    rows.push({ fact, input: { factId: fact.factId, statDate: v.statDate, pubDate: v.pubDate,
+      availableAt: instant(fact.availableAt), yoyNi: y != null && y !== '' && Number.isFinite(Number(y)) ? Number(y) : null } });
+  }
+  const current = rows.find((r) => r.fact.factId === event.evidenceFactId);
+  const previous = rows.filter((r) => r.input.statDate === event.attrs.prevStatDate && r.input.pubDate === event.attrs.prevPubDate &&
+    r.input.yoyNi === event.attrs.yoyNiPrev).sort((a, b) => a.input.availableAt.localeCompare(b.input.availableAt) || a.fact.factId.localeCompare(b.fact.factId)).at(-1);
+  if (current === undefined || previous === undefined || current.input.statDate !== event.attrs.statDate) return fail();
+  // 两个报告期各以原选定数值事实的 availableAt 为修订链上限；版本仍绑定这些事实的真实观察/构建时间。
+  const history = rows.filter((r) =>
+    (r.input.statDate === current.input.statDate && r.input.availableAt <= current.input.availableAt) ||
+    (r.input.statDate === previous.input.statDate && r.input.availableAt <= previous.input.availableAt));
+  const byId = new Map(history.map((r) => [r.fact.factId, r]));
+  for (const row of history) {
+    const seen = new Set<string>();
+    let cursor = row;
+    while (cursor.fact.supersedesFactId !== null) {
+      if (seen.has(cursor.fact.factId)) return fail();
+      seen.add(cursor.fact.factId);
+      const parent = byId.get(cursor.fact.supersedesFactId);
+      if (parent === undefined || parent.input.statDate !== cursor.input.statDate || parent.input.availableAt > cursor.input.availableAt) return fail();
+      cursor = parent;
+    }
+  }
+  // 相同时刻的并存行不替换原选中的证据身份；阈值、差值及声明仍由现有检测器复算。
+  const replay = detectGrowthEvents(event.subject,
+    [current, previous, ...history.filter((r) => r !== current && r !== previous)].map((r) => r.input), threshold)
+    .events.find((e) => e.evidenceFactId === event.evidenceFactId);
+  if (replay === undefined || instant(replay.eventTime) !== instant(event.eventTime) || canonicalSha256(replay.attrs) !== canonicalSha256(event.attrs)) return fail();
+  const first = history.filter((r) => r.input.statDate === current.input.statDate)
+    .sort((a, b) => a.input.availableAt.localeCompare(b.input.availableAt) || a.fact.factId.localeCompare(b.fact.factId))[0]!;
+  return { firstDisclosureFactId: first.fact.factId, previousEvidenceFactId: previous.fact.factId,
+    revisionFactIds: history.map((r) => r.fact.factId).sort(), attrs: structuredClone(replay.attrs) };
+}
+
 /** 只构造有完整成员/成熟窗口/输入事实身份的版本。当前修订值不升级为严格 PIT。 */
 export function referenceVersionPayload(blocks: GroupStatBlock[], inputFacts: readonly TimePointFact[], buildIdentity = blocks[0]?.versionBinding): ReferenceVersionPayload {
   if (buildIdentity === undefined || (blocks.length !== 0 && inputFacts.length === 0)) throw new ReferenceVersionError('REFERENCE_LINEAGE_MISSING', '缺构建身份或非空群组的输入事实');
@@ -323,7 +381,16 @@ export function referenceVersionPayload(blocks: GroupStatBlock[], inputFacts: re
       const l = m.lineage;
       const fact = l === undefined ? undefined : byId.get(l.evidenceFactId);
       if (!l?.eventId || fact?.subjectType !== 'STOCK' || fact.subjectId !== m.subject ||
-          instant(fact.availableAt) > instant(m.eventTime) || instant(m.eventTime) > materializedAt) {
+          instant(m.eventTime) > materializedAt) {
+        throw new ReferenceVersionError('REFERENCE_EVENT_UNBOUND', `${m.subject}@${m.eventTime}`);
+      }
+      if (m.eventKey === 'PERIOD_GROWTH_DELTA') {
+        if (l.growth === undefined || l.eventId !== eventIdOf(m.subject, 'PERIOD_GROWTH_DELTA', l.evidenceFactId) ||
+            canonicalSha256(l.growth) !== canonicalSha256(growthReferenceLineage({ subject: m.subject,
+              eventTime: m.eventTime, evidenceFactId: l.evidenceFactId, attrs: l.growth.attrs }, factGroups.get(`STOCK/${m.subject}/FINANCIAL`) ?? []))) {
+          throw new ReferenceVersionError('REFERENCE_GROWTH_LINEAGE_UNBOUND', l.eventId);
+        }
+      } else if (l.growth !== undefined || instant(fact.availableAt) > instant(m.eventTime)) {
         throw new ReferenceVersionError('REFERENCE_EVENT_UNBOUND', `${m.subject}@${m.eventTime}`);
       }
       const memberHash = canonicalSha256(m);
