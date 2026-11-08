@@ -1,3 +1,4 @@
+import { acquireLease, releaseLease, keepLeaseAlive, type ExecutionLease } from './lease.js';
 /**
  * W1 单测 · permit 生命周期（EK-3/4/5/6）：预算阻断与修复重试、send-once 幂等、
  * 状态机非法迁移、markSent 截止、UNKNOWN 退役须 confirmedBy。隔离 schema 生命周期同 lock.test。
@@ -23,6 +24,8 @@ import {
 } from './permit.js';
 
 const schema = `w1_${Date.now().toString(36)}_${randomUUID().replaceAll('-', '').slice(0, 12)}`;
+let testLease: ExecutionLease;
+let testKeeper: ReturnType<typeof keepLeaseAlive>;
 let pool: Pool;
 let admin: Pool;
 
@@ -30,9 +33,12 @@ before(async () => {
   admin = createPool();
   await applySchema(admin, schema);
   pool = createPool({ schema });
+  testLease = await acquireLease(pool, 'kernel'); testKeeper = keepLeaseAlive(pool, testLease);
 });
 
 after(async () => {
+  await testKeeper?.stop();
+  if (testLease) await releaseLease(pool, testLease);
   await pool.end();
   await dropSchema(admin, schema);
   await admin.end();
@@ -40,7 +46,8 @@ after(async () => {
 
 const budget: PlanAuthBudget = {
   planAuthVersion: 'pa-0.1',
-  maxModelCallsPerWeek: 40,
+  maxModelCallsPerWeek: 500,
+  scopeLimits: { weekly: 500, postEvent: 500 },
   maxInputBytes: 5000,
   maxInFlight: 2,
 };
@@ -90,7 +97,7 @@ describe('preparePermit：预算判定（EK-4.4/4.5）', () => {
     const contract = mkContract({ inputBytes: 4500, inputHash: 'b'.repeat(64) }, '600101');
     const permit = await preparePermit(pool, contract, budget);
     assert.equal(permit.state, 'PREPARED');
-    const sent = await markSent(pool, permit.permitId);
+    const sent = await markSent(pool, permit.permitId, testLease, budget);
     assert.equal(sent.state, 'SENT');
     await settle(pool, permit.permitId, { result: 'SUCCEEDED' });
     const rows = await pool.query(
@@ -102,7 +109,7 @@ describe('preparePermit：预算判定（EK-4.4/4.5）', () => {
   it('键上已有已发送链时，超预算提交不覆盖既有链（send-once 优先）', async () => {
     const key = '600102';
     const ok = await preparePermit(pool, mkContract({ inputBytes: 100 }, key), budget);
-    await markSent(pool, ok.permitId);
+    await markSent(pool, ok.permitId, testLease, budget);
     await settle(pool, ok.permitId, { result: 'SUCCEEDED' });
     await assertKernelError(
       () => preparePermit(pool, mkContract({ inputBytes: 9999 }, key), budget),
@@ -118,19 +125,19 @@ describe('send-once（EK-4.1/4.2）', () => {
     // SUCCEEDED 后
     const k1 = mkContract({ inputBytes: 100 }, '600200');
     const p1 = await preparePermit(pool, k1, budget);
-    await markSent(pool, p1.permitId);
+    await markSent(pool, p1.permitId, testLease, budget);
     await settle(pool, p1.permitId, { result: 'SUCCEEDED' });
     await assertKernelError(() => preparePermit(pool, mkContract({}, '600200'), budget), 'BUSINESS_KEY_ALREADY_SENT');
     // SENT 中
     const k2 = mkContract({ inputBytes: 100 }, '600201');
     const p2 = await preparePermit(pool, k2, budget);
-    await markSent(pool, p2.permitId);
+    await markSent(pool, p2.permitId, testLease, budget);
     await assertKernelError(() => preparePermit(pool, mkContract({}, '600201'), budget), 'BUSINESS_KEY_ALREADY_SENT');
     await settle(pool, p2.permitId, { result: 'SUCCEEDED' }); // 清场：不向后继测试泄漏在途 SENT
     // UNKNOWN 后（EK-5.2：不自动重采样）
     const k3 = mkContract({ inputBytes: 100 }, '600202');
     const p3 = await preparePermit(pool, k3, budget);
-    await markSent(pool, p3.permitId);
+    await markSent(pool, p3.permitId, testLease, budget);
     await settle(pool, p3.permitId, { result: 'UNKNOWN', basis: 'TEST' });
     await assertKernelError(() => preparePermit(pool, mkContract({}, '600202'), budget), 'BUSINESS_KEY_ALREADY_SENT');
   });
@@ -182,14 +189,14 @@ describe('状态机（EK-3.3）', () => {
 
   it('终态无出边：SUCCEEDED→FAILED、UNKNOWN→SUCCEEDED、二次 markSent 均非法', async () => {
     const p1 = await preparePermit(pool, mkContract({ inputBytes: 100 }, '600302'), budget);
-    await markSent(pool, p1.permitId);
+    await markSent(pool, p1.permitId, testLease, budget);
     await settle(pool, p1.permitId, { result: 'SUCCEEDED' });
     await assertKernelError(() => settle(pool, p1.permitId, { result: 'FAILED', failCode: 'X' }), 'PERMIT_STATE_INVALID');
     await assertKernelError(() => settle(pool, p1.permitId, { result: 'UNKNOWN', basis: 'X' }), 'PERMIT_STATE_INVALID');
-    await assertKernelError(() => markSent(pool, p1.permitId), 'PERMIT_STATE_INVALID');
+    await assertKernelError(() => markSent(pool, p1.permitId, testLease, budget), 'PERMIT_STATE_INVALID');
 
     const p2 = await preparePermit(pool, mkContract({ inputBytes: 100 }, '600303'), budget);
-    await markSent(pool, p2.permitId);
+    await markSent(pool, p2.permitId, testLease, budget);
     await settle(pool, p2.permitId, { result: 'UNKNOWN', basis: 'X' });
     await assertKernelError(() => settle(pool, p2.permitId, { result: 'SUCCEEDED' }), 'PERMIT_STATE_INVALID');
     // UNKNOWN 也不得被改写为 FAILED（EK-5.1：不改口）
@@ -211,7 +218,7 @@ describe('状态机（EK-3.3）', () => {
     ];
     for (const c of cases) {
       const p = await preparePermit(pool, mkContract({ inputBytes: 100 }, c.subject), budget);
-      await markSent(pool, p.permitId);
+      await markSent(pool, p.permitId, testLease, budget);
       const after = await settle(pool, p.permitId, c.outcome);
       assert.equal(after.state, c.outcome.result);
       assert.ok(after.settledAt, '终态记录时刻');
@@ -227,7 +234,7 @@ describe('markSent 截止（EK-6）', () => {
       '600400',
     );
     const p = await preparePermit(pool, contract, budget);
-    await assertKernelError(() => markSent(pool, p.permitId), 'DEADLINE_EXCEEDED');
+    await assertKernelError(() => markSent(pool, p.permitId, testLease, budget), 'DEADLINE_EXCEEDED');
     const after = await getPermit(pool, p.permitId);
     assert.equal(after?.state, 'FAILED');
     assert.equal(after?.failCode, 'DEADLINE_EXCEEDED');
@@ -241,7 +248,7 @@ describe('markSent 截止（EK-6）', () => {
     );
     const p = await preparePermit(pool, contract, budget);
     assert.equal(p.state, 'PREPARED');
-    const sent = await markSent(pool, p.permitId);
+    const sent = await markSent(pool, p.permitId, testLease, budget);
     assert.equal(sent.state, 'SENT');
     await settle(pool, p.permitId, { result: 'SUCCEEDED' });
     const rows = await pool.query(
@@ -273,22 +280,24 @@ describe('tryMarkSent 并发闸（EK-2.3/7.1）', () => {
     const p0 = await preparePermit(pool, mkContract({ inputBytes: 100 }, '600500'), budget);
     const p1 = await preparePermit(pool, mkContract({ inputBytes: 100 }, '600501'), budget);
     const p2 = await preparePermit(pool, mkContract({ inputBytes: 100 }, '600502'), budget);
-    assert.equal((await tryMarkSent(pool, p0.permitId, 2)).kind, 'SENT');
-    assert.equal((await tryMarkSent(pool, p1.permitId, 2)).kind, 'SENT');
+    assert.equal((await tryMarkSent(pool, p0.permitId, 2, testLease, budget)).kind, 'SENT');
+    assert.equal((await tryMarkSent(pool, p1.permitId, 2, testLease, budget)).kind, 'SENT');
     assert.equal(await countInFlight(pool), 2);
-    const full = await tryMarkSent(pool, p2.permitId, 2);
+    const full = await tryMarkSent(pool, p2.permitId, 2, testLease, budget);
     assert.equal(full.kind, 'IN_FLIGHT_FULL');
     assert.equal((await getPermit(pool, p2.permitId))?.state, 'PREPARED', '排队不报错、不降配额');
     await settle(pool, p0.permitId, { result: 'SUCCEEDED' });
-    const now = await tryMarkSent(pool, p2.permitId, 2);
+    const now = await tryMarkSent(pool, p2.permitId, 2, testLease, budget);
     assert.equal(now.kind, 'SENT');
+    await settle(pool, p1.permitId, { result: 'SUCCEEDED' });
+    await settle(pool, p2.permitId, { result: 'SUCCEEDED' });
   });
 });
 
 describe('UNKNOWN 本地退役（EK-5.3 + R21）', () => {
   async function mkUnknown(subject: string): Promise<string> {
     const p = await preparePermit(pool, mkContract({ inputBytes: 100 }, subject), budget);
-    await markSent(pool, p.permitId);
+    await markSent(pool, p.permitId, testLease, budget);
     await settle(pool, p.permitId, { result: 'UNKNOWN', basis: 'TEST_SILENCE' });
     return p.permitId;
   }
@@ -303,7 +312,7 @@ describe('UNKNOWN 本地退役（EK-5.3 + R21）', () => {
 
   it('非 UNKNOWN 态 → PERMIT_STATE_INVALID', async () => {
     const p = await preparePermit(pool, mkContract({ inputBytes: 100 }, '600601'), budget);
-    await markSent(pool, p.permitId);
+    await markSent(pool, p.permitId, testLease, budget);
     await settle(pool, p.permitId, { result: 'SUCCEEDED' });
     await assertKernelError(() => retireUnknown(pool, p.permitId, 'owner'), 'PERMIT_STATE_INVALID');
   });
@@ -329,9 +338,9 @@ describe('UNKNOWN 本地退役（EK-5.3 + R21）', () => {
 describe('listUnclosedPermits（EK-8.2 的 pending 语义）', () => {
   it('SENT 未终结与未退役 UNKNOWN 计入；退役后移出', async () => {
     const sent = await preparePermit(pool, mkContract({ inputBytes: 100 }, '600700'), budget);
-    await markSent(pool, sent.permitId);
+    await markSent(pool, sent.permitId, testLease, budget);
     const unk = await preparePermit(pool, mkContract({ inputBytes: 100 }, '600701'), budget);
-    await markSent(pool, unk.permitId);
+    await markSent(pool, unk.permitId, testLease, budget);
     await settle(pool, unk.permitId, { result: 'UNKNOWN', basis: 'TEST' });
     let pending = await listUnclosedPermits(pool);
     assert.ok(pending.some((p) => p.permitId === sent.permitId));

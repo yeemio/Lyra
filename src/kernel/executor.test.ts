@@ -38,7 +38,8 @@ after(async () => {
 
 const budget: PlanAuthBudget = {
   planAuthVersion: 'pa-0.1',
-  maxModelCallsPerWeek: 40,
+  maxModelCallsPerWeek: 500,
+  scopeLimits: { weekly: 500, postEvent: 500 }, // Explicit synthetic test authorization; separate budget gate tests use small caps.
   maxInputBytes: 5000,
   maxInFlight: 2,
 };
@@ -147,7 +148,7 @@ describe('四道闸（零释放次序）', () => {
   });
 
   it('执行权（可选 holderId）：非持有者 → EXECUTION_LOCK_HELD，零 permit 落位', async () => {
-    await acquireExecutorLock(pool, 'exec-a');
+    const { lease } = await acquireExecutorLock(pool, 'exec-a');
     let calls = 0;
     const modelFn: ModelFn = async () => { calls++; return {}; };
     await assertKernelError(
@@ -160,10 +161,10 @@ describe('四道闸（零释放次序）', () => {
     const rows = await pool.query(`select count(*)::int as n from exec_permit where subject='601513'`);
     assert.equal(rows.rows[0].n, 0, '执行权拒绝先于 permit 落位');
     const ok = await runModelCall(pool, {
-      contract: mkContract({}, '601513'), budget, modelFn, simulated: true, holderId: 'exec-a',
+      contract: mkContract({}, '601513'), budget, modelFn, simulated: true, lease,
     });
     assert.equal(ok.permit.state, 'SUCCEEDED');
-    await releaseExecutorLock(pool, 'exec-a');
+    await releaseExecutorLock(pool, lease);
   });
 });
 
@@ -331,18 +332,18 @@ describe('截止三分支（EK-6.2 + R22）', () => {
     assert.equal(row.rows[0].fail_code, 'EXPLICIT_FAIL', '晚到的显式错误按原错误码落库，不冒充 DEADLINE_EXCEEDED');
   });
 
-  it('modelFn 窗内注入 TIMEOUT 故障 → FAILED/DEADLINE_EXCEEDED', async () => {
+  it('modelFn 窗内注入 TIMEOUT 故障 → UNKNOWN/TIMEOUT', async () => {
     await assertKernelError(
       () => runModelCall(pool, {
         contract: mkContract({}, '601542'), budget,
         modelFn: async () => { throw new KernelError('TIMEOUT', '模拟超时'); },
         simulated: true,
       }),
-      'DEADLINE_EXCEEDED',
+      'TIMEOUT',
     );
     const row = await pool.query(`select state, fail_code from exec_permit where subject='601542'`);
-    assert.equal(row.rows[0].state, 'FAILED');
-    assert.equal(row.rows[0].fail_code, 'DEADLINE_EXCEEDED');
+    assert.equal(row.rows[0].state, 'UNKNOWN');
+    assert.equal(row.rows[0].fail_code, 'TIMEOUT');
   });
 });
 
@@ -369,7 +370,7 @@ describe('发送后故障（EK-5）', () => {
     assert.equal(calls, 1);
   });
 
-  it('EXPLICIT_FAIL → FAILED 具名；非 KernelError → FAILED/MODEL_FN_ERROR 且重抛', async () => {
+  it('EXPLICIT_FAIL → FAILED 具名；非 KernelError → UNKNOWN/MODEL_FN_ERROR 且重抛', async () => {
     await assertKernelError(
       () => runModelCall(pool, {
         contract: mkContract({}, '601551'), budget,
@@ -390,7 +391,7 @@ describe('发送后故障（EK-5）', () => {
       /boom/,
     );
     row = await pool.query(`select state, fail_code from exec_permit where subject='601552'`);
-    assert.equal(row.rows[0].state, 'FAILED');
+    assert.equal(row.rows[0].state, 'UNKNOWN');
     assert.equal(row.rows[0].fail_code, 'MODEL_FN_ERROR');
   });
 });

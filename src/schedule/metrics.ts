@@ -14,7 +14,7 @@
  *   - 原件完整性抽查：随机（种子化，同窗可复现）抽 N 个 seal_manifest（N 默认 5），
  *     每个封存的全部 artifact 哈希在原件库做哈希校验读（readBytes 内建重算比对）。
  * SC-11.4 纪律：本模块只产出工程与流程质量指标，不含任何效果评价字段；
- * 不可从库面观测的量（send-once 拒绝：拒绝抛错不落行）显式置 null 并注明，不猜零。
+ * execution_attempt 单列请求尝试，实际调用只按 sent_at 计数；旧历史不回填或猜零。
  */
 import { createHash } from 'node:crypto';
 import type { Pool } from 'pg';
@@ -152,11 +152,11 @@ export interface PermitWeekStats {
   researchKeys: number;
   /** 其中 J permit 窗内 SUCCEEDED（且非 LATE_COMPLETED）的业务键数。 */
   researchKeysOnWindowCompleted: number;
-  /** 未按窗完成：FAILED/DEADLINE_EXCEEDED + SUCCEEDED/LATE_COMPLETED（迟到诚实记时）。 */
+  /** 未按窗完成：FAILED|UNKNOWN / DEADLINE_EXCEEDED + SUCCEEDED/LATE_COMPLETED。 */
   notOnWindow: number;
   /**
-   * send-once 拒绝计数。null = 库面不可观测：BUSINESS_KEY_ALREADY_SENT 抛错不落行
-   * （EK-4.1 唯一约束兜底，拒绝无行可数）——如实声明，不猜零。运行期观测归执行器日志。
+   * 新 execution_attempt 记录中观察到的 send-once 拒绝；无尝试记录时 null。
+   * 升级前未记录的拒绝仍不可观测，不能从 0 推断旧历史没有拒绝。
    */
   sendOnceRejections: number | null;
 }
@@ -175,6 +175,7 @@ export interface ProcessMetricsDetail {
   weekStart: string;
   weekEnd: string;
   permits: PermitWeekStats;
+  attempts: { observed: number; unfinished: number; returned: number; rejected: number };
   /** 事件检测命中（events 本周 created_at 新增）。 */
   eventsDetected: number;
   /** 封存新增（seal_manifest 本周新行；W26 下 ⇔ 材料真实变化）。 */
@@ -210,6 +211,7 @@ interface PermitWeekRow {
   stage: string;
   deadline: Date;
   settled_at: Date | null;
+  sent_at: Date | null;
 }
 
 function emptyByState(): Record<PermitState, number> {
@@ -238,10 +240,12 @@ function permitStatsOf(rows: readonly PermitWeekRow[]): PermitWeekStats {
     if (state in byState) byState[state] += 1;
     if (r.simulated) stats.simulatedTrue += 1;
     else stats.simulatedFalse += 1;
-    if (r.research_kind === 'POST_EVENT') stats.postEventCalls += 1;
-    else stats.weeklyCalls += 1;
+    if (r.sent_at !== null) {
+      if (r.research_kind === 'POST_EVENT') stats.postEventCalls += 1;
+      else stats.weeklyCalls += 1;
+    }
     if (
-      (state === 'FAILED' && r.fail_code === 'DEADLINE_EXCEEDED') ||
+      ((state === 'FAILED' || state === 'UNKNOWN') && r.fail_code === 'DEADLINE_EXCEEDED') ||
       (state === 'SUCCEEDED' && r.fail_code === 'LATE_COMPLETED')
     ) {
       stats.notOnWindow += 1;
@@ -276,13 +280,17 @@ export async function collectProcessMetrics(
     throw new MetricsError('METRICS_WINDOW_INVALID', `weekStart >= weekEnd（${opts.weekStart} / ${opts.weekEnd}）`);
   }
 
-  // ① permit 面（exec_permit 本周行；created_at = 当前尝试时刻，冲突替换时刷新）
+  // ① permit 面（已发送按 sent_at 归周；未发送拒绝按 created_at 保留（不能将拒绝算成实际调用））
   const permits = await pool.query<PermitWeekRow>(
-    `select state, fail_code, simulated, research_kind, subject_kind, subject, cutoff, stage, deadline, settled_at
-     from exec_permit where created_at >= $1 and created_at < $2 order by created_at, permit_id`,
+    `select state, fail_code, simulated, research_kind, subject_kind, subject, cutoff, stage, deadline, settled_at, sent_at
+     from exec_permit where coalesce(sent_at,created_at) >= $1 and coalesce(sent_at,created_at) < $2 order by coalesce(sent_at,created_at), permit_id`,
     [opts.weekStart, opts.weekEnd],
   );
   const permitStats = permitStatsOf(permits.rows);
+  const attempts = (await pool.query<{ finished_at: Date | null; outcome: string | null; fail_code: string | null }>(
+    "select finished_at,outcome,fail_code from execution_attempt where space='kernel' and started_at >= $1 and started_at < $2 order by started_at,attempt_id",
+    [opts.weekStart, opts.weekEnd])).rows;
+  if (attempts.length) permitStats.sendOnceRejections = attempts.filter((a) => a.fail_code === 'BUSINESS_KEY_ALREADY_SENT').length;
 
   // ② 事件检测命中（events 本周新增；created_at 口径）
   const events = await pool.query<{ n: string }>(
@@ -317,7 +325,7 @@ export async function collectProcessMetrics(
     if (row.annotation !== null && row.annotation.startsWith('BLOCKED:')) blocked += 1;
   }
   const deferred = await pool.query<{ n: string }>(
-    `select count(*)::text as n from schedule_admission where queue_class = 'WEEKLY_DEFERRED' and sent = false`,
+    `select count(*)::text as n from schedule_admission a where queue_class = 'WEEKLY_DEFERRED' and sent = false and not exists(select 1 from exec_permit p where p.subject_kind=a.subject_kind and p.subject=a.subject and p.research_kind=a.research_kind and p.cutoff=a.cutoff and p.sent_at is not null)`,
   );
 
   // ⑤ 原件完整性抽查（store 提供时顺带执行；种子 = weekStart，同窗可复现）
@@ -337,7 +345,7 @@ export async function collectProcessMetrics(
 
   const honestyNotes = [
     'paused 恒 0：暂停上报（SC-8.4 STOP_AND_PAUSE_REPORT）无落库登记面，未观测 ≠ 无暂停',
-    'sendOnceRejections 为 null：send-once 拒绝抛错不落行，库面不可观测（EK-4.1 唯一约束兜底）',
+    'attempts 是新执行入口实际记录的请求尝试（含预检/预算拒绝和未完成记录）；旧历史未回填，sendOnceRejections 无记录时为 null。尝试数不作为发送或费用数',
     '事件命中按 events.created_at（检测落库时刻）；整批回填日该口径失真，如实注明',
     '封存新增按 seal_manifest 新行计数（W26 幂等复用下新行 ⇔ 材料真实变化）',
   ];
@@ -346,6 +354,8 @@ export async function collectProcessMetrics(
     weekStart: opts.weekStart,
     weekEnd: opts.weekEnd,
     permits: permitStats,
+    attempts: { observed: attempts.length, unfinished: attempts.filter((a) => a.finished_at === null).length,
+      returned: attempts.filter((a) => a.outcome === 'RETURNED').length, rejected: attempts.filter((a) => a.outcome === 'REJECTED').length },
     eventsDetected: Number(events.rows[0]?.n ?? 0),
     sealsAdded,
     gaps: {

@@ -1,3 +1,7 @@
+import { keepLeaseAlive, type ExecutionLease } from '../kernel/lease.js';
+import { inputFromTestSeal } from '../research/research-test-helper.js';
+import { researchMaterial } from '../research/requests.js';
+import { researchJInputHash } from '../research/validation.js';
 /**
  * Lyra · 旅程测试安装门（P0 Done-when 1；EK-10.2 七断言 + P0 补充断言）。W3: code-writer-pro。
  *
@@ -98,6 +102,8 @@ const LAST_RUN_PATH = join(REPO_ROOT, '.last-journey-run.json');
 const PROBE_PATH = fileURLToPath(new URL('../kernel/probe.ts', import.meta.url));
 const RECORD_INSTALL_PATH = fileURLToPath(new URL('../kernel/record-install.ts', import.meta.url));
 
+let testLease: ExecutionLease;
+let testKeeper: ReturnType<typeof keepLeaseAlive>;
 let env: JourneyEnv | undefined;
 let universe: SyntheticUniverse | undefined;
 
@@ -118,15 +124,17 @@ function jt(name: string, fn: () => Promise<void> | void): void {
 
 before(async () => {
   env = await startJourney();
-  await acquireExecutorLock(env.pool, HOLDER);
+  testLease = (await acquireExecutorLock(env.pool, HOLDER)).lease;
+  testKeeper = keepLeaseAlive(env.pool, testLease);
   universe = await buildSyntheticUniverse(env.pool, env.store);
 });
 
 beforeEach(async () => {
-  if (env) await heartbeatExecutorLock(env.pool, HOLDER); // 心跳续租，防长套件 TTL 过期
+  if (env) await heartbeatExecutorLock(env.pool, testLease); // 心跳续租，防长套件 TTL 过期
 });
 
 after(async () => {
+  await testKeeper?.stop();
   if (!env) return;
   const green = failCount === 0 && passCount > 0;
   const record = {
@@ -248,30 +256,14 @@ async function sealRound(subjectKind: SubjectKind, subject: string, cutoffIso: s
 }
 
 function mkAInput(seal: SealManifest): SimulatedAInput {
-  const artifactSha256s = seal.artifactRefs.map((r) => r.sha256).sort();
-  return {
-    inputHash: canonicalSha256({
-      stage: 'A',
-      manifestHash: seal.manifestHash,
-      subjectKind: seal.businessKey.subjectKind,
-      subject: seal.businessKey.subject,
-      factCount: seal.factIds.length,
-      artifactSha256s,
-    }),
-    subjectKind: seal.businessKey.subjectKind,
-    subject: seal.businessKey.subject,
-    material: { artifactSha256s, factCount: seal.factIds.length, gaps: ['合成宇宙：无真实数据源（P0）'] },
-  };
+  const pkg = inputFromTestSeal(seal);
+  return { inputHash: pkg.inputHash, subjectKind: seal.businessKey.subjectKind,
+    subject: seal.businessKey.subject, material: researchMaterial(pkg) };
 }
 
 function mkJInput(seal: SealManifest, aOutput: AOutput, checklist: ProgramChecklist): SimulatedJInput {
   return {
-    inputHash: canonicalSha256({
-      stage: 'J',
-      aOutputHash: canonicalSha256(aOutput),
-      checklistHash: checklist.checklistHash,
-      manifestHash: seal.manifestHash,
-    }),
+    inputHash: researchJInputHash(inputFromTestSeal(seal), aOutput, checklist),
     subjectKind: seal.businessKey.subjectKind,
     aOutput,
     checklist,
@@ -298,7 +290,7 @@ async function callA(seal: SealManifest, versions: RoundVersions, fault?: SimFau
     budget: e().budget,
     modelFn: withFault(simulatedModelAFn(input), fault),
     simulated: true,
-    holderId: HOLDER,
+    lease: testLease,
   });
   return { aOutput: r.output, permitId: r.permit.permitId };
 }
@@ -311,7 +303,7 @@ async function callJ(seal: SealManifest, aOutput: AOutput, checklist: ProgramChe
     budget: e().budget,
     modelFn: withFault(simulatedModelJFn(input), fault),
     simulated: true,
-    holderId: HOLDER,
+    lease: testLease,
   });
   return { jOutput: r.output, permitId: r.permit.permitId };
 }
@@ -348,6 +340,7 @@ async function runFullRound(
     checklist,
     jOutput,
     manifest: seal,
+    researchInput: inputFromTestSeal(seal),
     inheritance: opts.inheritance ?? null,
     changeReason: opts.changeReason ?? jOutput.changeReason ?? null,
   };
@@ -494,7 +487,7 @@ jt('EK-10.2.1：非执行权持有者与 RECONCILING 态均零 permit、具名�
     budget: e().budget,
     modelFn: withDelay(simulatedModelAFn(slowInput), 250),
     simulated: true,
-    holderId: HOLDER,
+    lease: testLease,
   });
   await waitPermitState('600901', 'A', 'SENT');
   const state1 = await bootRecovery(e().pool);
@@ -507,7 +500,7 @@ jt('EK-10.2.1：非执行权持有者与 RECONCILING 态均零 permit、具名�
       budget: e().budget,
       modelFn: simulatedModelAFn({ ...slowInput, subject: '600900' }),
       simulated: true,
-      holderId: HOLDER,
+      lease: testLease,
     }),
     'RECOVERY_CONFIRM_REQUIRED',
   );
@@ -591,7 +584,7 @@ jt('EK-10.2.4：同业务键重复提交 → 发送 1 次、读回首次；重�
       budget: e().budget,
       modelFn: counting,
       simulated: true,
-      holderId: HOLDER,
+      lease: testLease,
     }),
     'BUSINESS_KEY_ALREADY_SENT',
   );
@@ -606,7 +599,7 @@ jt('EK-10.2.4：同业务键重复提交 → 发送 1 次、读回首次；重�
       budget: e().budget,
       modelFn: simulatedModelJFn(mkJInput(h.seal, h.aOutput, h.checklist)),
       simulated: true,
-      holderId: HOLDER,
+      lease: testLease,
     }),
     'BUSINESS_KEY_ALREADY_SENT',
   );
@@ -648,7 +641,7 @@ jt('INPUT_OVER_BUDGET：超预算具名阻断不进 SENT；修复后同键重试
       budget: e().budget,
       modelFn: withFault(mkCounting(input), 'INPUT_OVER_BUDGET'), // 若模型侧被调用即闸失效信号
       simulated: true,
-      holderId: HOLDER,
+      lease: testLease,
     }),
     'INPUT_OVER_BUDGET',
   );
@@ -669,7 +662,7 @@ jt('INPUT_OVER_BUDGET：超预算具名阻断不进 SENT；修复后同键重试
     budget: e().budget,
     modelFn: mkCounting(fixedInput),
     simulated: true,
-    holderId: HOLDER,
+    lease: testLease,
   });
   assert.equal(ok.permit.state, 'SUCCEEDED');
   assert.equal(calls, 1, '最终恰一次模型调用');
@@ -711,7 +704,7 @@ jt('EK-10.2.5：SILENCE_AFTER_SEND → UNKNOWN；退役需 Owner 确认；恢复
       budget: e().budget,
       modelFn: simulatedModelAFn({ inputHash: canonicalSha256({ t: 'during-unknown' }), subjectKind: 'STOCK', subject: '600908', material: { artifactSha256s: [u().sampleArtifactSha256], factCount: 1 } }),
       simulated: true,
-      holderId: HOLDER,
+      lease: testLease,
     }),
     'RECOVERY_CONFIRM_REQUIRED',
   );
@@ -766,7 +759,7 @@ jt('EK-10.2.6：短截止 → UNKNOWN/DEADLINE_EXCEEDED（R22）；permit 沿自
       budget: e().budget,
       modelFn: withFault(simulatedModelAFn(slowInput), 'TIMEOUT'),
       simulated: true,
-      holderId: HOLDER,
+      lease: testLease,
     }),
     'DEADLINE_EXCEEDED',
   );
@@ -789,7 +782,7 @@ jt('EK-10.2.6：短截止 → UNKNOWN/DEADLINE_EXCEEDED（R22）；permit 沿自
   const mutatedTemplate = { ...template, deadline: new Date(Date.now() - 1000).toISOString() };
   const mutatedBudget = { ...e().budget, maxModelCallsPerWeek: 99, planAuthVersion: 'pa-0.9' };
   assert.notEqual(mutatedTemplate.deadline, originalDeadline);
-  const sent = await markSent(e().pool, prepared.permitId); // 用 DB 行上的原 deadline（未来）→ SENT
+  const sent = await markSent(e().pool, prepared.permitId, testLease, e().budget); // 用 DB 行上的原 deadline（未来）→ SENT
   assert.equal(sent.state, 'SENT');
   assert.equal(sent.contract.deadline, originalDeadline, 'permit 沿自身 deadline，不读改后的模板');
   void mutatedBudget; // 预算对象更换不影响已落位 permit 的任何字段
@@ -805,7 +798,7 @@ jt('EK-10.2.6：短截止 → UNKNOWN/DEADLINE_EXCEEDED（R22）；permit 沿自
     e().budget,
     { simulated: true },
   );
-  await expectKernel(() => markSent(e().pool, expiredPrepared.permitId), 'DEADLINE_EXCEEDED');
+  await expectKernel(() => markSent(e().pool, expiredPrepared.permitId, testLease, e().budget), 'DEADLINE_EXCEEDED');
   const expiredAfter = await getPermit(e().pool, expiredPrepared.permitId);
   assert.equal(expiredAfter?.state, 'FAILED');
   assert.equal(expiredAfter?.failCode, 'DEADLINE_EXCEEDED');
@@ -901,7 +894,7 @@ jt('Done-when 2：第二执行器探测进程退出码 3；三路并发慢模型
       budget: e().budget,
       modelFn: withDelay(simulatedModelAFn(mkSlowInput(subject)), 300),
       simulated: true,
-      holderId: HOLDER,
+      lease: testLease,
     }),
   );
   const results = await Promise.all(runs);
@@ -1007,10 +1000,10 @@ jt('Done-when 5：跨类选项/清单绑定/哈希重导出/继承配对/覆盖/
     }),
     'INHERITANCE_PAIRING_INVALID',
   );
-  // J 改判 A 候选（changedFromA）→ changeReason 必填
-  await expectConclusion(
-    () => persistConclusion(e().pool, { ...base, jOutput: { ...base.jOutput, changedFromA: true, changeReason: null }, changeReason: null }),
-    'CHANGE_REASON_REQUIRED',
+  // 实际改判与自报标志共同核对；外部 reason 不能替代 J 自身理由。
+  await assert.rejects(
+    () => persistConclusion(e().pool, { ...base, jOutput: { ...base.jOutput, finalDisposition: base.aOutput.candidate === 'ABSTAIN' ? 'RESEARCH_OUTPERFORM' : 'ABSTAIN', changedFromA: true, changeReason: null }, changeReason: null }),
+    (error: unknown) => (error as { code?: string }).code === 'J_CHANGE_REASON_REQUIRED',
   );
   // 二次写拒绝（含完全相同的重放）：研究字段落库后不可变
   await expectConclusion(() => persistConclusion(e().pool, base), 'CONCLUSION_IMMUTABLE');
@@ -1024,15 +1017,16 @@ jt('Done-when 5：跨类选项/清单绑定/哈希重导出/继承配对/覆盖/
       const final = stockSpace.find(
         (d) => d !== realJ.finalDisposition && d !== a4.candidate,
       ) as (typeof STOCK_DISPOSITIONS)[number];
-      return { ...realJ, finalDisposition: final, changedFromA: true, changeReason: 'J 复核改判（合成注入演示）' };
+      return { ...realJ, finalDisposition: final, changedFromA: true, changeReason: 'J 复核改判（合成注入演示）',
+        strongestCaseDisposition: 'ACCEPTED', verdicts: realJ.verdicts.map((v) => ({ ...v, verdict: 'SUPPORTED', decisionBearing: true, correction: null, remainingBasisChecklistIds: [] })) };
     },
-    inheritance: { fromConclusionId: h.conclusion.conclusionId, fromConclusionHash: h.conclusion.conclusionHash },
-    changeReason: '继承改判演示：维持方向但记录理由（合成注入）',
+    inheritance: null,
+    changeReason: 'J 改判演示（合成注入，独立研究）',
   });
   assert.equal(overridden.conclusion.disposition, overridden.jOutput.finalDisposition);
   assert.notEqual(overridden.conclusion.disposition, overridden.aOutput.candidate, '结论值不抄录 A 候选');
-  assert.equal(overridden.conclusion.inheritance?.fromConclusionId, h.conclusion.conclusionId);
-  assert.equal(overridden.conclusion.standaloneNote, null, '继承结论无 standalone 标注');
+  assert.equal(overridden.conclusion.inheritance, null);
+  assert.equal(overridden.conclusion.standaloneNote, '无基础结论可继承');
   assert.ok((overridden.conclusion.changeReason ?? '').length > 0);
 
   // adoption 恒 false（读回断言）+ 结算占位区：回填只写占位区、研究字段与哈希不动

@@ -1,3 +1,4 @@
+import type { ExecutionLease } from '../../kernel/lease.js';
 /** Isolated SQL/transport doubles only. No database connection, credential lookup or model process. */
 import { createHash } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
@@ -20,10 +21,13 @@ export interface IsolatedSrSnapshot {
 export class IsolatedSrPool {
   readonly queries: string[] = [];
   readonly holderId = 'isolated-strategy-review-writer';
+  readonly lease: ExecutionLease = { space: 'sr', holderId: this.holderId, generation: '1', ttlMs: 60000 };
   lifecycle = 'RUNNING';
   private tasks = new Map<string, Row>();
   private steps = new Map<string, Row>();
   private calls = new Map<string, Row>();
+  private budgetLimits = new Map<string, Row>();
+  private attempts = new Map<string, Row>();
   constructor(snapshot?: IsolatedSrSnapshot) {
     if (snapshot) {
       if (snapshot.identity !== 'ISOLATED_SR_SQL_DOUBLE_NOT_DATABASE_EVIDENCE') throw new Error('NOT_ISOLATED_SNAPSHOT');
@@ -43,6 +47,22 @@ export class IsolatedSrPool {
     const result = (rows: Row[]) => ({ rows: structuredClone(rows), rowCount: rows.length });
     const now = new Date();
     if (['begin', 'commit', 'rollback'].includes(q) || q.startsWith('select pg_advisory_xact_lock')) return result([]);
+    if (q.startsWith('insert into execution_attempt')) {
+      this.attempts.set(String(args[0]), { attempt_id: args[0], space: args[1], contract: JSON.parse(String(args[2])) }); return result([]);
+    }
+    if (q.startsWith('update execution_attempt set finished_at=')) {
+      const row = this.attempts.get(String(args[0])); if (!row) return result([]);
+      Object.assign(row, { finished_at: now, outcome: args[1], fail_code: args[2], permit_id: args[3] }); return result([row]);
+    }
+    if (q.startsWith('insert into execution_budget_authorization')) {
+      const key = `${String(args[0])}:${String(args[1])}`;
+      if (!this.budgetLimits.has(key)) this.budgetLimits.set(key, { limits: JSON.parse(String(args[2])) }); return result([]);
+    }
+    if (q.startsWith('select limits from execution_budget_authorization')) return result([this.budgetLimits.get(`${String(args[0])}:${String(args[1])}`)!]);
+    if (q === 'select clock_timestamp() as current_time') return result([{ current_time: now }]);
+    if (q.startsWith('select holder,generation::text,lease_until from sr_engine_lock')) return result([{ holder: this.holderId, generation: '1', lease_until: new Date(now.getTime()+60000) }]);
+    if (q.startsWith('update sr_engine_lock set heartbeat_at')) return result([{ holder: this.holderId }]);
+    if (q.startsWith('select lifecycle from sr_recovery_state')) return result([{ lifecycle: this.lifecycle }]);
     if (q === 'select now() as now') return result([{ now }]);
     if (q.startsWith('select holder, heartbeat_at from sr_engine_lock')) return result([{ holder: this.holderId, heartbeat_at: now }]);
     if (q.startsWith('select lifecycle, pending_call_ids, updated_at from sr_recovery_state')) return result([{ lifecycle: this.lifecycle, pending_call_ids: [], updated_at: now }]);
@@ -65,6 +85,13 @@ export class IsolatedSrPool {
       this.steps.set(String(id), row); return result([row]);
     }
     if (q.startsWith('select * from sr_step where task_id')) return result([...this.steps.values()].filter((r) => r.task_id === args[0]).sort((a, b) => Number(a.sequence) - Number(b.sequence)));
+    if (q.startsWith('select input_checkpoint,input_checkpoint_hash from sr_step')) {
+      const row = this.steps.get(String(args[1])); return result(row ? [{ input_checkpoint: row.input_checkpoint ?? null, input_checkpoint_hash: row.input_checkpoint_hash ?? null }] : []);
+    }
+    if (q.startsWith('update sr_step set input_checkpoint=')) {
+      const row = this.steps.get(String(args[1])); if (!row) return result([]);
+      row.input_checkpoint=JSON.parse(String(args[2])); row.input_checkpoint_hash=args[3]; return result([row]);
+    }
     if (q.startsWith('update sr_step set')) {
       const r = this.steps.get(String(args[0])); if (!r) return result([]);
       if (args[1] !== null) r.status = args[1]; if (args[2] !== null) r.note = args[2]; if (args[3]) r.started_at = now; if (args[4]) r.finished_at = now; return result([r]);
@@ -74,18 +101,32 @@ export class IsolatedSrPool {
       if (!this.tasks.has(String(task)) || this.steps.get(String(step))?.task_id !== task) throw new Error('ISOLATED_SR_CALL_FK');
       const prior = [...this.calls.values()].find((r) => r.task_id === task && r.step_id === step);
       if (prior && (prior.sent_at !== null || !['PREPARED', 'FAILED'].includes(String(prior.state)))) return result([]);
-      if (prior) this.calls.delete(String(prior.call_id));
-      const row = { call_id: id, task_id: task, step_id: step, input_hash: inputHash, input_bytes: bytes, method_version: method, plan_auth_version: auth, deadline: new Date(String(deadline)), state: failCode ? 'FAILED' : 'PREPARED', simulated, sent_at: null, settled_at: failCode ? now : null, fail_code: failCode ?? null, provider: null, model_id: null, usage: null, created_at: now };
-      this.calls.set(String(id), row); return result([row]);
+      const callId = prior?.call_id ?? id;
+      const row = { call_id: callId, task_id: task, step_id: step, input_hash: inputHash, input_bytes: bytes, method_version: method, plan_auth_version: auth, deadline: new Date(String(deadline)), state: failCode ? 'FAILED' : 'PREPARED', simulated, sent_at: null, settled_at: failCode ? now : null, fail_code: failCode ?? null, provider: null, model_id: null, usage: null, created_at: now };
+      this.calls.set(String(callId), row); return result([row]);
     }
+    if (q.startsWith('select call_id as permit_id from sr_call')) return result([...this.calls.values()]
+      .filter((r) => r.task_id === args[0] && r.step_id === args[1] && r.input_hash === args[2]).map((r) => ({ permit_id: r.call_id })));
     if (q.startsWith('select * from sr_call where task_id')) return result([...this.calls.values()].filter((r) => r.task_id === args[0] && r.step_id === args[1]));
     if (q.startsWith('select * from sr_call where call_id')) return result(this.calls.has(String(args[0])) ? [this.calls.get(String(args[0]))!] : []);
+    if (q.startsWith('select state,simulated,response_checkpoint,response_hash from sr_call')) {
+      const row = this.calls.get(String(args[0])); return result(row ? [row] : []);
+    }
+    if (q.startsWith('select c.task_id,c.state,clock_timestamp()>c.deadline')) {
+      const row = this.calls.get(String(args[0])); return result(row ? [{ task_id: row.task_id, state: row.state,
+        expired: now > (row.deadline as Date), week_used: String([...this.calls.values()].filter((c) => c.sent_at).length),
+        task_used: String([...this.calls.values()].filter((c) => c.task_id===row.task_id && c.sent_at).length) }] : []);
+    }
+    if (q.startsWith("update sr_call set state='succeeded',settled_at=clock_timestamp()")) {
+      const row = this.calls.get(String(args[0])); if (!row || row.state!=='SENT' || row.execution_generation!==args[4]) return result([]);
+      row.state='SUCCEEDED'; row.settled_at=now; row.fail_code=args[3]; row.response_checkpoint=JSON.parse(String(args[1])); row.response_hash=args[2]; return result([row]);
+    }
     if (q.startsWith('update sr_call as c set state')) {
       const r = this.calls.get(String(args[0]));
       if (!r || r.state !== 'PREPARED' || now > (r.deadline as Date) || [...this.calls.values()].filter((x) => x.state === 'SENT').length >= Number(args[1])) return result([]);
-      r.state = 'SENT'; r.sent_at = now; return result([r]);
+      r.state = 'SENT'; r.sent_at = now; r.execution_generation=args[2]; return result([r]);
     }
-    if (q.startsWith('select *, now() > deadline as deadline_exceeded from sr_call')) {
+    if (q.startsWith('select *, clock_timestamp() > deadline as deadline_exceeded from sr_call')) {
       const r = this.calls.get(String(args[0])); return result(r ? [{ ...r, deadline_exceeded: now > (r.deadline as Date) }] : []);
     }
     if (q.startsWith("update sr_call set state = 'failed'")) {
@@ -182,12 +223,12 @@ export async function reproduceIsolatedReview(out: string) {
     for (const fault of ['NONE', 'A_UNKNOWN', 'A_SCHEMA', 'J_UNKNOWN', 'J_SCHEMA', 'J_NARROWED', 'J_CHANGED', 'J_REJECTED', 'J_UNRESOLVED'] as const) {
       const pool = new IsolatedSrPool(), transport = new IsolatedReviewTransport(pool, fault);
       const input = await freezeRealReviewInput(sourceStore, transport, isolatedRequest());
-      const args = { sourceStore, input, expectedInputHash: input.inputHash, srPool: pool.asPool(), transport, budget: input.execution.budget, outputDir: join(out, fault.toLowerCase()), holderId: pool.holderId };
+      const args = { sourceStore, input, expectedInputHash: input.inputHash, srPool: pool.asPool(), transport, budget: input.execution.budget, outputDir: join(out, fault.toLowerCase()), holderId: pool.holderId, lease: pool.lease };
       const first = await runRealStrategyReview(args);
       const snapshot = pool.snapshot();
       await writeFile(join(dirname(first.inputPath), 'isolated-sr-snapshot.json'), JSON.stringify(snapshot, null, 2) + '\n', { flag: 'wx' });
       const restoredPool = new IsolatedSrPool(JSON.parse(JSON.stringify(snapshot)) as IsolatedSrSnapshot), restoredTransport = new IsolatedReviewTransport(restoredPool, fault);
-      const recovered = await runRealStrategyReview({ ...args, srPool: restoredPool.asPool(), transport: restoredTransport, holderId: restoredPool.holderId });
+      const recovered = await runRealStrategyReview({ ...args, srPool: restoredPool.asPool(), transport: restoredTransport, holderId: restoredPool.holderId, lease: restoredPool.lease });
       if (restoredTransport.events.length !== 0) throw new Error('RECOVERY_RESENT');
       if (fault === 'NONE' && first.result.resultHash !== recovered.result.resultHash) throw new Error('RECOVERY_CHANGED_SUCCESS');
       const client = await writeReviewClientManifest(join(out, `${fault.toLowerCase()}-client`), recovered.inputPath, recovered.resultPath);

@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import type { ChatMessage, ReportDocument, ReportSection, SrTask } from './contracts.js';
-import { renderDashboard, renderLoginPage, renderMarkdown, renderReportPage, renderErrorPage } from './render.js';
+import { renderDashboard, renderLoginPage, renderMarkdown, renderReportPage, renderTaskPage, renderErrorPage } from './render.js';
 
 function section(p: Partial<ReportSection>): ReportSection {
   return { key: 'summary', title: '首页与研究摘要', narrative: '', findings: [], tables: [], citations: [], gaps: [], ...p };
@@ -39,6 +39,17 @@ const msgs: ChatMessage[] = [{
   content: '问<script>alert(1)</script>', citations: [], callId: null, suggestedAction: null,
   createdAt: '2026-10-26T00:00:00.000Z',
 }];
+
+it('PR5 版本导航隔离坏旧版，所选有效版与追问/修订版本一致', () => {
+  const current = { ...report('第二版有效正文'), version: 2 };
+  const invalid = { reportId: current.reportId, version: 1, status: 'PUBLISHED' as const,
+    createdAt: current.createdAt, publishedAt: current.publishedAt, unavailableReason: 'SR_REPORT_HASH_MISMATCH' };
+  const html = renderReportPage({ report: current, versions: [invalid, current], tablesById: {}, messages: [], csrf: 'synthetic' });
+  assert.ok(html.includes('第二版有效正文') && html.includes('v1（材料不可验证）'));
+  assert.ok(!html.includes(`href="/reports/${current.reportId}?v=1"`));
+  assert.equal((html.match(/name="report_version" value="2"/g) ?? []).length, 2);
+  assert.ok(html.includes(`/pdf?v=2`));
+});
 
 describe('渲染安全：模型/用户文本不可信', () => {
   it('script 注入被转义（narrative 与用户消息）', () => {
@@ -110,6 +121,27 @@ const pool = {
   ],
   etfs: [{ code: '510300', name: '沪深300ETF' }],
 };
+
+it('PR4 表单默认重投原请求；新意图键和原任务恢复保留 CSRF（仅内容断言）', () => {
+  const doc = report('synthetic');
+  const html = () => renderReportPage({ report: doc, versions: [doc], tablesById: {}, messages: [], csrf: 'csrf-synthetic' });
+  const first = html(), second = html();
+  const keys = (value: string) => [...value.matchAll(/name="request_key" value="([^"]+)"/g)].map((match) => match[1]);
+  assert.equal(keys(first).length, 2);
+  assert.equal(new Set([...keys(first), ...keys(second)]).size, 4, '显式新意图用独立键，刷新默认不采纳新键');
+  assert.equal((first.match(/name="intent_mode"><option value="REUSE">/g) ?? []).length, 2);
+  assert.equal((first.match(/<option value="NEW">/g) ?? []).length, 2);
+  assert.equal((first.match(/name="report_version" value="1"/g) ?? []).length, 2);
+  const forms = [...first.matchAll(/<form method="post" action="\/reports\/[^\"]+\/(?:chat|revise)"[^>]*>[\s\S]*?<\/form>/g)];
+  assert.equal(forms.length, 2);
+  for (const form of forms) assert.ok(form[0].includes('name="_csrf" value="csrf-synthetic"'));
+  const task = srTask({ status: 'FAILED', error: { code: 'REQUEST_UNKNOWN', message: '<untrusted>' } });
+  const failed = renderTaskPage({ task, steps: [], reports: [], csrf: 'csrf-synthetic' });
+  assert.ok(failed.includes(`action="/tasks/${task.taskId}/resume"`));
+  assert.ok(failed.includes('name="_csrf" value="csrf-synthetic"') && failed.includes('&lt;untrusted&gt;'));
+  assert.ok(!renderTaskPage({ task: srTask(), steps: [], reports: [], csrf: 'csrf-synthetic' }).includes('/resume'));
+  assert.ok(!renderTaskPage({ task, steps: [], reports: [] }).includes('/resume'));
+});
 
 function dashboardHtml(tasks: SrTask[], usedTask = 1, usedCall = 20): string {
   return renderDashboard({

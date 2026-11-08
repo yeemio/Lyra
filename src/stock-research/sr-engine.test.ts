@@ -25,6 +25,7 @@ import { SimSrTransport, RealSrTransport, realTransportConfigFromEnv } from './t
 import { askReportQuestion, runSrTask } from './engine.js';
 import {
   createTask,
+  getTask,
   getReportByTaskAndVersion,
   listReportVersions,
   srBootRecovery,
@@ -71,7 +72,7 @@ interface Deps {
 }
 
 function depsWith(transport: SrModelTransport): Deps {
-  return { srPool, dataPool, transport, budget: defaultSrPlanBudget(), outputDir: outDir };
+  return { srPool, dataPool, transport, budget: { ...defaultSrPlanBudget(), maxModelCallsPerWeek: 1000 }, outputDir: outDir };
 }
 
 async function newTask(subject: string, cutoff: string, emphasis: string | null = null) {
@@ -205,11 +206,13 @@ describe('sr 引擎：中断恢复与调用身份', () => {
     assert.ok(failedCall?.sentAt, '失败发生在发送后（sent_at 非空）');
 
     const stepsBefore = (await srPool.query(`select count(*)::int n from sr_step where task_id=$1`, [task.taskId])).rows[0].n;
+    const identitiesBefore = (await srPool.query('select call_id,step_id,state,sent_at,response_hash from sr_call where task_id=$1 order by call_id', [task.taskId])).rows;
     const callsBefore = (await callRows()).length;
     const second = await runSrTask(depsWith(new SimSrTransport()), task.taskId);
     assert.equal(second.task.status, 'FAILED', '同输入重跑必须失败（不得换 ID 重发）');
-    assert.ok(JSON.stringify(second.task.error).includes('SENT_CHAIN_BLOCKED') || JSON.stringify(second.task.error).includes('一次发送'),
-      `错误应说明发送链阻断：${JSON.stringify(second.task.error)}`);
+    assert.equal(second.task.error?.code, 'SR_CHECKPOINT_MISSING', '已发但无可信成功检查点，拒绝重发');
+    assert.equal(second.task.taskId, task.taskId);
+    assert.deepEqual((await srPool.query('select call_id,step_id,state,sent_at,response_hash from sr_call where task_id=$1 order by call_id', [task.taskId])).rows, identitiesBefore, '越过已成功 PLAN 后仍拒绝原失败调用，原调用身份不变');
     assert.equal((await callRows()).length, callsBefore, '零新增调用');
     const stepsAfter = (await srPool.query(`select count(*)::int n from sr_step where task_id=$1`, [task.taskId])).rows[0].n;
     assert.equal(stepsAfter, stepsBefore, '无自动新步骤');
@@ -227,10 +230,9 @@ describe('sr 引擎：中断恢复与调用身份', () => {
 
     // 引擎恢复扫描 → RECONCILING；此时重跑被恢复守卫拦截（零调用）
     await srBootRecovery(srPool);
-    const blocked = await runSrTask(depsWith(new SimSrTransport()), task.taskId);
-    assert.equal(blocked.task.status, 'FAILED');
+    await assert.rejects(runSrTask(depsWith(new SimSrTransport()), task.taskId), { code: 'RECOVERY_CONFIRM_REQUIRED' });
+    assert.equal((await getTask(srPool, task.taskId))!.status, 'FAILED', '未认领任务保持原状态');
     assert.equal((await callRows()).length, callsBefore, 'RECONCILING 下零新调用');
-    assert.ok(JSON.stringify(blocked.task.error).includes('RECOVERY'), `错误应含恢复提示：${JSON.stringify(blocked.task.error)}`);
 
     // 〔R2〕Owner 退役 + 恢复确认后：同输入仍不得自动重发（退役不是重采样许可）；
     // 重新生成的正道 = 显式新任务（修订），新任务身份 + 新授权记录。
@@ -238,6 +240,7 @@ describe('sr 引擎：中断恢复与调用身份', () => {
     await srConfirmRecovery(srPool, 'owner-test');
     const third = await runSrTask(depsWith(new SimSrTransport()), task.taskId);
     assert.equal(third.task.status, 'FAILED', '退役后同输入仍不自动重发');
+    assert.equal(third.task.error?.code, 'REQUEST_UNKNOWN', '退役不合成成功检查点');
     assert.equal((await callRows()).length, callsBefore, '退役前后零新增调用');
     // 正道：显式新任务可完整重做（新身份、新调用）
     const redo = await newTask('600519', '2026-10-24T16:00:00.000Z');
@@ -351,10 +354,13 @@ describe('sr 引擎：C4 差集验收点', () => {
           ];
         }
         if (step === 'ANALYZE') {
-          // 同时注入 BLOCKING 质检：引用不存在的表——发布门必须因质检阻断（而非因合法非承重未解）
+          // 表引用仍合法；只保留两个完整情景，通过 ANALYZE 合同后由 QA 拒绝三情景不完整。
           const o = out as import('./transport.js').AnalyzeOutput;
-          const sec = o.sections[0];
-          if (sec) sec.tables = [...sec.tables, 'nonexistent-table-xyz'];
+          const outlook = o.sections.find((s) => s.key === 'outlook');
+          if (outlook) {
+            assert.ok(outlook.scenarios && outlook.scenarios.length === 3, '合成通道先提供完整三情景');
+            outlook.scenarios = outlook.scenarios.slice(0, 2);
+          }
         }
         return out;
       },
@@ -363,6 +369,7 @@ describe('sr 引擎：C4 差集验收点', () => {
     // 门因 BLOCKING 质检未过（单一裁定），但不是因为合法非承重未解项
     assert.equal(res.task.status, 'PARTIAL');
     assert.equal(res.report!.status, 'PUBLISHED_RESTRICTED');
+    assert.deepEqual(res.report!.qaFindings.filter((f) => f.severity === 'BLOCKING').map((f) => f.code), ['SCENARIO_MISSING'], '仅三情景完整性触发 QA 阻断');
     assert.ok(!res.report!.gate!.passed);
     assert.ok(res.report!.gate!.reason.includes('BLOCKING') || res.report!.gate!.reason.includes('质检'),
       `阻断原因应为质检而非承重未解（${res.report!.gate!.reason}）`);
@@ -585,8 +592,8 @@ describe('sr 引擎：C4 差集验收点', () => {
   });
 
   it('〔C4-03〕QA 阻断在 ASSEMBLE 失败恢复后保持：质检结论不丢、零模型重发', async () => {
-    // 场景：注入 BLOCKING（引用不存在表）→ 正常跑完为 PARTIAL/受限；然后模拟组装失败善后
-    // （ASSEMBLE 置 FAILED + 删除报告行），重入恢复——必须仍 PARTIAL/受限，且模型调用零新增。
+    // 场景：两个合法情景通过响应合同，QA 以 SCENARIO_MISSING 阻断 → PARTIAL/受限。
+    // ASSEMBLE 置 FAILED 并保留报告行，重入恢复必须仍 PARTIAL/受限、原版本且模型调用零新增。
     const task = await newTask('002384', '2026-10-24T16:00:00.000Z');
     const inner = new SimSrTransport();
     const blocker: SrModelTransport = {
@@ -595,8 +602,11 @@ describe('sr 引擎：C4 差集验收点', () => {
         const out = await inner.dispatch(step, ctx2, payload);
         if (step === 'ANALYZE') {
           const o = out as import('./transport.js').AnalyzeOutput;
-          const sec = o.sections[0];
-          if (sec) sec.tables = [...sec.tables, 'nonexistent-table-xyz'];
+          const outlook = o.sections.find((s) => s.key === 'outlook');
+          if (outlook) {
+            assert.ok(outlook.scenarios && outlook.scenarios.length === 3, '合成通道先提供完整三情景');
+            outlook.scenarios = outlook.scenarios.slice(0, 2);
+          }
         }
         return out;
       },
@@ -604,21 +614,31 @@ describe('sr 引擎：C4 差集验收点', () => {
     const first = await runSrTask(depsWith(blocker), task.taskId);
     assert.equal(first.task.status, 'PARTIAL', '首轮：门未过（BLOCKING）');
     assert.equal(first.report!.status, 'PUBLISHED_RESTRICTED');
+    assert.deepEqual(first.report!.qaFindings.filter((f) => f.severity === 'BLOCKING').map((f) => f.code), ['SCENARIO_MISSING'], '首轮确实到达 QA 三情景完整性检查');
     const callsAfterFirst = (await callRows()).length;
+    const stepsAfterFirst = (await srPool.query('select step_id from sr_step where task_id=$1 order by sequence', [task.taskId])).rows;
+    const identitiesAfterFirst = (await srPool.query('select call_id,step_id,state,sent_at,response_hash from sr_call where task_id=$1 order by call_id', [task.taskId])).rows;
 
-    // 模拟 ASSEMBLE 本地暂态失败后的善后状态：步骤置 FAILED、报告行删除，QA_CHECK 保持 SUCCEEDED 落盘
+    // 模拟组装后工作文件写失败：保留已经插入的报告，重入同一步骤不增版。
     await srPool.query(`update sr_step set status='FAILED', finished_at=null where task_id=$1::uuid and step_kind='ASSEMBLE'`, [task.taskId]);
-    await srPool.query(`delete from sr_report where task_id=$1::uuid`, [task.taskId]);
     await srPool.query(`update sr_task set status='FAILED', error=null, completed_at=null where task_id=$1::uuid`, [task.taskId]);
 
-    // 恢复：QA 结论从落盘重载（或确定性重算），阻断必须保持，模型调用零新增
+    // 恢复：QA 结论从绑定的 CAS 原件重载，阻断必须保持，模型调用零新增。
     const second = await runSrTask(depsWith(inner), task.taskId);
     assert.equal(second.task.status, 'PARTIAL', `恢复后仍 PARTIAL（实际 ${second.task.status}，error=${JSON.stringify(second.task.error)}）`);
     assert.ok(second.task.error && second.task.error.code === 'PUBLISH_GATE_BLOCKED', '恢复后仍是发布门阻断');
     assert.equal(second.report!.status, 'PUBLISHED_RESTRICTED', '恢复后仍受限发布');
+    assert.equal(second.task.taskId, task.taskId);
+    assert.equal(second.report!.reportId, first.report!.reportId);
+    assert.equal(second.report!.version, first.report!.version);
+    assert.deepEqual((await srPool.query('select step_id from sr_step where task_id=$1 order by sequence', [task.taskId])).rows, stepsAfterFirst, '恢复零新步骤');
+    assert.deepEqual((await srPool.query('select call_id,step_id,state,sent_at,response_hash from sr_call where task_id=$1 order by call_id', [task.taskId])).rows, identitiesAfterFirst, '恢复不改原调用及成功回执');
+    assert.deepEqual(second.report!.qaFindings, first.report!.qaFindings, '恢复保留完整 QA 发现');
     assert.ok(!second.report!.gate!.passed, '门未过');
     assert.ok(second.report!.gate!.reason.includes('BLOCKING') || second.report!.gate!.reason.includes('质检'), `门原因含质检阻断（${second.report!.gate!.reason}）`);
     assert.equal((await callRows()).length, callsAfterFirst, '恢复零模型重发');
+    assert.equal(second.report!.contentHash, first.report!.contentHash, '重入保留首次报告正文与版本');
+    assert.equal((await listReportVersions(srPool, task.taskId)).length, 1, '不凭空增版');
   });
 });
 

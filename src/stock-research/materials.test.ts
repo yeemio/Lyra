@@ -102,7 +102,7 @@ describe('官方原件、计划选料与经营链（离线、零数据库）', (
     const context: Parameters<typeof evaluatePublishGate>[0] = {
       deps: { dataPool: inertPool, srPool: inertPool, transport: sim, budget: defaultSrPlanBudget(), outputDir: '' },
       task: { taskId: 'offline', accountId: 'offline', subject: input.subject, subjectName: input.subjectName, focus: 'BUSINESS', emphasis: '渠道与回款', horizon: 'LONG_TERM', cutoff: CUTOFF, status: 'RUNNING', idemKey: 'offline', revisedFromTaskId: null, methodVersion: 'sr-m1', adapterVersion: 'offline', planAuthVersion: 'sr-auth-1', error: null, createdAt: CUTOFF, updatedAt: CUTOFF, completedAt: null },
-      pool: { stocks: [], etfs: [] }, analyze: new Map([['a', a]]), pack: p, computed, plan, aFinal: final, checklist, judge: j, qa: [],
+      analyze: new Map([['a', a]]), pack: p, computed, plan, aFinal: final, checklist, judge: j, qa: [],
     };
     const { gate } = evaluatePublishGate(context);
     await inertPool.end();

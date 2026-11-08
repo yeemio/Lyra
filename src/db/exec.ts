@@ -74,6 +74,13 @@ export async function applySchema(
       await client.query(`set local search_path to "${schema}"`);
     }
     await client.query(ddl); // 无参数多语句简单查询，一次应用
+    if (sqlFile.href === schemaSqlUrl.href || sqlFile.href === srMigrationSqlUrl.href) {
+      const extra = sqlFile.href === schemaSqlUrl.href
+        ? new URL('../kernel/execution-schema.sql', import.meta.url)
+        : new URL('../stock-research/execution-schema.sql', import.meta.url);
+      await client.query(await readFile(extra, 'utf8'));
+      await client.query(await readFile(new URL('../kernel/attempt-schema.sql', import.meta.url), 'utf8'));
+    }
     await client.query('commit');
   } catch (err) {
     try {

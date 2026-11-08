@@ -1,3 +1,4 @@
+import type { FrozenBenchmark } from './conclusion/benchmark.js';
 /**
  * Lyra · 共享契约（P0，总控冻结 2026-10-25）。
  * 唯一共享类型源；实现模块只 import、不重复定义。字段出处：
@@ -120,6 +121,7 @@ export interface PlanAuthBudget {
   maxModelCallsPerWeek: number;
   maxInputBytes: number; // 输入预算；超预算 INPUT_OVER_BUDGET 阻断（EK-4.4/4.5）
   maxInFlight: 2; // 并发上限（EK-2.3）
+  scopeLimits?: { weekly: number; postEvent: number }; // 显式授权；缺省冻结常态 60/10，不自动扩容
 }
 
 export type KernelErrorCode =
@@ -160,7 +162,16 @@ export interface JOutput {
   stage: 'J';
   inputHash: string;
   finalDisposition: Disposition; // disposition 必须等于此值（字段间校验）
-  verdicts: { checklistId: string; verdict: ChecklistVerdict; decisionBearing: boolean; correction: string | null }[];
+  verdicts: {
+    checklistId: string;
+    verdict: ChecklistVerdict;
+    decisionBearing: boolean;
+    correction: string | null;
+    /** 新输出必填；旧存档形状由读取层保留，不可据此重新生成有效结论。 */
+    reason: string;
+    evidenceArtifactSha256s: string[];
+    remainingBasisChecklistIds: string[];
+  }[];
   changedFromA: boolean;
   changeReason: string | null; // 改判必填（含继承改判）
   strongestCaseDisposition: 'ACCEPTED' | 'NARROWED' | 'REFUTED' | 'UNRESOLVED';
@@ -197,6 +208,10 @@ export interface ConclusionEvidence {
   checklistHash: string;
   jOutputHash: string;
   manifestHash: string;
+  /** 新结论绑定实际输入及 A/清单/J 原文 CAS；旧结论缺失时不得声明已送达继承。 */
+  researchTraceSha256?: string;
+  /** 新研究实际使用的基准快照；旧对象缺失时不可按当前库补写。 */
+  benchmark?: FrozenBenchmark;
 }
 
 export interface SettlementZone {

@@ -21,7 +21,7 @@ after(async () => { assert.deepEqual(guard.attempts, { database: 0, externalFetc
 async function scenario(fault: IsolatedFault = 'NONE', mutate?: (request: ReturnType<typeof isolatedRequest>) => void) {
   const pool = new IsolatedSrPool(), transport = new IsolatedReviewTransport(pool, fault), request = isolatedRequest(); mutate?.(request);
   const input = await freezeRealReviewInput(sourceStore, transport, request);
-  const args = { sourceStore, input, expectedInputHash: input.inputHash, srPool: pool.asPool(), transport, budget: input.execution.budget, outputDir: join(out, `case-${++serial}`), holderId: pool.holderId };
+  const args = { sourceStore, input, expectedInputHash: input.inputHash, srPool: pool.asPool(), transport, budget: input.execution.budget, outputDir: join(out, `case-${++serial}`), holderId: pool.holderId, lease: pool.lease };
   const delivery = await runRealStrategyReview(args);
   return { ...delivery, pool, transport, input, args };
 }
@@ -116,7 +116,7 @@ test('每步显式期限：发送前过期零发送，发送后挂起按真实�
   // Build dependencies before starting this deliberately short execution window.
   const preliminary = await freezeRealReviewInput(sourceStore, transport, request); request.deadlines.A = new Date(Date.now() + 1000).toISOString();
   const input = rehash({ ...preliminary, execution: { ...preliminary.execution, deadlines: request.deadlines } }, 'inputHash');
-  const result = await runRealStrategyReview({ sourceStore, input, expectedInputHash: input.inputHash, srPool: pool.asPool(), transport, budget: input.execution.budget, outputDir: join(out, `pending-${++serial}`), holderId: pool.holderId });
+  const result = await runRealStrategyReview({ sourceStore, input, expectedInputHash: input.inputHash, srPool: pool.asPool(), transport, budget: input.execution.budget, outputDir: join(out, `pending-${++serial}`), holderId: pool.holderId, lease: pool.lease });
   assert.equal(result.result.status, 'UNKNOWN'); assert.equal(result.result.receipts.A?.failCode, 'DEADLINE_EXCEEDED'); assert.equal(transport.events.length, 1);
 });
 
@@ -161,7 +161,7 @@ test('真实身份transport不获本轮许可，恢复守卫关闭时零permit�
   await assert.rejects(freezeRealReviewInput(sourceStore, transport, isolatedRequest()), /REAL_STRATEGY_CALLS_NOT_AUTHORIZED/);
   assert.equal(transport.events.length, 0); assert.equal(pool.snapshot().calls.length, 0);
   transport.describe = describe; const input = await freezeRealReviewInput(sourceStore, transport, isolatedRequest()); pool.lifecycle = 'RECONCILING';
-  await assert.rejects(runRealStrategyReview({ sourceStore, input, expectedInputHash: input.inputHash, srPool: pool.asPool(), transport, budget: input.execution.budget, outputDir: join(out, 'reconciling'), holderId: pool.holderId }), { code: 'RECOVERY_CONFIRM_REQUIRED' });
+  await assert.rejects(runRealStrategyReview({ sourceStore, input, expectedInputHash: input.inputHash, srPool: pool.asPool(), transport, budget: input.execution.budget, outputDir: join(out, 'reconciling'), holderId: pool.holderId, lease: pool.lease }), { code: 'RECOVERY_CONFIRM_REQUIRED' });
   assert.equal(pool.snapshot().calls.length, 0);
   const over = await scenario('NONE', (r) => { r.budget.maxInputBytes = 100; });
   assert.equal(over.transport.events.length, 0); assert.equal(over.result.receipts.A?.failCode, 'INPUT_OVER_BUDGET'); assert.equal(over.result.status, 'FAILED'); assert.ok(over.result.promptBytes.A > 100);

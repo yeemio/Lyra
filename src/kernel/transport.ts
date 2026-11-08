@@ -22,7 +22,8 @@ import {
 
 /** 模型路由抽象：一次模型调用的传输载体（A/J 输出统一以 unknown 返回，由调用侧定型）。 */
 export interface ModelTransport {
-  dispatch(call: ModelCallContract, payload: unknown): Promise<unknown>;
+  preflight?(call: ModelCallContract, payload: unknown): Promise<void> | void;
+  dispatch(call: ModelCallContract, payload: unknown, signal?: AbortSignal): Promise<unknown>;
   /** 身份自我声明（EK-10.1）：provider 名与是否模拟。 */
   describe(): { provider: string; simulated: boolean };
 }
@@ -52,6 +53,7 @@ function assertPayloadBound(call: ModelCallContract, payload: unknown): Simulate
 
 /** 确定性模拟传输：A/J 由 call.stage 分派到 src/research/simulated.ts 的模型函数。 */
 export class SimulatedTransport implements ModelTransport {
+  preflight(call: ModelCallContract, payload: unknown): void { assertPayloadBound(call, payload); }
   async dispatch(call: ModelCallContract, payload: unknown): Promise<unknown> {
     const input = assertPayloadBound(call, payload);
     if (call.stage === 'A') return simulatedModelA(input as SimulatedAInput);
@@ -71,6 +73,7 @@ export const DEFAULT_UNAUTHORIZED_REASON =
 /** 真实端点占位：任何 dispatch 一律具名拒绝；不触碰网络。 */
 export class UnauthorizedTransport implements ModelTransport {
   constructor(readonly reason: string = DEFAULT_UNAUTHORIZED_REASON) {}
+  preflight(): never { throw new KernelError('MODEL_PROVIDER_UNAUTHORIZED', this.reason); }
 
   async dispatch(_call: ModelCallContract, _payload: unknown): Promise<never> {
     throw new KernelError('MODEL_PROVIDER_UNAUTHORIZED', this.reason);
@@ -79,6 +82,17 @@ export class UnauthorizedTransport implements ModelTransport {
   describe(): { provider: string; simulated: boolean } {
     return { provider: 'real-endpoint-unauthorized', simulated: false };
   }
+}
+
+/** Request construction and real transport preparation must finish before the SENT boundary. */
+export async function preflightTransport(transport: ModelTransport, call: ModelCallContract, payload: unknown): Promise<void> {
+  assertPayloadBound(call, payload);
+  const prompt = (payload as { prompt?: unknown }).prompt;
+  if (prompt !== undefined && (typeof prompt !== 'string' || !prompt.trim() || Buffer.byteLength(prompt, 'utf8') !== call.inputBytes)) {
+    throw new KernelError('MODEL_INPUT_UNBOUND', 'Prompt bytes differ from the call contract');
+  }
+  if (!transport.describe().simulated && !transport.preflight) throw new KernelError('MODEL_PREFLIGHT_REQUIRED', 'Real transports must expose a non-sending preflight');
+  await transport.preflight?.(call, payload);
 }
 
 /** 传输选择配置：缺省 simulated；'real' 在无授权配置时得到未授权占位。 */

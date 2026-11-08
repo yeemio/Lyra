@@ -1,3 +1,4 @@
+import { acquireLease, releaseLease, keepLeaseAlive, type ExecutionLease } from './lease.js';
 /**
  * W1 单测 · 启动诊断与恢复（EK-8）：RECONCILING 进入/零模型调用/RECOVERY_CONFIRM_REQUIRED/
  * 显式确认回 RUNNING/UNKNOWN 保持待退役、diagnose 三问。
@@ -14,6 +15,8 @@ import { runModelCall, type ModelFn } from './executor.js';
 import { assertRunning, bootRecovery, confirmRecovery, diagnose, getRecoveryState } from './recovery.js';
 
 const schema = `w1_${Date.now().toString(36)}_${randomUUID().replaceAll('-', '').slice(0, 12)}`;
+let testLease: ExecutionLease;
+let testKeeper: ReturnType<typeof keepLeaseAlive>;
 let pool: Pool;
 let admin: Pool;
 
@@ -21,9 +24,12 @@ before(async () => {
   admin = createPool();
   await applySchema(admin, schema);
   pool = createPool({ schema });
+  testLease = await acquireLease(pool, 'kernel'); testKeeper = keepLeaseAlive(pool, testLease);
 });
 
 after(async () => {
+  await testKeeper?.stop();
+  if (testLease) await releaseLease(pool, testLease);
   await pool.end();
   await dropSchema(admin, schema);
   await admin.end();
@@ -31,7 +37,8 @@ after(async () => {
 
 const budget: PlanAuthBudget = {
   planAuthVersion: 'pa-0.1',
-  maxModelCallsPerWeek: 40,
+  maxModelCallsPerWeek: 500,
+  scopeLimits: { weekly: 500, postEvent: 500 },
   maxInputBytes: 5000,
   maxInFlight: 2,
 };
@@ -65,7 +72,7 @@ async function assertKernelError(fn: () => Promise<unknown>, code: string): Prom
 /** 直接造一个 SENT 未终结的 permit（模拟进程死亡现场，绕过 executor 走内表）。 */
 async function seedSentPermit(subject: string): Promise<string> {
   const p = await preparePermit(pool, mkContract(subject), budget);
-  await markSent(pool, p.permitId);
+  await markSent(pool, p.permitId, testLease, budget);
   return p.permitId;
 }
 
@@ -86,6 +93,7 @@ describe('bootRecovery（EK-8.2）', () => {
   });
 
   it('未退役 UNKNOWN 也计入 pending；退役后不再计入', async () => {
+    await confirmRecovery(pool, 'synthetic-fixture-owner');
     const id = await seedSentPermit('602501');
     await settle(pool, id, { result: 'UNKNOWN', basis: 'TEST_CRASH' });
     let s = await bootRecovery(pool);
@@ -110,7 +118,7 @@ describe('RECONCILING 下的执行守卫（EK-8.2/8.3）', () => {
     const modelFn: ModelFn = async () => { calls++; return {}; };
     const before = await pool.query(`select count(*)::int as n from exec_permit`);
     await assertKernelError(
-      () => runModelCall(pool, { contract: mkContract('602511'), budget, modelFn, simulated: true }),
+      () => runModelCall(pool, { contract: mkContract('602511'), budget, modelFn, simulated: true, lease: testLease }),
       'RECOVERY_CONFIRM_REQUIRED',
     );
     assert.equal(calls, 0, 'RECONCILING 下零模型调用');
@@ -121,6 +129,7 @@ describe('RECONCILING 下的执行守卫（EK-8.2/8.3）', () => {
 
 describe('confirmRecovery（EK-8.3）', () => {
   it('无确认人 → RECOVERY_CONFIRM_REQUIRED；RUNNING 下调用为幂等 no-op', async () => {
+    await confirmRecovery(pool, 'synthetic-fixture-owner');
     await seedSentPermit('602520');
     await bootRecovery(pool);
     await assertKernelError(() => confirmRecovery(pool, ''), 'RECOVERY_CONFIRM_REQUIRED');
@@ -148,29 +157,30 @@ describe('confirmRecovery（EK-8.3）', () => {
     // 新键（新截点）可正常执行；同键仍被 send-once 拦住
     const ok = await runModelCall(pool, {
       contract: mkContract('602522', { businessKey: { subjectKind: 'STOCK', subject: '602522', researchKind: 'WEEKLY', cutoff: '2026-10-31T15:00:00.000Z' } }),
-      budget, modelFn: noopModel, simulated: true,
+      budget, lease: testLease, modelFn: noopModel, simulated: true,
     });
     assert.equal(ok.permit.state, 'SUCCEEDED');
     await assertKernelError(
-      () => runModelCall(pool, { contract: mkContract('602521'), budget, modelFn: noopModel, simulated: true }),
+      () => runModelCall(pool, { contract: mkContract('602521'), budget, lease: testLease, modelFn: noopModel, simulated: true }),
       'BUSINESS_KEY_ALREADY_SENT',
     );
   });
 
-  it('resolver 判"结果可知"则按确认终态关闭；UNKNOWN pending 保持 UNKNOWN 待退役', async () => {
+  it('resolver 标签不能证明成功；无原结果的 SENT 转 UNKNOWN，UNKNOWN 仍待退役', async () => {
     const sentId = await seedSentPermit('602523');
     const unkContract = mkContract('602524');
     const unkPermit = await preparePermit(pool, unkContract, budget);
-    await markSent(pool, unkPermit.permitId);
+    await markSent(pool, unkPermit.permitId, testLease, budget);
     await settle(pool, unkPermit.permitId, { result: 'UNKNOWN', basis: 'CRASH' });
     await bootRecovery(pool);
-    const { resolved } = await confirmRecovery(pool, 'owner-yeemio', () => ({ outcome: 'SUCCEEDED' }));
+    await assertKernelError(() => confirmRecovery(pool, 'owner-yeemio', () => ({ outcome: 'SUCCEEDED' })), 'RECOVERY_EVIDENCE_REQUIRED');
+    const { resolved } = await confirmRecovery(pool, 'owner-yeemio');
     const relevant = resolved.filter((r) => r.permitId === sentId || r.permitId === unkPermit.permitId);
     assert.deepEqual(
       relevant.sort((a, b) => a.permitId.localeCompare(b.permitId)),
       [
         { permitId: unkPermit.permitId, from: 'UNKNOWN', to: 'UNKNOWN' },
-        { permitId: sentId, from: 'SENT', to: 'SUCCEEDED' },
+        { permitId: sentId, from: 'SENT', to: 'UNKNOWN' },
       ].sort((a, b) => a.permitId.localeCompare(b.permitId)),
     );
     assert.equal((await getRecoveryState(pool)).lifecycle, 'RUNNING');

@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 /**
  * Lyra · sr 空间页面渲染（R31）：纯函数 SSR，字符串输出，零外部 CDN，零内联脚本。
  *
@@ -9,6 +10,8 @@
  *   script-src 'self'。本模块不输出任何 <script>；任务页自动刷新用 meta refresh。
  * - 全部页面页脚恒为「个人研究记录，非投资建议」（合规标注）。
  */
+import type { ReportVersionSummary } from './contracts.js';
+import { materialDateSummary } from './report-tables.js';
 import { escapeHtml } from '../web/pages.js';
 import { renderWorkbenchContent, type WorkbenchPageState } from './strategy/workbench-render.js';
 import type {
@@ -571,8 +574,9 @@ export function renderDashboard(args: {
 
 export function renderTaskPage(args: {
   task: SrTask;
+  csrf?: string;
   steps: SrStep[];
-  reports: ReportDocument[];
+  reports: ReportVersionSummary[];
   account?: { username: string; role: 'ADMIN' | 'USER'; displayName: string };
 }): string {
   const { task } = args;
@@ -600,6 +604,7 @@ export function renderTaskPage(args: {
         : '<p class="sr-muted">本任务没有产出报告（失败或被取消时如实呈现）。</p>')
     : `<div class="sr-table-scroll"><table class="sr-table"><thead><tr><th>版本</th><th>状态</th><th>生成时间</th><th></th></tr></thead><tbody>${sortedReports
         .map((r) => {
+          if (r.unavailableReason) return `<tr><td>v${r.version}</td><td colspan="3">材料不可验证，保留原记录（${escapeHtml(r.unavailableReason)}）</td></tr>`;
           const rb = reportStatusBadge(r.status);
           return `<tr><td class="sr-strong">v${r.version}</td><td>${badge(rb.text, rb.cls)}</td><td>${escapeHtml(fmtDateTime(r.publishedAt ?? r.createdAt))}</td><td><a href="/reports/${escapeHtml(r.reportId)}?v=${r.version}">阅读报告</a></td></tr>`;
         })
@@ -609,6 +614,7 @@ export function renderTaskPage(args: {
 <nav class="sr-crumbs"><a href="/">首页</a> / 任务 ${escapeHtml(task.subject)}</nav>
 <h1 class="sr-h1">${escapeHtml(task.subjectName)} <span class="sr-muted sr-mono">${escapeHtml(task.subject)}</span> ${badge(st.text, st.cls)}</h1>
 ${errorBox}
+${task.status === 'FAILED' && args.csrf ? `<form method="post" action="/tasks/${escapeHtml(task.taskId)}/resume"><input type="hidden" name="_csrf" value="${escapeHtml(args.csrf)}"><button class="sr-btn" type="submit">核验原检查点并继续此任务</button><p class="sr-muted small">保留原任务与调用；已发送但结果不明时先对账，不会自动重发。</p></form>` : ''}
 ${running ? '<div class="sr-alert sr-alert-blue">任务执行中，页面每 5 秒自动刷新。</div>' : ''}
 
 <section class="sr-card">
@@ -781,7 +787,7 @@ ${action}
 
 export function renderReportPage(args: {
   report: ReportDocument;
-  versions: ReportDocument[];
+  versions: ReportVersionSummary[];
   tablesById: Record<string, TableLike>;
   messages: ChatMessage[];
   csrf: string;
@@ -796,7 +802,9 @@ export function renderReportPage(args: {
   const rb = reportStatusBadge(report.status);
   const versionPills = [...args.versions]
     .sort((a, b) => b.version - a.version)
-    .map((v) => v.version === report.version
+    .map((v) => v.unavailableReason
+      ? `<span class="sr-badge b-gray">v${v.version}（材料不可验证）</span>`
+      : v.version === report.version
       ? `<span class="sr-badge b-blue">v${v.version}（当前）</span>`
       : `<a class="sr-badge b-gray" href="/reports/${escapeHtml(report.reportId)}?v=${v.version}">v${v.version} · ${escapeHtml(reportStatusBadge(v.status).text)}</a>`)
     .join(' ');
@@ -894,12 +902,7 @@ ${evidenceBlock}
   const chatHtml = args.messages.length === 0
     ? '<p class="sr-muted">还没有追问。可以在下方提问，例如「第 3 章的推断依赖哪个假设？」</p>'
     : args.messages.map(chatMessageHtml).join('\n');
-  const snapshot = args.tablesById['market-snapshot'];
-  const dateRow = snapshot?.rows[0];
-  const marketTime = snapshot && dateRow ? dateRow[snapshot.columns.indexOf('observedAt')] : null;
-  const history = args.tablesById['bars-daily'];
-  const historyDate = history?.rows.at(-1)?.[history.columns.indexOf('date')];
-  const dataDates = snapshot ? `<p class="sr-note">实际材料日期：公司原件为2025年报及2026半年报；运价快照为2026-10-23；行情快照为${escapeHtml(String(marketTime ?? '未知'))}；历史日线截至${escapeHtml(String(historyDate ?? '未知'))}。未取得三季报原件，行情快照不拼接历史日线。</p>` : '';
+  const dataDates = `<p class="sr-note">${escapeHtml(materialDateSummary(args.tablesById))}</p>`;
 
   const main = `
 <div class="sr-report-toolbar">
@@ -947,6 +950,9 @@ ${args.readOnly ? '' : `<section class="sr-section" id="chat" tabindex="-1">
 ${chatHtml}
 <form method="post" action="/reports/${escapeHtml(report.reportId)}/chat" class="sr-form sr-chat-form">
 <input type="hidden" name="_csrf" value="${escapeHtml(args.csrf)}">
+<input type="hidden" name="report_version" value="${report.version}">
+<input type="hidden" name="request_key" value="${randomUUID()}">
+<label><select name="intent_mode"><option value="REUSE">继续同内容原请求（刷新或断线后重试）</option><option value="NEW">明确发起新请求（新额度；不用于未知结果重试）</option></select></label>
 <div class="sr-field">
 <label for="sr-question">提问（解释 / 质疑 / 假设调整 / 资料不足，回答绑定当版报告）</label>
 <textarea id="sr-question" name="question" rows="3" maxlength="2000" required placeholder="例：估值章的 PE 假设为什么取 8 倍下限？"></textarea>
@@ -960,6 +966,9 @@ ${chatHtml}
 <p class="sr-muted small">修订会产生新版本任务并生成新报告；旧报告与旧版本全部保留、随时可回看。</p>
 <form method="post" action="/reports/${escapeHtml(report.reportId)}/revise" class="sr-form">
 <input type="hidden" name="_csrf" value="${escapeHtml(args.csrf)}">
+<input type="hidden" name="report_version" value="${report.version}">
+<input type="hidden" name="request_key" value="${randomUUID()}">
+<label><select name="intent_mode"><option value="REUSE">继续同内容原请求（刷新或断线后重试）</option><option value="NEW">明确发起新请求（新额度；不用于未知结果重试）</option></select></label>
 <div class="sr-field">
 <label for="sr-revise-emphasis">新的关注点 / 修订说明</label>
 <textarea id="sr-revise-emphasis" name="emphasis" rows="2" maxlength="500" placeholder="例：补充对毛利率拐点的检验"></textarea>

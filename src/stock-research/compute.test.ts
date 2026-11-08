@@ -12,7 +12,7 @@ import { computeMetrics } from './compute.js';
 const CUTOFF = '2026-10-23T16:00:00Z';
 
 function mkTable(tableId: string, columns: string[], rows: (string | number | null)[][]): EvidenceTable {
-  return { tableId, title: tableId, columns, rows, unitNote: null, locators: [], cutoff: CUTOFF };
+  return { tableId, title: tableId, columns, rows, unitNote: null, locators: [], cutoff: CUTOFF, ...(['bars-daily', 'index-bars'].includes(tableId) ? { priceBasis: 'UNADJUSTED_PRICE' as const } : {}) };
 }
 
 function mkCoverage(): SrCoverage {

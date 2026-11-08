@@ -1,3 +1,4 @@
+import { keepLeaseAlive, type ExecutionLease } from '../../kernel/lease.js';
 /** Explicit CLI: prepare is the default; execution needs a pinned new Owner grant and the old real switch. */
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
@@ -60,12 +61,13 @@ export async function executeReviewBundle(args: { bundle: string; expectedPropos
       const { createPool } = await import('../../db/pool.js');
       const { acquireSrEngineLock, heartbeatSrEngineLock, releaseSrEngineLock, srListUnclosedCalls } = await import('../store.js');
       const srPool = createPool({ schema: 'sr' }), holderId = `strategy-real-review:${randomUUID()}`;
+      let lease: ExecutionLease;
       try {
         if ((await srListUnclosedCalls(srPool)).length) throw new StrategyError('RECOVERY_CONFIRM_REQUIRED');
-        await acquireSrEngineLock(srPool, holderId);
+        lease = await acquireSrEngineLock(srPool, holderId);
       } catch (e) { await srPool.end(); throw e; }
-      const heartbeat = setInterval(() => { void heartbeatSrEngineLock(srPool, holderId).catch(() => undefined); }, 20_000); heartbeat.unref();
-      return { srPool, holderId, close: async () => { clearInterval(heartbeat); try { await releaseSrEngineLock(srPool, holderId); } finally { await srPool.end(); } } };
+      const keeper = keepLeaseAlive(srPool, lease);
+      return { srPool, holderId, lease, close: async () => { await keeper.stop(); try { await releaseSrEngineLock(srPool, lease); } finally { await srPool.end(); } } };
     },
   });
 }

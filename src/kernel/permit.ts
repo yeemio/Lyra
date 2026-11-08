@@ -1,3 +1,4 @@
+import { contractHash } from './response.js';
 /**
  * Lyra · permit 生命周期（EK-3、EK-4、EK-5.2/5.3、EK-6）。W1: code-writer-pro。
  * 状态机（EK-3.3，非法迁移一律 PERMIT_STATE_INVALID）：
@@ -22,6 +23,8 @@ import {
   type PlanAuthBudget,
 } from '../contracts.js';
 import { rowToPermit, withTransaction, type DbClient, type ExecPermitRow } from '../db/exec.js';
+import { assertLease, type ExecutionLease } from './lease.js';
+import { reserveSend, consumeSendReservation } from './budget.js';
 
 /**
  * settle 的终态结果。UNKNOWN 的 basis 落 fail_code（EK-5.1 判定依据与时刻的记录义务）。
@@ -39,7 +42,7 @@ const PERMIT_COLUMNS = `permit_id, stage, subject_kind, subject, research_kind, 
 
 /** 冲突替换的公共 SET 片段（业务键五列是冲突键，无需重设）。 */
 const CONFLICT_SET_COMMON = [
-  'permit_id = excluded.permit_id',
+  'permit_id = exec_permit.permit_id',
   'input_hash = excluded.input_hash',
   'input_bytes = excluded.input_bytes',
   'method_version = excluded.method_version',
@@ -203,7 +206,7 @@ export async function listUnclosedPermits(pool: DbClient): Promise<ModelPermit[]
 export async function failPreparedDeadline(pool: DbClient, permitId: string): Promise<ModelPermit | null> {
   const res = await pool.query<ExecPermitRow>(
     `update exec_permit set state = 'FAILED', settled_at = now(), fail_code = 'DEADLINE_EXCEEDED'
-     where permit_id = $1 and state = 'PREPARED' and now() > deadline
+     where permit_id = $1 and state = 'PREPARED' and clock_timestamp() > deadline
      returning *`,
     [permitId],
   );
@@ -222,23 +225,10 @@ async function invalidTransition(pool: DbClient, permitId: string, to: string): 
  * DEADLINE_EXCEEDED 并抛 DEADLINE_EXCEEDED（未按窗完成，发送从未发起）。
  * 非 PREPARED → PERMIT_STATE_INVALID。
  */
-export async function markSent(pool: Pool, permitId: string): Promise<ModelPermit> {
-  const expired = await failPreparedDeadline(pool, permitId);
-  if (expired) {
-    throw new KernelError(
-      'DEADLINE_EXCEEDED',
-      `发送前截止已过（deadline=${expired.contract.deadline}）：按未按窗完成落库 FAILED/DEADLINE_EXCEEDED，未发送（EK-6.2）`,
-    );
-  }
-  const res = await pool.query<ExecPermitRow>(
-    `update exec_permit set state = 'SENT', sent_at = now()
-     where permit_id = $1 and state = 'PREPARED'
-     returning *`,
-    [permitId],
-  );
-  const row = res.rows[0];
-  if (row) return rowToPermit(row);
-  throw await invalidTransition(pool, permitId, 'SENT');
+export async function markSent(pool: Pool, permitId: string, lease?: ExecutionLease, budget?: PlanAuthBudget): Promise<ModelPermit> {
+  const r = await tryMarkSent(pool, permitId, budget?.maxInFlight ?? 2, lease, budget);
+  if (r.kind === 'SENT') return r.permit;
+  throw new KernelError(r.kind === 'DEADLINE_EXCEEDED' ? 'DEADLINE_EXCEEDED' : 'PERMIT_STATE_INVALID', `Cannot send: ${r.kind}`);
 }
 
 /**
@@ -269,24 +259,47 @@ export async function tryMarkSent(
   pool: Pool,
   permitId: string,
   maxInFlight: number,
+  lease?: ExecutionLease,
+  budget?: PlanAuthBudget,
+  expectedContract?: ModelCallContract,
 ): Promise<TryMarkSentOutcome> {
+  if (!lease || lease.space !== 'kernel' || !budget) throw new KernelError('EXECUTION_LEASE_REQUIRED', 'A current lease and authorization budget are required');
+  if (!Number.isSafeInteger(maxInFlight) || maxInFlight < 1 || maxInFlight > budget.maxInFlight) throw new KernelError('EXECUTION_BUDGET_INVALID', 'Send concurrency cannot exceed the bound authorization');
   return withTransaction(pool, async (tx) => {
+    await assertLease(tx, lease, true);
+    const recovery = await tx.query("select lifecycle from recovery_state where id=1 for share");
+    if (recovery.rows[0]?.lifecycle !== 'RUNNING') throw new KernelError('RECOVERY_CONFIRM_REQUIRED');
     await tx.query('select pg_advisory_xact_lock($1::bigint)', [EXEC_GATE_ADVISORY_KEY]);
+    const before = await tx.query<ExecPermitRow & { expired: boolean; in_flight: string }>(
+      `select *,clock_timestamp()>deadline as expired,(select count(*)::text from exec_permit where state='SENT') as in_flight
+       from exec_permit where permit_id=$1::uuid for update`, [permitId]);
+    const rowBefore = before.rows[0];
+    if (rowBefore && expectedContract && contractHash(rowToPermit(rowBefore).contract) !== contractHash(expectedContract)) {
+      throw new KernelError('PERMIT_CONTRACT_CONFLICT', 'Prepared call was replaced by another request; zero send');
+    }
+    if (rowBefore?.state === 'PREPARED' && !rowBefore.expired && Number(rowBefore.in_flight)<maxInFlight) {
+      await reserveSend(tx, rowToPermit(rowBefore).contract, budget, permitId);
+    }
+    await assertLease(tx, lease);
     const res = await tx.query<ExecPermitRow>(
       `update exec_permit as p
-       set state = 'SENT', sent_at = now()
+       set state = 'SENT', sent_at = clock_timestamp(),execution_generation=$3::bigint
        where p.permit_id = $1::uuid
          and p.state = 'PREPARED'
-         and now() <= p.deadline
+         and exists(select 1 from kernel_lock where id=1 and lease_until>clock_timestamp())
+         and clock_timestamp() <= p.deadline
          and (select count(*) from exec_permit x where x.state = 'SENT') < $2::int
        returning p.*`,
-      [permitId, maxInFlight],
+      [permitId, maxInFlight, lease.generation],
     );
     const row = res.rows[0];
-    if (row) return { kind: 'SENT', permit: rowToPermit(row) } as TryMarkSentOutcome;
+    if (row) {
+      await consumeSendReservation(tx, rowToPermit(row).contract, permitId);
+      return { kind: 'SENT', permit: rowToPermit(row) } as TryMarkSentOutcome;
+    }
     // 0 行：区分原因——截止已过则关闭为 FAILED/DEADLINE_EXCEEDED；在途满则等待；状态异常具名报错。
     const cur = await tx.query<ExecPermitRow & { deadline_exceeded: boolean }>(
-      `select *, now() > deadline as deadline_exceeded from exec_permit where permit_id = $1::uuid`,
+      `select *, clock_timestamp() > deadline as deadline_exceeded from exec_permit where permit_id = $1::uuid`,
       [permitId],
     );
     const curRow = cur.rows[0];

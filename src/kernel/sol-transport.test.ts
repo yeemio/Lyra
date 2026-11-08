@@ -178,7 +178,7 @@ function validJJson(expectedIds: string[], overrides?: Record<string, unknown>):
     stage: 'J',
     inputHash: 'cd'.repeat(32),
     finalDisposition: 'ABSTAIN',
-    verdicts: expectedIds.map((id) => ({ checklistId: id, verdict: 'SUPPORTED', decisionBearing: true, correction: null })),
+    verdicts: expectedIds.map((id) => ({ checklistId: id, verdict: 'SUPPORTED', decisionBearing: true, correction: null, reason: '合成复核理由', evidenceArtifactSha256s: ['11'.repeat(32)], remainingBasisChecklistIds: [] })),
     changedFromA: false,
     changeReason: null,
     strongestCaseDisposition: 'ACCEPTED',
@@ -195,7 +195,8 @@ const J_IDS = ['check:p0:DECISIVE_LINK:0', 'check:p0:DECISIVE_LINK:1', 'check:p0
 describe('SolTransport · 身份与 argv 构造（Metis 镜像）', () => {
   it('describe：provider codex-native、simulated:false', () => {
     const t = new SolTransport({ spawnFn: mockSpawn().spawnFn });
-    assert.deepEqual(t.describe(), { provider: 'codex-native', simulated: false });
+    assert.deepEqual(t.describe(), { provider: 'codex-native', simulated: false, modelId: 'gpt-6.1-sol', effort: 'high' });
+    assert.notDeepEqual(t.describe(), new SolTransport({ model: 'synthetic-other-model', reasoningEffort: 'max' }).describe());
   });
 
   it('argv 结构逐项镜像 Metis buildCodexArgv（沙箱只读、web_search 禁用、schema/final 路径、stdin 提示符）', async () => {
@@ -324,6 +325,23 @@ describe('SolTransport · dispatch 成功路径', () => {
 });
 
 describe('SolTransport · 失败路径（具名错误，无重试）', () => {
+  it('PR4 外部租约取消传到挂起进程；零重发，晚到 close 不改 UNKNOWN 依据', async () => {
+    const workRoot = freshWorkRoot(), rec = mockSpawn({ hang: true });
+    const { transport } = testConfig(rec, workRoot, { timeoutMs: 5000, killGraceMs: 5 });
+    const controller = new AbortController();
+    try {
+      const result = transport.dispatch(contract(), { inputHash: INPUT_HASH, subjectKind: 'STOCK', prompt: PROMPT }, controller.signal);
+      const rejected = assertKernelError(() => result, 'SILENCE_AFTER_SEND');
+      assert.equal(rec.calls.length, 1);
+      controller.abort(new KernelError('EXECUTION_LOCK_HELD'));
+      await rejected;
+      rec.calls[0]!.handle.close(0);
+      assert.equal(rec.calls.length, 1);
+      await assertKernelError(() => transport.dispatch(contract(), { inputHash: INPUT_HASH, subjectKind: 'STOCK', prompt: PROMPT }, controller.signal), 'EXECUTION_LOCK_HELD');
+      assert.equal(rec.calls.length, 1, 'pre-aborted call cannot create another child');
+    } finally { rmSync(workRoot, { recursive: true, force: true }); }
+  });
+
   it('超时：挂起子进程 → SIGTERM→SIGKILL 兜底收束 → TIMEOUT', async () => {
     const workRoot = freshWorkRoot();
     const rec = mockSpawn({ hang: true });

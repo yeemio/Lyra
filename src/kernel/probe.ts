@@ -20,7 +20,7 @@ async function main(): Promise<number> {
   try {
     const lock = await acquireExecutorLock(pool, holder);
     console.log(`EXECUTOR_LOCK_ACQUIRED holder=${lock.holder} acquiredAt=${lock.acquiredAt}`);
-    await releaseExecutorLock(pool, holder);
+    await releaseExecutorLock(pool, lock.lease);
     return 0;
   } catch (err) {
     if (err instanceof KernelError && err.code === 'EXECUTION_LOCK_HELD') {

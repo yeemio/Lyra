@@ -325,7 +325,7 @@ test('链头选择与 pickSwIndustryAt 等价：携带行 / 区间闭合 / 重�
   const carried = [classFact({ 体系: 'pre2014', 行业代码: '410102', l1IndexCode: null, validFrom: '2003-11-10T16:00:00.000Z', validTo: null })];
   assert.equal(pickSwChainHeadAt(carried, CUTOFF)?.fact.factId, pickSwIndustryAt(carried, CUTOFF)?.fact.factId);
   assert.equal(swL1OfWindow(pickSwChainHeadAt(carried, CUTOFF)!, '2021'), '801160'); // 41 公用事业（读取窗口解释）
-  assert.equal(pickSwIndustryAt(carried, CUTOFF)?.l1IndexCode, null); // 存库字段仍 null（差异为设计：W7 读取窗口语义）
+  assert.equal(pickSwIndustryAt(carried, CUTOFF)?.l1IndexCode, '801160'); // 研究和结算同用冻结窗口映射
 
   // pre2014 行被 2021 行闭合 → 只选 2021 行
   const closed = [

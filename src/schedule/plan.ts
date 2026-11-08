@@ -187,14 +187,18 @@ export async function persistAdmissions(
       `insert into schedule_admission (admission_id, plan_id, queue_class, priority, subject_kind, subject,
          research_kind, cutoff, source, detected_at, trigger_event_ids, annotation, first_queued_at, started, sent, notes)
        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, $13, $14, $15, $16::jsonb)
-       on conflict (plan_id, admission_id) do nothing`,
+       on conflict (plan_id, admission_id) do update set
+         started=schedule_admission.started or excluded.started, sent=schedule_admission.sent or excluded.sent,
+         annotation=coalesce(excluded.annotation,schedule_admission.annotation),
+         notes=coalesce((select jsonb_agg(distinct x) from jsonb_array_elements(schedule_admission.notes || excluded.notes) x),'[]'::jsonb)
+       returning (xmax=0) as inserted`,
       [
         r.admissionId, planId, r.queueClass, QUEUE_PRIORITY[r.queueClass], r.subjectKind, r.subject,
         r.researchKind, r.cutoff, r.source, r.detectedAt, JSON.stringify(r.triggerEventIds), r.annotation,
         r.firstQueuedAt, r.started, r.sent, JSON.stringify(r.notes),
       ],
     );
-    inserted += res.rowCount ?? 0;
+    inserted += res.rows.filter((row: { inserted: boolean }) => row.inserted).length;
   }
   return { inserted };
 }
@@ -221,9 +225,9 @@ interface AdmissionDbRow {
 /** 读回准入记录（可按计划过滤；时间统一 ISO 读回）。 */
 export async function loadAdmissions(pool: Pool, filter?: { planId?: string }): Promise<AdmissionRow[]> {
   const res = filter?.planId === undefined
-    ? await pool.query<AdmissionDbRow>(`select * from schedule_admission order by plan_id, priority, first_queued_at, admission_id`)
+    ? await pool.query<AdmissionDbRow>(`select a.*, (a.sent or exists(select 1 from exec_permit p where p.subject_kind=a.subject_kind and p.subject=a.subject and p.research_kind=a.research_kind and p.cutoff=a.cutoff and p.sent_at is not null)) as sent from schedule_admission a order by plan_id, priority, first_queued_at, admission_id`)
     : await pool.query<AdmissionDbRow>(
-        `select * from schedule_admission where plan_id = $1 order by priority, first_queued_at, admission_id`,
+        `select a.*, (a.sent or exists(select 1 from exec_permit p where p.subject_kind=a.subject_kind and p.subject=a.subject and p.research_kind=a.research_kind and p.cutoff=a.cutoff and p.sent_at is not null)) as sent from schedule_admission a where plan_id = $1 order by priority, first_queued_at, admission_id`,
         [filter.planId],
       );
   return res.rows.map((r) => ({
@@ -240,7 +244,7 @@ export async function loadAdmissions(pool: Pool, filter?: { planId?: string }): 
     triggerEventIds: r.trigger_event_ids,
     annotation: r.annotation,
     firstQueuedAt: r.first_queued_at.toISOString(),
-    started: r.started,
+    started: r.started || r.sent,
     sent: r.sent,
     notes: r.notes,
   }));

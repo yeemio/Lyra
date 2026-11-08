@@ -15,11 +15,13 @@
  * - 生成身份：报告 generatedBy 由通道 describe().simulated 决定，不得手工改写。
  */
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, writeFile, readFile } from 'node:fs/promises';
+import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { KernelError } from '../contracts.js';
 import { runPermittedCall, type PermittedCallSuccess } from '../kernel/executor.js';
 import { canonicalSha256 } from '../canonical.js';
+import { withExecutionLease, type ExecutionLease } from '../kernel/lease.js';
+import { fencedSrWrite, freezeSrInput, restoreSrResponse, srCheckpointInput, assertSrModelArtifact, initialEvidence, type SrInputCheckpoint } from './engine-checkpoint.js';
 import {
   REPORT_SECTIONS,
   type SrCallContract,
@@ -37,7 +39,6 @@ import {
   type SrTransportDescribe,
 } from './contracts.js';
 import {
-  listChatMessages,
   SR_PERMIT_SPACE,
   srCallHasReceipt,
   srFindCallByStep,
@@ -46,13 +47,15 @@ import {
   findThreadForReport,
   getReportByTaskAndVersion,
   getTask,
-  insertReport,
+  insertAssembledReport,
   insertStep,
-  listReportVersions,
+  getLatestReportForTask,
   listSteps,
   srRecordCallMeta,
   updateStep,
   updateTask,
+  ensureSrSteps,
+  claimSrTask,
 } from './store.js';
 import type { SrCallPermit } from './store.js';
 import {
@@ -78,8 +81,12 @@ import {
   type SynthOutput,
 } from './transport.js';
 import { selectAnalysisTables } from './materials.js';
-import { buildEvidencePack, applyPlanToEvidence, loadResearchPool } from './evidence.js';
+import { beginChatRequest, completeChatRequest, recordRequestFailure } from './store-requests.js';
+import { buildEvidencePack, applyPlanToEvidence } from './evidence.js';
 import { computeMetrics } from './compute.js';
+import { signReport } from './report-identity.js';
+import { chatCitations, verifiedChatMessages } from './chat-evidence.js';
+import { loadReportMaterials, readStepArtifact, reportArtifacts, saveStepArtifact } from './report-artifacts.js';
 
 /** ANALYZE 分组：三组覆盖十章中的九章（summary 由 SYNTHESIZE 生成、sources 由组装生成）。 */
 const ANALYZE_GROUPS: { key: string; sections: string[] }[] = [
@@ -173,6 +180,7 @@ async function taskDir(deps: SrEngineDeps, taskId: string): Promise<string> {
 }
 
 async function writeStepOutput(deps: SrEngineDeps, step: SrStep, value: unknown): Promise<string> {
+  await fencedSrWrite(deps.srPool, deps.lease, (tx) => saveStepArtifact(tx, deps.outputDir, step, value));
   const dir = await taskDir(deps, step.taskId);
   const rel = join('steps', `${String(step.sequence).padStart(2, '0')}-${step.stepKind}${step.sectionKey ? '-' + step.sectionKey : ''}.json`);
   await mkdir(join(dir, 'steps'), { recursive: true });
@@ -180,10 +188,8 @@ async function writeStepOutput(deps: SrEngineDeps, step: SrStep, value: unknown)
   return rel;
 }
 
-async function readStepOutput<T>(deps: SrEngineDeps, taskId: string, rel: string): Promise<T> {
-  const dir = await taskDir(deps, taskId);
-  const raw = await readFile(join(dir, rel), 'utf8');
-  return JSON.parse(raw) as T;
+async function readStepOutput<T>(deps: SrEngineDeps, step: SrStep): Promise<T> {
+  return readStepArtifact<T>(deps.outputDir, step, step.outputArtifact);
 }
 
 // ===== 模型调用（唯一发送路径）=====
@@ -192,71 +198,69 @@ export type SrModelStep = 'PLAN' | 'ANALYZE' | 'A_FINAL' | 'JUDGE' | 'SYNTHESIZE
 
 /** Shared sr entry; callers own the frozen contract and output persistence, never a second permit space. */
 export async function callSrModel<T>(
-  deps: Pick<SrEngineDeps, 'srPool' | 'transport' | 'budget'>,
+  deps: Pick<SrEngineDeps, 'srPool' | 'transport' | 'budget'> & Pick<SrEngineDeps, 'lease'>,
   args: {
     contract: Omit<SrCallContract, 'inputHash' | 'inputBytes'>;
     modelStep: SrModelStep;
     input: unknown;
     validate: (v: unknown) => T;
     holderId?: string;
+    lease?: ExecutionLease;
+    fixedDeadline?: boolean;
     expectedTransport?: SrTransportDescribe;
     afterValidated?: (output: T, permit: SrCallPermit, transport: SrTransportDescribe) => Promise<void>;
   },
 ): Promise<PermittedCallSuccess<SrCallPermit, T>> {
-  const { modelStep, input, validate } = args;
-  const prompt = JSON.stringify(input, null, 1);
-  const inputHash = sha256Text(prompt);
-  const desc = deps.transport.describe(modelStep);
-  if (args.expectedTransport && canonicalSha256(desc) !== canonicalSha256(args.expectedTransport)) throw new KernelError('MODEL_PROVIDER_UNAUTHORIZED', 'Frozen transport identity changed');
-  let result: PermittedCallSuccess<SrCallPermit, T>;
-  let callMeta: { callId: string; provider: string; modelId: string | null; effort?: string; simulated: boolean; startedAt: number } | undefined;
-  try {
-    result = await runPermittedCall<SrCallPermit, SrCallContract, T>(
-      SR_PERMIT_SPACE,
-      deps.srPool,
-      {
-        contract: {
-          ...args.contract,
-          inputHash,
-          inputBytes: Buffer.byteLength(prompt, 'utf8'),
-        },
-        budget: deps.budget,
-        simulated: desc.simulated,
-        holderId: args.holderId,
+  return withExecutionLease(deps.srPool, 'sr', async (guard) => {
+    const { modelStep, input, validate } = args;
+    const prompt = JSON.stringify(input, null, 1);
+    const inputHash = sha256Text(prompt);
+    const desc = deps.transport.describe(modelStep);
+    if (args.expectedTransport && canonicalSha256(desc) !== canonicalSha256(args.expectedTransport)) throw new KernelError('MODEL_PROVIDER_UNAUTHORIZED', 'Frozen transport identity changed');
+    if (!desc.simulated && !deps.transport.preflight) throw new KernelError('MODEL_PREFLIGHT_REQUIRED', 'Real SR transport requires a non-sending preflight');
+    const wire = await deps.transport.preflight?.(modelStep, inputHash, input) ?? { inputHash, inputBytes: Buffer.byteLength(prompt, 'utf8') };
+    if (!Number.isSafeInteger(wire.inputBytes) || wire.inputBytes < 1 || !/^[a-f0-9]{64}$/.test(wire.inputHash)) throw new KernelError('MODEL_INPUT_UNBOUND', 'Transport preflight has no valid wire identity');
+    if (wire.inputBytes > deps.budget.maxInputBytes) throw new KernelError('INPUT_OVER_BUDGET', 'Full wire prompt exceeds the authorized input budget');
+    const frozen = await freezeSrInput(deps.srPool, guard.lease, { version: 1,
+      contract: { ...args.contract, deadline: new Date(args.contract.deadline).toISOString(), inputHash, inputBytes: Buffer.byteLength(prompt, 'utf8') },
+      modelStep, input, wire, transport: desc, budget: deps.budget }, args.fixedDeadline);
+    let result = await restoreSrResponse(deps.srPool, frozen);
+    let startedAt: number | undefined;
+    let callId: string | undefined;
+    try {
+      if (!result) result = await runPermittedCall<SrCallPermit, SrCallContract, T>(SR_PERMIT_SPACE, deps.srPool, {
+        contract: frozen.contract, budget: deps.budget, simulated: desc.simulated, lease: guard.lease,
+        checkpoint: { input: srCheckpointInput(frozen), transport: desc },
         modelFn: async (ctx) => {
-          const desc = deps.transport.describe(modelStep);
-          if (args.expectedTransport && canonicalSha256(desc) !== canonicalSha256(args.expectedTransport)) throw new KernelError('MODEL_PROVIDER_UNAUTHORIZED', 'Frozen transport identity changed before dispatch');
-          callMeta = { callId: ctx.permit.permitId, ...desc, startedAt: performance.now() };
-          await srRecordCallMeta(deps.srPool, ctx.permit.permitId, {
-            provider: desc.provider,
-            modelId: desc.modelId,
-            usage: desc.effort ? { reasoningEffort: desc.effort } : null,
-          });
-          const out = await deps.transport.dispatch(modelStep, { callId: ctx.permit.permitId, inputHash, deadline: ctx.contract.deadline }, input);
-          const validated = validate(out);
-          await args.afterValidated?.(validated, ctx.permit, desc);
-          return validated;
+          await guard.assert();
+          if (canonicalSha256(deps.transport.describe(modelStep)) !== canonicalSha256(desc)) throw new KernelError('MODEL_PROVIDER_UNAUTHORIZED', 'Transport identity changed before dispatch');
+          callId = ctx.permit.callId; startedAt = performance.now();
+          await fencedSrWrite(deps.srPool, guard.lease, (tx) => srRecordCallMeta(tx as unknown as SrEngineDeps['srPool'], callId!, { provider: desc.provider, modelId: desc.modelId,
+            usage: { ...(desc.effort ? { reasoningEffort: desc.effort } : {}), wireInputBytes: wire.inputBytes } }));
+          ctx.signal?.throwIfAborted();
+          await guard.assert();
+          ctx.signal?.throwIfAborted();
+          return validate(await deps.transport.dispatch(modelStep, { callId, inputHash, deadline: frozen.contract.deadline, signal: ctx.signal }, frozen.input));
+        }, pollMs: 25,
+      });
+      const output = validate(result.output);
+      // Publication is after the atomic SUCCEEDED/checkpoint, outside the model/deadline race.
+      // If publication fails, retry reads this original result, without dispatching again.
+      await guard.assert();
+      await args.afterValidated?.(output, result.permit, desc);
+      return { permit: result.permit, output };
+    } catch (err) {
+      if (err instanceof KernelError) throw new KernelError(err.code, `[${modelStep}] ${err.message}`);
+      throw err;
+    } finally {
+      if (callId && startedAt !== undefined) await fencedSrWrite(deps.srPool, guard.lease, (tx) => srRecordCallMeta(tx as unknown as SrEngineDeps['srPool'], callId!, {
+        provider: desc.provider, modelId: desc.modelId, usage: {
+          ...(desc.effort ? { reasoningEffort: desc.effort } : {}), durationMs: Math.round(performance.now() - startedAt!),
+          wireInputBytes: wire.inputBytes, costNote: desc.simulated ? '模拟通道：无费用' : '费用未知，待实际回执；UNKNOWN 不记零费用',
         },
-        pollMs: 25,
-      },
-    );
-  } catch (err) {
-    if (err instanceof KernelError) {
-      throw new KernelError(err.code, `[${modelStep}] ${err.message}`);
+      })).catch(() => undefined);
     }
-    throw err;
-  } finally {
-    if (callMeta) {
-      // Supplement after the executor settles, including UNKNOWN from its deadline race.
-      // A telemetry write cannot replace the original result/error or alter permit state.
-      await srRecordCallMeta(deps.srPool, callMeta.callId, {
-        provider: callMeta.provider,
-        modelId: callMeta.modelId,
-        usage: { ...(callMeta.effort ? { reasoningEffort: callMeta.effort } : {}), durationMs: Math.round(performance.now() - callMeta.startedAt), costNote: callMeta.simulated ? '模拟通道：无费用' : '费用计量待真实通道接入' },
-      }).catch(() => undefined);
-    }
-  }
-  return result;
+  }, { lease: args.lease ?? deps.lease, holderId: args.holderId });
 }
 
 async function callModel(
@@ -272,12 +276,18 @@ async function callModel(
   return result.output;
 }
 
+async function updateOwnedStep(deps: SrEngineDeps, stepId: string, patch: Parameters<typeof updateStep>[2]): Promise<void> {
+  await fencedSrWrite(deps.srPool, deps.lease, (tx) => updateStep(tx, stepId, patch));
+}
+async function updateOwnedTask(deps: SrEngineDeps, taskId: string, patch: Parameters<typeof updateTask>[2]): Promise<SrTask> {
+  return fencedSrWrite(deps.srPool, deps.lease, (tx) => updateTask(tx as unknown as SrEngineDeps['srPool'], taskId, patch));
+}
+
 // ===== 步骤执行 =====
 
 interface RunContext {
   deps: SrEngineDeps;
   task: SrTask;
-  pool: Awaited<ReturnType<typeof loadResearchPool>>;
   plan?: PlanOutput;
   pack?: EvidencePack;
   computed?: ComputeResult;
@@ -291,17 +301,17 @@ interface RunContext {
 
 async function runOneStep(ctx: RunContext, step: SrStep): Promise<void> {
   const { deps, task } = ctx;
-  await updateStep(deps.srPool, step.stepId, { status: 'RUNNING', started: true });
+  await updateOwnedStep(deps, step.stepId, { status: 'RUNNING', started: true });
   try {
     switch (step.stepKind) {
       case 'PLAN': {
-        const subject = ctx.pool.stocks.find((s) => s.code === task.subject);
-        const preflight = await buildEvidencePack(deps.dataPool, { taskId: task.taskId, subject: task.subject, cutoff: task.cutoff, focus: task.focus, outputDir: deps.outputDir });
+        const preflight = { pack: await initialEvidence(deps, task.taskId, async () =>
+          (await buildEvidencePack(deps.dataPool, { taskId: task.taskId, subject: task.subject, cutoff: task.cutoff, focus: task.focus, outputDir: deps.outputDir })).pack) };
         ctx.pack = preflight.pack;
         const input: PlanInput = {
           subject: task.subject,
           subjectName: task.subjectName,
-          swL1: subject?.swL1 ?? '未知',
+          swL1: preflight.pack.coverage.industry.swL1 ?? '历史归属/名称缺失',
           focus: task.focus,
           horizon: task.horizon,
           emphasis: task.emphasis,
@@ -311,24 +321,18 @@ async function runOneStep(ctx: RunContext, step: SrStep): Promise<void> {
         };
         const out = validatePlanOutput(await callModel(deps, task, step, 'PLAN', input, validatePlanOutput));
         ctx.plan = out;
-        await writeStepOutput(deps, step, { input, output: out });
-        await updateStep(deps.srPool, step.stepId, { status: 'SUCCEEDED', note: `${out.questions.length} 个研究问题`, finished: true });
+        await writeStepOutput(deps, step, { inputJson: JSON.stringify(input, null, 1), input, output: out });
+        await updateOwnedStep(deps, step.stepId, { status: 'SUCCEEDED', note: `${out.questions.length} 个研究问题`, finished: true });
         return;
       }
       case 'EVIDENCE': {
         if (!ctx.plan) throw new KernelError('STEP_PRECONDITION', 'EVIDENCE 需要 PLAN');
-        const built = ctx.pack ? { pack: ctx.pack } : await buildEvidencePack(deps.dataPool, {
-          taskId: task.taskId,
-          subject: task.subject,
-          cutoff: task.cutoff,
-          focus: task.focus,
-          outputDir: deps.outputDir,
-        });
+        const built = { pack: ctx.pack ?? await initialEvidence(deps, task.taskId) };
         built.pack = applyPlanToEvidence(built.pack, ctx.plan, task.horizon);
         ctx.pack = built.pack;
         await writeFile(join(await taskDir(deps, task.taskId), 'evidence.json'), JSON.stringify(built.pack, null, 1), 'utf8');
-        await writeStepOutput(deps, step, { packRef: 'evidence.json', coverage: built.pack.coverage, packHash: built.pack.packHash });
-        await updateStep(deps.srPool, step.stepId, { status: 'SUCCEEDED', note: `${built.pack.tables.length} 张证据表，缺口 ${built.pack.coverage.gaps.length} 项`, finished: true });
+        await writeStepOutput(deps, step, { pack: built.pack });
+        await updateOwnedStep(deps, step.stepId, { status: 'SUCCEEDED', note: `${built.pack.tables.length} 张证据表，缺口 ${built.pack.coverage.gaps.length} 项`, finished: true });
         return;
       }
       case 'COMPUTE': {
@@ -337,8 +341,8 @@ async function runOneStep(ctx: RunContext, step: SrStep): Promise<void> {
         ctx.computed = result;
         const dir = await taskDir(deps, task.taskId);
         await writeFile(join(dir, 'computed.json'), JSON.stringify(result, null, 1), 'utf8');
-        await writeStepOutput(deps, step, { computedRef: 'computed.json', checks: result.checks });
-        await updateStep(deps.srPool, step.stepId, { status: 'SUCCEEDED', note: `${result.tables.length} 张计算表`, finished: true });
+        await writeStepOutput(deps, step, { computed: result });
+        await updateOwnedStep(deps, step.stepId, { status: 'SUCCEEDED', note: `${result.tables.length} 张计算表`, finished: true });
         return;
       }
       case 'ANALYZE': {
@@ -361,8 +365,8 @@ async function runOneStep(ctx: RunContext, step: SrStep): Promise<void> {
         };
         const out = validateAnalyzeOutput(await callModel(deps, task, step, 'ANALYZE', input, (v) => validateAnalyzeOutput(v, input)), input);
         ctx.analyze.set(step.sectionKey ?? '', out);
-        await writeStepOutput(deps, step, { input, output: out });
-        await updateStep(deps.srPool, step.stepId, { status: 'SUCCEEDED', note: `${out.sections.length} 章`, finished: true });
+        await writeStepOutput(deps, step, { inputJson: JSON.stringify(input, null, 1), input, output: out });
+        await updateOwnedStep(deps, step.stepId, { status: 'SUCCEEDED', note: `${out.sections.length} 章`, finished: true });
         return;
       }
       case 'SYNTHESIZE':
@@ -383,8 +387,8 @@ async function runOneStep(ctx: RunContext, step: SrStep): Promise<void> {
         };
         const out = validateAFinalOutput(await callModel(deps, task, step, 'A_FINAL', input, (v) => validateAFinalOutput(v)));
         ctx.aFinal = out;
-        await writeStepOutput(deps, step, { input, output: out });
-        await updateStep(deps.srPool, step.stepId, { status: 'SUCCEEDED', note: `结论+${out.decisiveLinks.length} 条决定性连接+反证`, finished: true });
+        await writeStepOutput(deps, step, { inputJson: JSON.stringify(input, null, 1), input, output: out });
+        await updateOwnedStep(deps, step.stepId, { status: 'SUCCEEDED', note: `结论+${out.decisiveLinks.length} 条决定性连接+反证`, finished: true });
         return;
       }
       case 'CHECKLIST': {
@@ -394,7 +398,7 @@ async function runOneStep(ctx: RunContext, step: SrStep): Promise<void> {
         const cl = deriveSrChecklist(groups, ctx.aFinal);
         ctx.checklist = cl;
         await writeStepOutput(deps, step, cl);
-        await updateStep(deps.srPool, step.stepId, { status: 'SUCCEEDED', note: `${cl.items.length} 项（哈希 ${cl.checklistHash.slice(0, 8)}）`, finished: true });
+        await updateOwnedStep(deps, step.stepId, { status: 'SUCCEEDED', note: `${cl.items.length} 项（哈希 ${cl.checklistHash.slice(0, 8)}）`, finished: true });
         return;
       }
       case 'JUDGE': {
@@ -421,9 +425,9 @@ async function runOneStep(ctx: RunContext, step: SrStep): Promise<void> {
           { deliveredTableIds: deliveredIds, aConclusion: ctx.aFinal.conclusion },
         );
         ctx.judge = out;
-        await writeStepOutput(deps, step, { input, output: out });
+        await writeStepOutput(deps, step, { inputJson: JSON.stringify(input, null, 1), input, output: out });
         const unresolved = out.verdicts.filter((v) => v.verdict === 'UNRESOLVED').length;
-        await updateStep(deps.srPool, step.stepId, { status: 'SUCCEEDED', note: `${out.verdicts.length} 项裁决，${unresolved} 项未解，证据 ${evidenceBundle.length} 表`, finished: true });
+        await updateOwnedStep(deps, step.stepId, { status: 'SUCCEEDED', note: `${out.verdicts.length} 项裁决，${unresolved} 项未解，证据 ${evidenceBundle.length} 表`, finished: true });
         return;
       }
       case 'QA_CHECK': {
@@ -431,15 +435,15 @@ async function runOneStep(ctx: RunContext, step: SrStep): Promise<void> {
         ctx.qa = findings;
         await writeStepOutput(deps, step, { findings });
         const blocking = findings.filter((f) => f.severity === 'BLOCKING').length;
-        await updateStep(deps.srPool, step.stepId, { status: 'SUCCEEDED', note: blocking ? `${blocking} 项 BLOCKING` : '通过', finished: true });
+        await updateOwnedStep(deps, step.stepId, { status: 'SUCCEEDED', note: blocking ? `${blocking} 项 BLOCKING` : '通过', finished: true });
         return;
       }
       case 'ASSEMBLE': {
         const report = await assembleReport(ctx, step);
         const dir = await taskDir(deps, task.taskId);
-        await writeFile(join(dir, 'report.md'), renderReportMarkdown(report, ctx), 'utf8');
+        await writeFile(join(dir, 'report.md'), renderReportMarkdown(report, await loadReportMaterials(deps.outputDir, report)), 'utf8');
         await writeStepOutput(deps, step, { reportId: report.reportId, version: report.version, contentHash: report.contentHash });
-        await updateStep(deps.srPool, step.stepId, { status: 'SUCCEEDED', note: `v${report.version}`, finished: true });
+        await updateOwnedStep(deps, step.stepId, { status: 'SUCCEEDED', note: `v${report.version}`, finished: true });
         return;
       }
       default:
@@ -447,7 +451,7 @@ async function runOneStep(ctx: RunContext, step: SrStep): Promise<void> {
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    await updateStep(deps.srPool, step.stepId, { status: 'FAILED', note: message.slice(0, 500), finished: true });
+    await updateOwnedStep(deps, step.stepId, { status: 'FAILED', note: message.slice(0, 500), finished: true });
     throw err;
   }
 }
@@ -671,11 +675,10 @@ function generatedBy(ctx: RunContext): ReportDocument['generatedBy'] {
   return ctx.deps.transport.describe().simulated ? 'PRODUCT_SIMULATED' : 'PRODUCT_REAL';
 }
 
-async function assembleReport(ctx: RunContext, _step: SrStep): Promise<ReportDocument> {
+async function assembleReport(ctx: RunContext, step: SrStep): Promise<ReportDocument> {
   const { deps, task } = ctx;
-  const existing = await listReportVersions(deps.srPool, task.taskId);
-  const version = existing.length + 1;
-  const reportId = existing[0]?.reportId ?? randomUUID();
+  const version = 1; // 实际版本在持有任务行锁的 insertAssembledReport 中确定
+  const reportId = randomUUID();
   const sections: ReportSection[] = [];
 
   // 〔C3〕发布门评估（共用函数）
@@ -689,6 +692,7 @@ async function assembleReport(ctx: RunContext, _step: SrStep): Promise<ReportDoc
     aOutputHash: canonicalSha256({ sections: aSections, aFinal }),
     checklistHash: ctx.checklist?.checklistHash ?? '(缺失)',
     jOutputHash: judge ? canonicalSha256(judge) : '(J 未完成)',
+    artifacts: reportArtifacts(await listSteps(deps.srPool, task.taskId), step.stepId),
   };
 
   // summary（A 摘要 + J 终局对齐——〔C4/R0d〕摘要不得先于裁决呈现旧结论）
@@ -770,7 +774,7 @@ async function assembleReport(ctx: RunContext, _step: SrStep): Promise<ReportDoc
     key: 'sources',
     title: SECTION_TITLES.sources,
     narrative:
-      `${genNote}\n\n资料截点：${task.cutoff}；方法版本 ${task.methodVersion}；报告版本 v${version}。\n\n` +
+      `${genNote}\n\n资料截点：${task.cutoff}；方法版本 ${task.methodVersion}。\n\n` +
       `研究链：A 分节分析 + A 终稿 → 程序清单（${ctx.checklist?.items.length ?? 0} 项，机械抽取）→ 必经 J 裁决 → 发布门${gate.passed ? '（通过）' : '（未过——受限发布）'}。\n\n` +
       `${verdictSummary}\n\n` +
       `证据绑定（可整链核验）：证据包 ${evidenceRefs.packHash.slice(0, 16)}… / A 输出 ${evidenceRefs.aOutputHash.slice(0, 16)}… / 清单 ${evidenceRefs.checklistHash.slice(0, 16)}… / J 输出 ${evidenceRefs.jOutputHash.slice(0, 16)}…。\n\n` +
@@ -806,7 +810,8 @@ async function assembleReport(ctx: RunContext, _step: SrStep): Promise<ReportDoc
     createdAt: (deps.now?.() ?? new Date()).toISOString(),
     publishedAt: (deps.now?.() ?? new Date()).toISOString(),
   };
-  return insertReport(deps.srPool, base);
+  await loadReportMaterials(deps.outputDir, signReport(base));
+  return insertAssembledReport(deps.srPool, base, deps.lease);
 }
 
 /** 报告的 markdown 归档形态（与网页/PDF 同源）。 */
@@ -870,65 +875,45 @@ export interface SrTaskRunResult {
   report: ReportDocument | null;
 }
 
+const runningTasks = new WeakMap<SrEngineDeps['srPool'], Map<string, Promise<SrTaskRunResult>>>();
 export async function runSrTask(deps: SrEngineDeps, taskId: string): Promise<SrTaskRunResult> {
+  let tasks = runningTasks.get(deps.srPool);
+  if (!tasks) { tasks = new Map(); runningTasks.set(deps.srPool, tasks); }
+  const old = tasks.get(taskId);
+  if (old) return old;
+  const promise = withExecutionLease(deps.srPool, 'sr', ({ lease }) => runSrTaskOwned({ ...deps, lease }, taskId), { lease: deps.lease });
+  tasks.set(taskId, promise);
+  try { return await promise; } finally { tasks.delete(taskId); }
+}
+
+async function runSrTaskOwned(deps: SrEngineDeps, taskId: string): Promise<SrTaskRunResult> {
   const task = await getTask(deps.srPool, taskId);
   if (!task) throw new KernelError('TASK_NOT_FOUND', `任务不存在：${taskId}`);
   // FAILED 可续跑（中断恢复只续未完成步骤；已完成模型步骤复用落盘输出，零重发）。
   if (['COMPLETED', 'PARTIAL', 'CANCELLED'].includes(task.status)) {
-    const report = await getReportByTaskAndVersion(deps.srPool, taskId, 1);
+    const report = await getLatestReportForTask(deps.srPool, taskId);
+    if (report) await loadReportMaterials(deps.outputDir, report);
     return { task, report: report ?? null };
   }
-  await updateTask(deps.srPool, taskId, { status: 'RUNNING', error: null });
-
-  // 步骤骨架：幂等创建（重启后补齐缺失行）
-  let steps = await listSteps(deps.srPool, taskId);
-  if (steps.length === 0) {
-    for (let i = 0; i < plannedSteps().length; i++) {
-      const p = plannedSteps()[i];
-      if (!p) continue;
-      await insertStep(deps.srPool, { taskId, stepKind: p.kind, sectionKey: p.sectionKey, sequence: i + 1 });
-    }
-    steps = await listSteps(deps.srPool, taskId);
-  }
-
-  const ctx: RunContext = {
-    deps,
-    task,
-    pool: await loadResearchPool(),
-    analyze: new Map(),
-  };
-
-  // 产物读回（恢复路径：已完成步骤的落盘输出）
-  const dir = await taskDir(deps, taskId);
-  for (const step of steps) {
-    if (step.status !== 'SUCCEEDED') continue;
-    if (step.stepKind === 'EVIDENCE') {
-      try { ctx.pack = JSON.parse(await readFile(join(dir, 'evidence.json'), 'utf8')) as EvidencePack; } catch { /* 重建 */ }
-    } else if (step.stepKind === 'COMPUTE') {
-      try { ctx.computed = JSON.parse(await readFile(join(dir, 'computed.json'), 'utf8')) as ComputeResult; } catch { /* 重建 */ }
-    }
-  }
-
+  let claimed = false;
   try {
+    await claimSrTask(deps.srPool, deps.lease!, taskId);
+    claimed = true;
+    const steps = await ensureSrSteps(deps.srPool, deps.lease!, taskId, plannedSteps());
+    const ctx: RunContext = { deps, task, analyze: new Map() };
     for (const step of steps) {
       if (step.status === 'SUCCEEDED') {
-        // 落盘产物读回到内存上下文
-        if (step.stepKind === 'PLAN') ctx.plan = await reloadPlan(deps, taskId, step);
+        if (['PLAN','ANALYZE','A_FINAL','SYNTHESIZE','JUDGE'].includes(step.stepKind)) await verifyCompletedModel(deps, step);
+        // 只读首次绑定的 CAS 产物；工作目录缺失/覆盖不改变恢复材料。
+        if (step.stepKind === 'EVIDENCE') ctx.pack = (await readStepOutput<{ pack: EvidencePack }>(deps, step)).pack;
+        if (step.stepKind === 'COMPUTE') ctx.computed = (await readStepOutput<{ computed: ComputeResult }>(deps, step)).computed;
+        if (step.stepKind === 'PLAN') { ctx.plan = await reloadPlan(deps, taskId, step); ctx.pack = await initialEvidence(deps, taskId); }
         if (step.stepKind === 'ANALYZE' && step.sectionKey) ctx.analyze.set(step.sectionKey, await reloadAnalyze(deps, taskId, step));
         if (step.stepKind === 'SYNTHESIZE' || step.stepKind === 'A_FINAL') ctx.aFinal = await reloadAFinal(deps, taskId, step);
-        if (step.stepKind === 'CHECKLIST') ctx.checklist = await readStepOutput<SrChecklist>(deps, taskId, stepOutputRel(step));
+        if (step.stepKind === 'CHECKLIST') ctx.checklist = await readStepOutput<SrChecklist>(deps, step);
         if (step.stepKind === 'JUDGE') ctx.judge = await reloadJudge(deps, taskId, step);
-        // 〔C5/C4-03〕QA_CHECK 已完成时恢复其结论：发布门依赖 ctx.qa——
-        // 缺失会使 evaluatePublishGate 把质检视为无阻断（C4-03 反例）。优先读回落盘；
-        // 读回失败则确定性重算（runQaChecks 无模型调用），两种路径都不重发任何模型调用。
         if (step.stepKind === 'QA_CHECK') {
-          try {
-            const saved = await readStepOutput<{ findings: ReportQaFinding[] }>(deps, taskId, stepOutputRel(step));
-            ctx.qa = saved.findings;
-          } catch {
-            ctx.qa = runQaChecks(ctx);
-            await writeStepOutput(deps, step, { findings: ctx.qa });
-          }
+          ctx.qa = (await readStepOutput<{ findings: ReportQaFinding[] }>(deps, step)).findings;
         }
         continue;
       }
@@ -956,7 +941,7 @@ export async function runSrTask(deps: SrEngineDeps, taskId: string): Promise<SrT
     const blocking = (ctx.qa ?? []).filter((f) => f.severity === 'BLOCKING').length;
     const gateEval = evaluatePublishGate(ctx);
     const gateBlocked = !gateEval.gatePassed; // 〔C4/R0c〕单一有效裁定：QA 阻断已并入发布门
-    const finalTask = await updateTask(deps.srPool, taskId, {
+    const finalTask = await updateOwnedTask(deps, taskId, {
       status: blocking > 0 || gateBlocked ? 'PARTIAL' : 'COMPLETED',
       error: gateBlocked
         ? { code: 'PUBLISH_GATE_BLOCKED', message: gateEval.gate.reason }
@@ -965,12 +950,13 @@ export async function runSrTask(deps: SrEngineDeps, taskId: string): Promise<SrT
           : null,
       completed: true,
     });
-    const report = await getReportByTaskAndVersion(deps.srPool, taskId, 1);
+    const report = await getLatestReportForTask(deps.srPool, taskId);
     return { task: finalTask, report: report ?? null };
   } catch (err) {
+    if (!claimed || (err instanceof KernelError && ['EXECUTION_LOCK_HELD','EXECUTION_LEASE_REQUIRED','RECOVERY_CONFIRM_REQUIRED'].includes(err.code))) throw err;
     const code = err instanceof KernelError ? err.code : 'STEP_FAILED';
     const message = err instanceof Error ? err.message : String(err);
-    const failedTask = await updateTask(deps.srPool, taskId, {
+    const failedTask = await updateOwnedTask(deps, taskId, {
       status: 'FAILED',
       error: { code, message: message.slice(0, 1000) },
       completed: true,
@@ -979,39 +965,62 @@ export async function runSrTask(deps: SrEngineDeps, taskId: string): Promise<SrT
   }
 }
 
+async function verifyCompletedModel(deps: SrEngineDeps, step: SrStep): Promise<void> {
+  const row = (await deps.srPool.query<{ input_checkpoint: SrInputCheckpoint | null; input_checkpoint_hash: string | null }>(
+    'select input_checkpoint,input_checkpoint_hash from sr_step where step_id=$1::uuid', [step.stepId])).rows[0];
+  const frozen = row?.input_checkpoint;
+  if (!frozen || row!.input_checkpoint_hash !== canonicalSha256(frozen) || frozen.contract.taskId !== step.taskId ||
+      frozen.contract.stepId !== step.stepId || canonicalSha256(frozen.transport) !== canonicalSha256(deps.transport.describe(frozen.modelStep))) {
+    throw new KernelError('SR_CHECKPOINT_MISSING', 'Completed model step lacks a matching original request');
+  }
+  const result = await restoreSrResponse(deps.srPool, frozen);
+  const value = await readStepOutput<{ inputJson: string; input: unknown; output: unknown }>(deps, step);
+  if (!result) throw new KernelError('SR_CHECKPOINT_CONFLICT', 'Completed model step has no original successful call');
+  assertSrModelArtifact(frozen, value, result.output);
+  switch (frozen.modelStep) {
+    case 'PLAN': validatePlanOutput(result.output); break;
+    case 'ANALYZE': validateAnalyzeOutput(result.output, frozen.input as AnalyzeInput); break;
+    case 'A_FINAL': validateAFinalOutput(result.output); break;
+    case 'SYNTHESIZE': validateSynthOutput(result.output); break;
+    case 'JUDGE': {
+      const input = frozen.input as JInput;
+      validateJOutput(result.output, input.checklist.items.map((x) => x.checklistId),
+        { deliveredTableIds: input.evidenceBundle.map((x) => x.tableId), aConclusion: input.aFinal.conclusion }); break;
+    }
+  }
+}
+
 async function reloadPlan(deps: SrEngineDeps, taskId: string, step: SrStep): Promise<PlanOutput> {
-  const v = await readStepOutput<{ output: PlanOutput }>(deps, taskId, stepOutputRel(step));
+  const v = await readStepOutput<{ output: PlanOutput }>(deps, step);
   return v.output;
 }
 async function reloadAnalyze(deps: SrEngineDeps, taskId: string, step: SrStep): Promise<AnalyzeOutput> {
-  const v = await readStepOutput<{ output: AnalyzeOutput }>(deps, taskId, stepOutputRel(step));
+  const v = await readStepOutput<{ output: AnalyzeOutput }>(deps, step);
   return v.output;
 }
 async function reloadSynth(deps: SrEngineDeps, taskId: string, step: SrStep): Promise<SynthOutput> {
-  const v = await readStepOutput<{ output: SynthOutput }>(deps, taskId, stepOutputRel(step));
+  const v = await readStepOutput<{ output: SynthOutput }>(deps, step);
   return v.output;
 }
 async function reloadAFinal(deps: SrEngineDeps, taskId: string, step: SrStep): Promise<AFinalOutput> {
-  const v = await readStepOutput<{ output: AFinalOutput }>(deps, taskId, stepOutputRel(step));
+  const v = await readStepOutput<{ output: AFinalOutput }>(deps, step);
   return v.output;
 }
 async function reloadJudge(deps: SrEngineDeps, taskId: string, step: SrStep): Promise<JOutput> {
-  const v = await readStepOutput<{ output: JOutput }>(deps, taskId, stepOutputRel(step));
+  const v = await readStepOutput<{ output: JOutput }>(deps, step);
   return v.output;
 }
-function stepOutputRel(step: SrStep): string {
-  return join('steps', `${String(step.sequence).padStart(2, '0')}-${step.stepKind}${step.sectionKey ? '-' + step.sectionKey : ''}.json`);
-}
-
 // ===== 追问（CHAT_ANSWER 步骤 + 调用）=====
 
 export interface AskOptions {
+  requestKey?: string;
+  quotaLimit?: number;
   taskId: string;
   reportVersion: number;
   question: string;
   questionKind: ChatMessage['kind'];
-  pack: EvidencePack;
-  computed: ComputeResult;
+  pack?: EvidencePack; // 兼容调用者：如提供，必须与绑定原件逐字相符
+  computed?: ComputeResult;
 }
 
 export async function askReportQuestion(
@@ -1024,68 +1033,88 @@ export async function askReportQuestion(
   const report = await getReportByTaskAndVersion(deps.srPool, opts.taskId, opts.reportVersion);
   if (!report) throw new KernelError('REPORT_NOT_FOUND', `报告不存在：${opts.taskId}/v${opts.reportVersion}`);
 
-  let thread = await findThreadForReport(deps.srPool, report.reportId, accountId);
-  if (!thread) thread = await createChatThread(deps.srPool, report.reportId, accountId);
-
-  // 〔C3 补〕追问同文本幂等：同线程同问题的既有回答直接返回（零新调用）——
-  // 与任务幂等键同义，防止逐字重发绕过一次发送语义（复核建议项）。
-  const existing = await listChatMessages(deps.srPool, thread.threadId);
-  for (let i = 0; i < existing.length - 1; i++) {
-    const m = existing[i]!;
-    const next = existing[i + 1]!;
-    if (m.role === 'USER' && m.content === opts.question && next.role === 'ASSISTANT') {
-      return next;
-    }
+  const { pack, computed } = await loadReportMaterials(deps.outputDir, report);
+  if ((opts.pack && canonicalSha256(opts.pack) !== canonicalSha256(pack)) ||
+      (opts.computed && canonicalSha256(opts.computed) !== canonicalSha256(computed))) {
+    throw new KernelError('SR_ARTIFACT_BINDING_MISMATCH', '追问材料不属于所选报告版本');
   }
-
-  await addChatMessage(deps.srPool, {
-    threadId: thread.threadId,
-    role: 'USER',
-    kind: opts.questionKind,
-    content: opts.question,
-    citations: [],
-    callId: null,
-    suggestedAction: null,
-  });
-
-  // 问题路由：关键词与显式分类结合
   const kind = opts.questionKind !== 'OTHER' ? opts.questionKind : classifyQuestion(opts.question);
-  const tablesForQuestion = selectTablesForQuestion(opts.pack, opts.computed, opts.question, kind);
-
-  const step = await insertStep(deps.srPool, {
-    taskId: task.taskId,
-    stepKind: 'CHAT_ANSWER',
-    sectionKey: null, // 答案消息 ID 在调用后回写 note
-    sequence: 900 + Math.floor(Math.random() * 9000), // 追问步骤排在主链之后（顺序仅供展示）
-  });
+  const tablesForQuestion = selectTablesForQuestion(pack, computed, opts.question, kind);
   const input: ChatInput = {
     question: opts.question,
     questionKind: kind,
     subject: task.subject,
     cutoff: report.cutoff,
+    reportIdentity: { reportId: report.reportId, version: report.version, contentHash: report.contentHash },
     reportExcerpt: report.sections.slice(0, 4).map((s) => ({ sectionKey: s.key, narrative: s.narrative.slice(0, 400), tables: s.tables })),
-    tables: tablesForQuestion.map((t) => ({ tableId: t.tableId, title: t.title, columns: t.columns, rows: t.rows.slice(-30) })),
+    tables: tablesForQuestion.map((t) => {
+      const body = { tableId: t.tableId, title: t.title, columns: t.columns, rows: t.rows.slice(-30),
+        kind: ('formula' in t ? 'COMPUTED' : 'EVIDENCE') as 'COMPUTED' | 'EVIDENCE',
+        locators: t.locators.length === t.rows.length ? t.locators.slice(-30) : t.locators };
+      return { ...body, tableHash: canonicalSha256(body) };
+    }),
   };
-  await updateStep(deps.srPool, step.stepId, { status: 'RUNNING', started: true });
-  try {
-    const out = validateChatOutput(await callModel(deps, task, step, 'CHAT_ANSWER', input, validateChatOutput)) as ChatOutput;
-    await updateStep(deps.srPool, step.stepId, { status: 'SUCCEEDED', finished: true });
-    const msg = await addChatMessage(deps.srPool, {
-      threadId: thread.threadId,
-      role: 'ASSISTANT',
-      kind,
-      content: out.answer,
-      citations: out.citations.map((c) => ({ label: c.label, locator: { kind: 'COMPUTED' as const, tableId: c.tableId } })),
-      callId: null,
-      suggestedAction: out.suggestedAction ?? null,
-    });
-    return msg;
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    await updateStep(deps.srPool, step.stepId, { status: 'FAILED', note: message.slice(0, 500), finished: true });
-    throw err;
+  const inputJson = JSON.stringify(input, null, 1);
+  const { request, step } = await beginChatRequest(deps.srPool, { accountId, report, question: opts.question, kind, input,
+    ...(opts.requestKey === undefined ? {} : { key: opts.requestKey }), ...(opts.quotaLimit === undefined ? {} : { quotaLimit: opts.quotaLimit }) });
+  let active = questionRuns.get(deps.srPool);
+  if (!active) { active = new Map(); questionRuns.set(deps.srPool, active); }
+  const runKey = `${accountId}:${request.request_key}`;
+  const running = active.get(runKey);
+  if (running) return running;
+  const work = (async () => {
+  const originalCall = await srFindCallByStep(deps.srPool, task.taskId, step.stepId);
+  if (originalCall?.state === 'SENT' || originalCall?.state === 'UNKNOWN') throw new KernelError(
+    originalCall.state === 'SENT' ? 'REQUEST_PENDING' : 'REQUEST_UNKNOWN', `Original request ${request.request_key}: ${originalCall.state}; no resend`);
+  let saved: { permit: SrCallPermit; output: unknown } | null = null;
+  if (originalCall?.state === 'SUCCEEDED') {
+    const row = (await deps.srPool.query<{ input_checkpoint: SrInputCheckpoint; input_checkpoint_hash: string }>(
+      'select input_checkpoint,input_checkpoint_hash from sr_step where step_id=$1::uuid', [step.stepId])).rows[0];
+    if (!row?.input_checkpoint || row.input_checkpoint_hash !== canonicalSha256(row.input_checkpoint) ||
+        canonicalSha256(row.input_checkpoint.input) !== canonicalSha256(input) || row.input_checkpoint.modelStep !== 'CHAT_ANSWER') throw new KernelError('SR_CHECKPOINT_CONFLICT');
+    saved = await restoreSrResponse(deps.srPool, row.input_checkpoint);
+    if (request.state === 'SUCCEEDED') {
+      const verified = await verifiedChatMessages(deps.srPool, deps.outputDir, report, request.thread_id!);
+      const message = verified.messages.find((m) => m.messageId === request.response_message_id);
+      if (!saved || !message || message.callId !== saved.permit.callId) throw new KernelError('SR_CHAT_UNBOUND');
+      return message;
+    }
   }
+  return withExecutionLease(deps.srPool, 'sr', async ({ lease }) => {
+    const owned = { ...deps, lease };
+    try {
+      if (step.status !== 'SUCCEEDED') await updateOwnedStep(owned, step.stepId, { status: 'RUNNING', started: true });
+      const archive = async (output: ReturnType<typeof validateChatOutput>, permit: SrCallPermit) => {
+        await fencedSrWrite(deps.srPool, lease, (tx) => saveStepArtifact(tx, deps.outputDir, step, { inputJson, input, output, callId: permit.callId }));
+      };
+      const result = saved ? { permit: saved.permit, output: validateChatOutput(saved.output, input) } : await callSrModel(owned, {
+        contract: { taskId: task.taskId, stepId: step.stepId, methodVersion: task.methodVersion,
+          planAuthVersion: deps.budget.planAuthVersion,
+          deadline: new Date((deps.now?.() ?? new Date()).getTime() + SR_CALL_WINDOW_MS).toISOString() },
+        modelStep: 'CHAT_ANSWER', input, validate: (v) => validateChatOutput(v, input),
+        afterValidated: archive,
+      });
+      const out = result.output;
+      if (saved) await archive(out, result.permit);
+      return await completeChatRequest(deps.srPool, lease, request, {
+        threadId: request.thread_id!, role: 'ASSISTANT', kind, content: out.answer,
+        citations: chatCitations(input, out), callId: result.permit.callId, suggestedAction: out.suggestedAction ?? null,
+      });
+    } catch (err) {
+      await recordRequestFailure(deps.srPool, lease, request, err);
+      const call = await srFindCallByStep(deps.srPool, task.taskId, step.stepId);
+      if (call?.state !== 'SENT' && call?.state !== 'SUCCEEDED') {
+        await updateOwnedStep(owned, step.stepId, { status: 'FAILED', note: (err instanceof Error ? err.message : String(err)).slice(0, 500), finished: true });
+      }
+      throw err;
+    }
+  }, { lease: deps.lease });
+  })();
+  active.set(runKey, work);
+  try { return await work; } finally { active.delete(runKey); }
 }
+
+const questionRuns = new WeakMap<SrEngineDeps['srPool'], Map<string, Promise<ChatMessage>>>();
 
 export function classifyQuestion(q: string): ChatMessage['kind'] {
   const s = q.toLowerCase();

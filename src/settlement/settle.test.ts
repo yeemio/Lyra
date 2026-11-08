@@ -10,6 +10,8 @@ import { randomUUID } from 'node:crypto';
 import { after, before, test } from 'node:test';
 import type { Pool } from 'pg';
 import { createPool } from '../db/pool.js';
+import { freezeBenchmark } from '../conclusion/benchmark.js';
+import type { TimePointFact } from '../contracts.js';
 import { insertFact } from '../pintime/facts.js';
 import { settleConclusion, type SettleOutcome } from './settle.js';
 import { SettlementError, decFrom, decMin, decToString } from './decimal.js';
@@ -126,8 +128,9 @@ async function insertFactorEvent(subject: string, day: string): Promise<void> {
   });
 }
 
+const industrySnapshots = new Map<string, TimePointFact>();
 async function insertIndustry2021(subject: string, l1: string): Promise<void> {
-  await insertFact(pool, {
+  const fact: TimePointFact = {
     factId: `sw-${subject}-2021`,
     subjectType: 'STOCK',
     subjectId: subject,
@@ -140,7 +143,9 @@ async function insertIndustry2021(subject: string, l1: string): Promise<void> {
     eventAt: '2021-07-29T16:00:00.000Z', sourcePublishedAt: '2021-07-29T16:00:00.000Z',
     firstObservedAt: '2026-10-25T00:00:00.000Z', availableAt: '2021-07-30T16:00:00.000Z',
     supersedesFactId: null, artifactSha256: ART, adapterVersion: 'sw@p1',
-  });
+  };
+  await insertFact(pool, fact);
+  industrySnapshots.set(subject, fact);
 }
 
 /** 平价行情：ref 开盘 open、各日收盘 close、第 count 日 closeLast（preclose 全 close）。 */
@@ -157,7 +162,10 @@ function settleArgs(
   disposition: 'RESEARCH_OUTPERFORM' | 'RESEARCH_UNDERPERFORM' | 'ABSTAIN',
   overrides: Record<string, unknown> = {},
 ) {
-  return { subject, disposition, conclusionTime: CONCLUSION_T0, cutoff: CUTOFF, asOf: AS_OF, ...overrides };
+  const cutoff = String(overrides.cutoff ?? CUTOFF);
+  const fact = industrySnapshots.get(subject);
+  const benchmark = freezeBenchmark({ subjectKind: 'STOCK', subject, cutoff, facts: fact === undefined ? [] : [fact] });
+  return { subject, disposition, conclusionTime: CONCLUSION_T0, cutoff, asOf: AS_OF, benchmark, ...overrides };
 }
 
 /** SETTLED 形态收窄助手（非 SETTLED 直接失败并给出原因）。 */

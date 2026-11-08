@@ -1,3 +1,4 @@
+import { keepLeaseAlive, type ExecutionLease } from '../kernel/lease.js';
 /**
  * W22 单测 · Gate-M 周度研究执行器（真实数据 + mock 通道）。
  * 零真实模型调用、零 spawn：真跑路径注入 FakeSolChannel（ModelTransport，describe
@@ -20,12 +21,15 @@ import type { SolDispatchPayload } from '../kernel/sol-transport.js';
 import { DEFAULT_SOL_MODEL } from '../kernel/sol-transport.js';
 import { readConclusion } from '../db/conclusion.js';
 import { KernelError, type AOutput, type JOutput, type ModelCallContract } from '../contracts.js';
-import { canonicalSha256 } from '../canonical.js';
 import { runGateM, renderJPrompt, GATE_M_PLAN_BUDGET } from './gate-m.js';
+import { researchJInputHash } from './validation.js';
+import { researchMaterial, type ResearchDispatchPayload } from './requests.js';
 import { deriveChecklist } from './checklist.js';
 import { simulatedModelA } from './simulated.js';
 
 const HOLDER = `gate-m-test-${randomUUID()}`;
+let testLease: ExecutionLease;
+let testKeeper: ReturnType<typeof keepLeaseAlive>;
 const schema = `gate_m_${randomUUID().replaceAll('-', '').slice(0, 12)}`;
 const admin = createPool();
 let isolated: Pool;
@@ -34,11 +38,13 @@ const store = new ArtifactStore('data/artifacts');
 test.before(async () => {
   await applySchema(admin, schema);
   isolated = createPool({ schema });
-  await acquireExecutorLock(isolated, HOLDER);
+  testLease = (await acquireExecutorLock(isolated, HOLDER)).lease;
+  testKeeper = keepLeaseAlive(isolated, testLease);
 });
 
 test.after(async () => {
-  try { await releaseExecutorLock(isolated, HOLDER); } catch { /* 已释放 */ }
+  await testKeeper?.stop();
+  try { await releaseExecutorLock(isolated, testLease); } catch { /* 已释放 */ }
   await isolated?.end().catch(() => {});
   await dropSchema(admin, schema);
   await admin.end();
@@ -47,10 +53,14 @@ test.after(async () => {
 // ===== mock 通道：Sol 形态载荷（prompt + expectedChecklistIds），输出回抄 prompt 内嵌哈希 =====
 
 class FakeSolChannel implements ModelTransport {
+  preflight(call: ModelCallContract, payload: unknown): void {
+    const p = payload as { prompt: string; inputHash: string };
+    assert.equal(p.inputHash, call.inputHash); assert.equal(Buffer.byteLength(p.prompt), call.inputBytes);
+  }
   readonly calls: { stage: 'A' | 'J'; prompt: string; inputBytes: number }[] = [];
 
   async dispatch(call: ModelCallContract, payload: unknown): Promise<unknown> {
-    const p = payload as SolDispatchPayload;
+    const p = payload as ResearchDispatchPayload;
     const requiredHash = /required_input_hash = "([0-9a-f]{64})"/.exec(p.prompt)?.[1];
     if (requiredHash === undefined) {
       throw new KernelError('MODEL_OUTPUT_SCHEMA_INVALID', 'fake：prompt 未内嵌 required_input_hash');
@@ -63,13 +73,13 @@ class FakeSolChannel implements ModelTransport {
         subjectKind: call.businessKey.subjectKind,
         candidate: 'RESEARCH_OUTPERFORM',
         decisiveLinks: [
-          { text: '决定性连接一：近 8 季财务趋势（fake 通道）', evidenceArtifactSha256: '11'.repeat(32) },
-          { text: '决定性连接二：行业基准相对表现（fake 通道）', evidenceArtifactSha256: '22'.repeat(32) },
+          { text: '决定性连接一：近 8 季财务趋势（fake 通道）', evidenceArtifactSha256: p.material.artifactSha256s[0]! },
+          { text: '决定性连接二：行业基准相对表现（fake 通道）', evidenceArtifactSha256: p.material.artifactSha256s[0]! },
         ],
         strongestCounter: '最强反证：近 20 日换手率抬升（fake 通道）',
         confidence: 'MEDIUM',
         limitations: ['fake 通道输出（测试）'],
-        simulated: true,
+        simulated: false,
       };
       return out;
     }
@@ -78,12 +88,12 @@ class FakeSolChannel implements ModelTransport {
       stage: 'J',
       inputHash: requiredHash,
       finalDisposition: 'ABSTAIN',
-      verdicts: ids.map((id) => ({ checklistId: id, verdict: 'SUPPORTED' as const, decisionBearing: true, correction: null })),
-      changedFromA: false,
-      changeReason: null,
+      verdicts: ids.map((id) => ({ checklistId: id, verdict: 'SUPPORTED' as const, decisionBearing: true, correction: null, reason: '合成复核', evidenceArtifactSha256s: [p.material.artifactSha256s[0]!], remainingBasisChecklistIds: [] })),
+      changedFromA: true,
+      changeReason: '合成复核选择放弃',
       strongestCaseDisposition: 'ACCEPTED',
       limitations: ['fake 通道输出（测试）'],
-      simulated: true,
+      simulated: false,
     };
     return out;
   }
@@ -131,15 +141,11 @@ test('Gate-M prompt：J prompt 含 J_DUTIES、A 输出全文、清单全文与�
     inputHash: pkg.inputHash,
     subjectKind: pkg.businessKey.subjectKind,
     subject: pkg.businessKey.subject,
-    material: {
-      artifactSha256s: pkg.seals.flatMap((s) => s.artifactRefs.map((r) => r.sha256)).slice(0, 12),
-      factCount: pkg.seals.reduce((n, s) => n + s.factIds.length, 0),
-      gaps: pkg.dimensions.flatMap((c) => c.gap),
-    },
+    material: researchMaterial(pkg),
   });
   const checklist = deriveChecklist(fakeA, pkg.seals[0]!.manifestHash);
-  const jInputHash = canonicalSha256({ a: fakeA, checklist });
-  const j = renderJPrompt('STOCK', fakeA, checklist, jInputHash);
+  const jInputHash = researchJInputHash(pkg, fakeA, checklist);
+  const j = renderJPrompt(pkg, fakeA, checklist, jInputHash);
   assert.ok(j.includes('J（裁决者）义务 · method@p2-v1'), 'J_DUTIES 版本行');
   assert.ok(j.includes('逐项裁决恰好一次'), 'J_DUTIES 逐项裁决句');
   assert.ok(j.includes('A 输出全文'), 'A 输出全文段');
@@ -184,7 +190,7 @@ test('Gate-M 真跑（mock 通道）：A→清单→J→结论落库→报告，
     subject: '600519',
     cutoff: '2022-06-30T07:00:00.000Z',
     execute: true,
-    holderId: HOLDER,
+    lease: testLease,
   });
   assert.equal(outcome.mode, 'execute');
   assert.equal(outcome.prompts.jPromptBasis, 'real-a-output');
@@ -224,9 +230,9 @@ test('Gate-M 预算闸：prompt 真实字节超授权上限 → INPUT_OVER_BUDGE
       subject: '600519',
       cutoff: '2022-03-31T07:00:00.000Z',
       execute: true,
-      holderId: HOLDER,
+      lease: testLease,
       budget: { ...GATE_M_PLAN_BUDGET, planAuthVersion: 'pa-gate-m-budget-test', maxInputBytes: 1_000 },
-      versions: { methodVersion: 'method@p2-v1', adapterVersion: 'data@p1', planAuthVersion: 'pa-gate-m-budget-test' },
+      versions: { methodVersion: 'method@p2-v2-20261103', adapterVersion: 'data@p1', planAuthVersion: 'pa-gate-m-budget-test' },
     }),
     (err: unknown) => (err as { code?: string }).code === 'INPUT_OVER_BUDGET',
     '超预算具名阻断',
@@ -239,17 +245,14 @@ test('Gate-M 预算闸：prompt 真实字节超授权上限 → INPUT_OVER_BUDGE
   assert.equal(blocked.rows[0]?.fail_code, 'INPUT_OVER_BUDGET');
 });
 
-test('Gate-M send-once：同业务键二次真跑 → BUSINESS_KEY_ALREADY_SENT', async () => {
+test('Gate-M 检查点重放：同业务键读回原 A/J/结论，不发送也不新增', async () => {
   const fake = new FakeSolChannel();
-  await assert.rejects(
-    () => runGateM({ dataPool: admin, execPool: isolated, store, transport: fake }, {
-      subject: '600519',
-      cutoff: '2022-06-30T07:00:00.000Z',
-      execute: true,
-      holderId: HOLDER,
-    }),
-    (err: unknown) => (err as { code?: string }).code === 'BUSINESS_KEY_ALREADY_SENT',
-    'send-once 拒绝（授权只有一轮）',
-  );
-  assert.equal(fake.calls.length, 0, '重发在 permit 层被拒，模型零调用');
+  const outcome = await runGateM({ dataPool: admin, execPool: isolated, store, transport: fake }, {
+    subject: '600519', cutoff: '2022-06-30T07:00:00.000Z', execute: true, lease: testLease,
+  });
+  assert.equal(outcome.mode, 'execute');
+  if (outcome.mode !== 'execute') throw new Error('EXPECTED_EXECUTE');
+  assert.equal(fake.calls.length, 0);
+  assert.equal((await readConclusion(isolated, outcome.conclusion.conclusionId))?.conclusionHash, outcome.conclusion.conclusionHash);
+  assert.equal((await isolated.query("select count(*)::int as n from exec_permit where subject='600519' and cutoff='2022-06-30T07:00:00.000Z'")).rows[0].n, 2);
 });

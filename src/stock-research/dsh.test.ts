@@ -196,15 +196,13 @@ it('selector → unique executor/permit → official SDK → business validation
     const blocked = await runSrTask({ ...deps, transport: selectSrTransport({ ...f.env, LYRA_SR_REAL_CALLS: '0' }, false) }, unauthorized.taskId);
     assert.equal(blocked.task.error!.code, 'MODEL_PROVIDER_UNAUTHORIZED'); assert.equal(f.requests(), beforeReplay);
     // Force only the supplementary usage update to fail: identity remains, original error wins.
-    const failingMetaPool = new Proxy(srPool, { get(target, key) {
-      if (key === 'query') return (sql: string, values?: unknown[]) => {
-        if (sql.includes('update sr_call set provider') && values?.[3]) return Promise.reject(new Error('SYNTHETIC_USAGE_WRITE_FAILED'));
-        return target.query(sql, values);
-      };
-      const value = Reflect.get(target, key); return typeof value === 'function' ? value.bind(target) : value;
-    } });
+    // Metadata now uses a fenced transaction/client; a pool.query proxy would miss it.
+    await srPool.query(`create function fail_synthetic_usage() returns trigger language plpgsql as $$ begin
+      if new.provider='synthetic-error' and new.usage ? 'durationMs' then raise exception 'SYNTHETIC_USAGE_WRITE_FAILED'; end if;
+      return new; end $$;
+      create trigger fail_synthetic_usage before update on sr_call for each row execute function fail_synthetic_usage()`);
     const telemetryFailure = await newTask();
-    const originalFailure = await runSrTask({ ...deps, srPool: failingMetaPool, transport: { describe: () => ({ provider: 'synthetic-error', modelId: 'synthetic', simulated: true }), async dispatch() { await new Promise(resolve => setTimeout(resolve, responseDelayMs)); throw new KernelError('SYNTHETIC_ORIGINAL_FAILURE', 'Controlled original error'); } } }, telemetryFailure.taskId);
+    const originalFailure = await runSrTask({ ...deps, transport: { describe: () => ({ provider: 'synthetic-error', modelId: 'synthetic', simulated: true }), async dispatch() { await new Promise(resolve => setTimeout(resolve, responseDelayMs)); throw new KernelError('SYNTHETIC_ORIGINAL_FAILURE', 'Controlled original error'); } } }, telemetryFailure.taskId);
     assert.equal(originalFailure.task.error!.code, 'SYNTHETIC_ORIGINAL_FAILURE');
     const telemetryFailureCall = (await srPool.query('select state,fail_code,provider,model_id from sr_call where task_id=$1', [telemetryFailure.taskId])).rows[0]!;
     assert.equal(telemetryFailureCall.state, 'FAILED'); assert.equal(telemetryFailureCall.fail_code, 'SYNTHETIC_ORIGINAL_FAILURE'); assert.equal(telemetryFailureCall.provider, 'synthetic-error');
