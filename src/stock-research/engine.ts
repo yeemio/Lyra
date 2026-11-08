@@ -21,7 +21,7 @@ import { KernelError } from '../contracts.js';
 import { runPermittedCall, type PermittedCallSuccess } from '../kernel/executor.js';
 import { canonicalSha256 } from '../canonical.js';
 import { withExecutionLease, type ExecutionLease } from '../kernel/lease.js';
-import { fencedSrWrite, freezeSrInput, restoreSrResponse, srCheckpointInput, initialEvidence, type SrInputCheckpoint } from './engine-checkpoint.js';
+import { fencedSrWrite, freezeSrInput, restoreSrResponse, srCheckpointInput, assertSrModelArtifact, initialEvidence, type SrInputCheckpoint } from './engine-checkpoint.js';
 import {
   REPORT_SECTIONS,
   type SrCallContract,
@@ -975,8 +975,8 @@ async function verifyCompletedModel(deps: SrEngineDeps, step: SrStep): Promise<v
   }
   const result = await restoreSrResponse(deps.srPool, frozen);
   const value = await readStepOutput<{ inputJson: string; input: unknown; output: unknown }>(deps, step);
-  if (!result || value.inputJson !== JSON.stringify(frozen.input, null, 1) || canonicalSha256(value.input) !== canonicalSha256(frozen.input) ||
-      canonicalSha256(value.output) !== canonicalSha256(result.output)) throw new KernelError('SR_CHECKPOINT_CONFLICT', 'Step CAS differs from the original successful call');
+  if (!result) throw new KernelError('SR_CHECKPOINT_CONFLICT', 'Completed model step has no original successful call');
+  assertSrModelArtifact(frozen, value, result.output);
   switch (frozen.modelStep) {
     case 'PLAN': validatePlanOutput(result.output); break;
     case 'ANALYZE': validateAnalyzeOutput(result.output, frozen.input as AnalyzeInput); break;

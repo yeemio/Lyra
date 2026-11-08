@@ -80,3 +80,14 @@ Owner 已授权这批经核对的问题修复、验证、对应分支提交/推�
 **NOT_RUN：真实隔离 PostgreSQL。** 当前 `postgres/initdb/pg_ctl/psql/docker/podman` 均不可用，`LYRA_REPAIR_TEST_PG` 与 `LYRA_PG_PASSWORD` 均未设置。`execution-recovery.pg.test.ts`、`engine-recovery.pg.test.ts` 及调整后的 `report-identity.pg.test.ts` 必须由总控在准确新 head 的自建 PG 上补验。门覆盖源 DDL 重入、两池/两进程、超 TTL 续租与接管、锁等待后过期、旧 token/旧合同拒绝、双预算与 A/J 预约/UNKNOWN、审计计数、检查点失败回滚、A 后/J 后/发布前恢复、双击/HTTP 刷新/答案落位故障/修订重投、8 次 task 额度和原任务 worker 恢复。缺少 URL 时显式跳过即 NOT_RUN，不是通过。原 kernel/研究/调度/SR 集成调用者还需总控在其公开合成事实、研究池及临时 schema 上运行；未触碰真实资料或业务库。
 
 **NOT_RUN：网页实际呈现。** 新意图/原任务继续表单只有 HTML 内容、安全和提交字段断言；未通过浏览器或截图路径绕过已有访问限制，不能签视觉接受。PDF 源码未变，不复报旧 PDF 为新检查。PR1/PR7/PR5 网页及原私有资料兼容性、严格 PIT、真实 A/J 语义、账户、安装、行业八日、效果、六项 NOT_ASSESSED 边界均保留。总控 ACCEPT_SOURCE 前，累计接受仍为 21/27。
+
+## PR4 R2：两项具名生产回归（2026-11-08）
+
+本轮唯一父提交为 C03 `bd161d976370bbdc4a9f8f78529b634283b67962`（tree `291860aaa207996e22d0b3de43eb570ad4975df6`）。原 C01/C02/C03、依赖父顺序、首次失败及交付原件均保留；只追加原作者一个提交，不重写历史。本节记录修复，不代表总控接受。
+
+- **I-11 / SR 成功检查点恢复**：CAS 中的 `inputJson` 原字符串按 UTF-8 计算 SHA-256 与字节数，核对原冻结合同；其解析值、CAS 结构化输入与 JSONB 检查点按规范化结构比较。原成功响应、合同/通道身份及 CAS 步骤身份仍分别由 `restoreSrResponse`、`verifyCompletedModel` 与 `readStepArtifact` 核验。JSONB 重排键不再误报冲突；原字节、输入、输出或身份真的变化仍拒绝，缺 CAS/无成功回执不补配，UNKNOWN 不退额、不重发。
+- **I-12 / POST_EVENT dry**：在原组装包上读取锚点事实与原先验，复用 `loadPriorResearch`、`withPostEventContext` 的同股/截点/封存/实际送达及继承资格校验，随后调用原 `buildARequest` 和 transport preflight。预览不创建执行检查点、permit、结论、计划或准入行。保留原启动窗预览语义；非模拟 dry 沿冻结方法被 `RESEARCH_METHOD_PROTOCOL_MISMATCH` 拒绝，非模拟 commit 仍在写入前 `P5_PROTOCOL_FROZEN`，不切换模拟身份。
+
+原四个失败用例的症状和断言保留：`report-identity.pg.test.ts` 的实际 EISDIR/ASSEMBLE 续跑、`sr-engine.test.ts` 的 C4-03 QA 阻断恢复与 R2 已发送失败拒绝、`nightly.test.ts` 的 7 DRY + 1 SKIPPED。只增加原 CAS/JSONB 差异证据、原任务/步骤/调用/报告身份不变及事件送达/预检/零发送断言；CLI commit 的 7 研究/14 permit/7 结论与冻结拒绝不减。DSH 旧夹具不改。新增 `engine-checkpoint.test.ts` 只验证原字节与结构、真实临时 CAS 读回/错绑/缺失，明确不算 PostgreSQL。
+
+本作者 Linux 环境的 typecheck、上述新纯检查及就近执行/报告纯回归合计 34/34、零失败/跳过，diff 检查通过；精确命令、stdout/stderr、退出码与冻结 head 以本轮交付日志为准。**隔离 PostgreSQL NOT_RUN**：无 `postgres/initdb/pg_ctl/psql/docker/podman`、无隔离连接配置；未运行默认库调用者、未把跳过或 SQL 替身称为 PG 通过。四个原失败用例须由总控在准确 R2 的自建 PG 上聚焦补验，原正向证据只按未变范围复用。不扩大真实资料、P5、网页呈现或业务/效果接受。

@@ -16,6 +16,7 @@ import { fileURLToPath } from 'node:url';
 import { after, before, test } from 'node:test';
 import type { Pool } from 'pg';
 import { ArtifactStore } from '../artifacts/store.js';
+import type { ModelCallContract } from '../contracts.js';
 import type { TradeCalendarTable } from '../adapters/calendar.js';
 import { applySchema, dropSchema } from '../db/exec.js';
 import { createPool } from '../db/pool.js';
@@ -23,7 +24,10 @@ import { persistConclusion, readConclusion } from '../db/conclusion.js';
 import { readExecutorLock } from '../kernel/lock.js';
 import { freezeBenchmark } from '../conclusion/benchmark.js';
 import { asOfFacts, insertFact } from '../pintime/facts.js';
-import { validatePostEventContext } from '../research/inheritance.js';
+import { readSeal } from '../pintime/seal.js';
+import { validatePostEventContext, type PostEventContext } from '../research/inheritance.js';
+import type { ResearchDispatchPayload } from '../research/requests.js';
+import type { InputIndexContent } from '../research/inputs.js';
 import type { ResearchTrace } from '../research/validation.js';
 import { runNightly, runNightlyCli, SKELETON_PLAN_AUTH_VERSION, type NightlyEntryResult } from './nightly.js';
 import { SimulatedTransport, UnauthorizedTransport, type ModelTransport } from '../kernel/transport.js';
@@ -200,7 +204,23 @@ const entriesOf = (out: { entries: NightlyEntryResult[] }, status: string): Nigh
   out.entries.filter((e) => e.status === status);
 
 test('dry：轮转 6 只 + 事件合并（截点取最晚）+ 池外跳过；零 permit 零结论零调度写入', async () => {
-  const out = await runNightly(deps(), { date: DATE, mode: 'dry', now: NOW_EVENING, poolInfoFile });
+  const previews: { call: ModelCallContract; payload: ResearchDispatchPayload }[] = [];
+  const inner = new SimulatedTransport();
+  let dispatches = 0;
+  const previewTransport: ModelTransport = {
+    describe: () => inner.describe(),
+    preflight: (call, payload) => {
+      inner.preflight(call, payload);
+      const p = payload as ResearchDispatchPayload;
+      assert.equal(call.stage, 'A');
+      assert.equal(call.inputHash, p.inputHash);
+      assert.equal(call.inputBytes, Buffer.byteLength(p.prompt, 'utf8'));
+      assert.ok(p.prompt.includes(call.inputHash));
+      previews.push({ call, payload: p });
+    },
+    dispatch: async () => { dispatches++; assert.fail('dry 不得发送模型'); },
+  };
+  const out = await runNightly({ ...deps(), transport: previewTransport }, { date: DATE, mode: 'dry', now: NOW_EVENING, poolInfoFile });
 
   assert.equal(out.nth, 1);
   assert.deepEqual(
@@ -227,9 +247,52 @@ test('dry：轮转 6 只 + 事件合并（截点取最晚）+ 池外跳过；零
   // 事件后 dry 条目带启动闸与继承预览
   const pe = entriesOf(out, 'DRY').find((e) => e.researchKind === 'POST_EVENT');
   assert.ok(pe && pe.detail && pe.detail.includes('启动闸=ALLOWED') && pe.detail.includes('继承=STANDALONE'), pe?.detail ?? '');
+  assert.equal(previews.length, 7, '每条预览到达实际 transport preflight');
+  const eventPreviews = previews.filter((p) => p.call.businessKey.researchKind === 'POST_EVENT');
+  assert.equal(eventPreviews.length, 1);
+  const preview = eventPreviews[0]!;
+  assert.equal(preview.call.businessKey.subject, '600102');
+  assert.equal(preview.call.businessKey.cutoff, EVENT_CUTOFF);
+  assert.equal(preview.call.inputHash, pe.inputHash);
+  assert.equal(preview.call.inputBytes, pe.inputBytes);
+  const block = preview.payload.researchInput.l0.find((b) => b.materialId === 'mat:0:post-event-context')!;
+  assert.ok(block, '事件上下文须实际送达 L0，不能只写预览说明');
+  const context = (block.payload.records as unknown as PostEventContext[])[0]!;
+  assert.equal(context.kind, 'POST_EVENT_CONTEXT_V2');
+  assert.equal(context.basis, 'STANDALONE');
+  assert.equal(context.event.eventId, 'evt-b');
+  assert.equal(context.event.evidenceFactId, eventFactIds.get('evt-b'));
+  assert.equal(context.eventFact.subjectId, '600102');
+  assert.equal(context.eventFact.factId, context.event.evidenceFactId);
+  assert.equal(context.event.eventTime, EVENT_CUTOFF);
+  assert.ok(Date.parse(context.eventFact.availableAt) <= Date.parse(EVENT_CUTOFF));
+  assert.equal(context.admittedAt, NOW_EVENING.toISOString());
+  assert.ok(preview.payload.prompt.includes('POST_EVENT_CONTEXT_V2') && preview.payload.prompt.includes(context.eventFact.factId));
+  const index = preview.payload.researchInput.l2.find((b) => b.kind === 'INDEX')!.payload as unknown as InputIndexContent;
+  assert.ok(index.deliveredFacts.some((f) => f.factId === context.eventFact.factId &&
+    f.artifactSha256 === context.eventFact.artifactSha256 && f.materialId === block.materialId && f.layer === 'L0'));
+  const seals = await Promise.all(index.seals.map((s) => readSeal(pool, s.sealId)));
+  assert.ok(seals.some((s) => s?.factIds.includes(context.eventFact.factId) &&
+    s.artifactRefs.some((a) => a.sha256 === context.eventFact.artifactSha256)), '原事件事实/原件在实际封存中');
+  const original = JSON.parse(new TextDecoder().decode(await store.readBytes(context.eventFact.artifactSha256)));
+  assert.equal(original.factId, context.eventFact.factId);
+  assert.equal(original.subjectId, '600102');
 
   // 零落库（permit / 结论 / 调度表）；重复 dry 仍零
-  await runNightly(deps(), { date: DATE, mode: 'dry', now: NOW_EVENING, poolInfoFile });
+  const repeat = await runNightly({ ...deps(), transport: previewTransport }, { date: DATE, mode: 'dry', now: NOW_EVENING, poolInfoFile });
+  assert.deepEqual(repeat.tally, out.tally);
+  assert.equal(previews.length, 14);
+  assert.equal(dispatches, 0);
+  // 非模拟 dry 仍受冻结方法协议约束，不能偷偷改成 simulated 或声称预检通过。
+  let realPreflights = 0;
+  const realDry = await runNightlyCli(['--date', DATE, '--dry', '--transport', 'real', '--now', NOW_EVENING.toISOString(), '--pool-info', poolInfoFile],
+    deps(), () => ({ describe: () => ({ provider: 'synthetic-non-simulated-shape', simulated: false }),
+      preflight: () => { realPreflights++; assert.fail('冻结方法不能抵达成功预检'); },
+      dispatch: async () => { dispatches++; assert.fail('禁止真实发送'); } }));
+  assert.deepEqual(realDry.tally, { DRY: 0, PASS: 0, FAILED: 7, BLOCKED: 0, SKIPPED: 1 });
+  assert.ok(entriesOf(realDry, 'FAILED').every((e) => e.code === 'RESEARCH_METHOD_PROTOCOL_MISMATCH'));
+  assert.equal(realPreflights, 0);
+  assert.equal(dispatches, 0);
   assert.equal(await countOf('exec_permit'), 0);
   assert.equal(await countOf('conclusion'), 0);
   assert.equal(await countOf('schedule_plan'), 0);

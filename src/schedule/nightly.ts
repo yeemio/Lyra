@@ -29,7 +29,8 @@ import { createPool } from '../db/pool.js';
 import { canonicalSha256 } from '../canonical.js';
 import { withTransaction } from '../db/exec.js';
 import { assertLease } from '../kernel/lease.js';
-import { validatePostEventContext } from '../research/inheritance.js';
+import { loadPriorResearch, validatePostEventContext, withPostEventContext, type PostEventContext } from '../research/inheritance.js';
+import { loadFact } from '../pintime/facts.js';
 import { type ResearchSnapshot } from '../research/gate-m-checkpoint.js';
 import { validDispositions, type AOutput, type JOutput, type PlanAuthBudget, type SubjectKind } from '../contracts.js';
 import { readConclusion } from '../db/conclusion.js';
@@ -52,7 +53,6 @@ import {
   admissionIdOf,
   admitPostEvent,
   budgetGuard,
-  declarePostEventInheritance,
   mergePostEventAdmissions,
   POST_EVENT_BASELINE_PER_WEEK,
   type AdmissionRecord,
@@ -751,7 +751,8 @@ async function dryPreview(
   ctx: { poolInfoFile: string; now: Date; weekStart: string; planAuthVersion: string },
 ): Promise<{ inputHash: string; inputBytes: number; note: string }> {
   const notes: string[] = [];
-  if (plan.researchKind === 'POST_EVENT' && anchor !== null) {
+  if (plan.researchKind === 'POST_EVENT') {
+    if (anchor === null) throw new NightlyError('POST_EVENT_ANCHOR_MISSING', `${plan.subject} 缺少事件锚点`);
     // SC-3.3 启动闸预览 + SC-7.1 继承声明预览（dry 不执行，只如实标注）。
     // 预览不承重：历史尾周（日历覆盖尾当日事件，无下一交易日）等预览失败只记录，不阻断组装。
     try {
@@ -762,9 +763,6 @@ async function dryPreview(
     } catch (error) {
       notes.push(`启动闸=PREVIEW_UNAVAILABLE(${errorCode(error)}；重放预览非执行闸)`);
     }
-    const prior = await priorWeeklyConclusion(deps.execPool, plan.subject, ctx.weekStart);
-    const declaration = declarePostEventInheritance(plan.subject, prior === null ? [] : [prior]);
-    notes.push(`继承=${declaration.basis}${prior === null ? '' : `(${prior.conclusionId})`}`);
   }
   const assembled = await assembleResearchInput(deps.dataPool, deps.store, {
     subjectKind: plan.subjectKind,
@@ -779,12 +777,26 @@ async function dryPreview(
     researchKind: plan.researchKind,
     poolInfoFile: ctx.poolInfoFile,
   });
+  let pkg = assembled.package;
+  if (plan.researchKind === 'POST_EVENT' && anchor !== null) {
+    const priorRef = await priorWeeklyConclusion(deps.execPool, plan.subject, ctx.weekStart);
+    const prior = priorRef === null ? null : await readConclusion(deps.execPool, priorRef.conclusionId);
+    const resolved = await loadPriorResearch(deps.execPool, deps.store, prior, anchor, SKELETON_METHOD_VERSION, ctx.now.toISOString());
+    const eventFact = await loadFact(deps.dataPool, anchor.evidenceFactId);
+    if (eventFact === null) throw new NightlyError('EVENT_FACT_MISSING', anchor.evidenceFactId);
+    const context: PostEventContext = resolved.prior === null
+      ? { kind: 'POST_EVENT_CONTEXT_V2', basis: 'STANDALONE', prior: null, event: anchor, eventFact, admittedAt: ctx.now.toISOString(), reason: resolved.reason }
+      : { kind: 'POST_EVENT_CONTEXT_V2', basis: 'INHERITED', prior: resolved.prior, event: anchor, eventFact, admittedAt: ctx.now.toISOString(), reason: resolved.reason };
+    // Same fact/seal/delivery and prior-evidence checks as runPostEventResearch; no execution checkpoint or admission write.
+    pkg = withPostEventContext(pkg, context, NIGHTLY_INPUT_BUDGET);
+    notes.push(`继承=${context.basis}${context.prior === null ? '' : `(${context.prior.conclusion.conclusionId})`}`);
+  }
   const transport = deps.transport ?? selectTransport({ provider: 'simulated' });
-  const request = buildARequest(assembled.package, transport.describe().simulated);
-  await preflightTransport(transport, { businessKey: assembled.package.businessKey, stage: 'A',
+  const request = buildARequest(pkg, transport.describe().simulated);
+  await preflightTransport(transport, { businessKey: pkg.businessKey, stage: 'A',
     inputHash: request.inputHash, inputBytes: request.inputBytes, methodVersion: SKELETON_METHOD_VERSION,
     planAuthVersion: ctx.planAuthVersion, deadline: shanghaiInstant(shanghaiWall(ctx.now).date, WEEKLY_DEADLINE).toISOString() }, request.payload);
-  if (plan.researchKind === 'POST_EVENT') notes.push('事件上下文与J仍待执行时按原准入组装；本预览不替代该预检');
+  if (plan.researchKind === 'POST_EVENT') notes.push('事件上下文已实际送达L0；本预览不替代执行准入与J复核');
   return {
     inputHash: request.inputHash,
     inputBytes: request.inputBytes,

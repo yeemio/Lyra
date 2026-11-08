@@ -206,10 +206,13 @@ describe('sr 引擎：中断恢复与调用身份', () => {
     assert.ok(failedCall?.sentAt, '失败发生在发送后（sent_at 非空）');
 
     const stepsBefore = (await srPool.query(`select count(*)::int n from sr_step where task_id=$1`, [task.taskId])).rows[0].n;
+    const identitiesBefore = (await srPool.query('select call_id,step_id,state,sent_at,response_hash from sr_call where task_id=$1 order by call_id', [task.taskId])).rows;
     const callsBefore = (await callRows()).length;
     const second = await runSrTask(depsWith(new SimSrTransport()), task.taskId);
     assert.equal(second.task.status, 'FAILED', '同输入重跑必须失败（不得换 ID 重发）');
     assert.equal(second.task.error?.code, 'SR_CHECKPOINT_MISSING', '已发但无可信成功检查点，拒绝重发');
+    assert.equal(second.task.taskId, task.taskId);
+    assert.deepEqual((await srPool.query('select call_id,step_id,state,sent_at,response_hash from sr_call where task_id=$1 order by call_id', [task.taskId])).rows, identitiesBefore, '越过已成功 PLAN 后仍拒绝原失败调用，原调用身份不变');
     assert.equal((await callRows()).length, callsBefore, '零新增调用');
     const stepsAfter = (await srPool.query(`select count(*)::int n from sr_step where task_id=$1`, [task.taskId])).rows[0].n;
     assert.equal(stepsAfter, stepsBefore, '无自动新步骤');
@@ -613,6 +616,8 @@ describe('sr 引擎：C4 差集验收点', () => {
     assert.equal(first.report!.status, 'PUBLISHED_RESTRICTED');
     assert.deepEqual(first.report!.qaFindings.filter((f) => f.severity === 'BLOCKING').map((f) => f.code), ['SCENARIO_MISSING'], '首轮确实到达 QA 三情景完整性检查');
     const callsAfterFirst = (await callRows()).length;
+    const stepsAfterFirst = (await srPool.query('select step_id from sr_step where task_id=$1 order by sequence', [task.taskId])).rows;
+    const identitiesAfterFirst = (await srPool.query('select call_id,step_id,state,sent_at,response_hash from sr_call where task_id=$1 order by call_id', [task.taskId])).rows;
 
     // 模拟组装后工作文件写失败：保留已经插入的报告，重入同一步骤不增版。
     await srPool.query(`update sr_step set status='FAILED', finished_at=null where task_id=$1::uuid and step_kind='ASSEMBLE'`, [task.taskId]);
@@ -623,6 +628,11 @@ describe('sr 引擎：C4 差集验收点', () => {
     assert.equal(second.task.status, 'PARTIAL', `恢复后仍 PARTIAL（实际 ${second.task.status}，error=${JSON.stringify(second.task.error)}）`);
     assert.ok(second.task.error && second.task.error.code === 'PUBLISH_GATE_BLOCKED', '恢复后仍是发布门阻断');
     assert.equal(second.report!.status, 'PUBLISHED_RESTRICTED', '恢复后仍受限发布');
+    assert.equal(second.task.taskId, task.taskId);
+    assert.equal(second.report!.reportId, first.report!.reportId);
+    assert.equal(second.report!.version, first.report!.version);
+    assert.deepEqual((await srPool.query('select step_id from sr_step where task_id=$1 order by sequence', [task.taskId])).rows, stepsAfterFirst, '恢复零新步骤');
+    assert.deepEqual((await srPool.query('select call_id,step_id,state,sent_at,response_hash from sr_call where task_id=$1 order by call_id', [task.taskId])).rows, identitiesAfterFirst, '恢复不改原调用及成功回执');
     assert.deepEqual(second.report!.qaFindings, first.report!.qaFindings, '恢复保留完整 QA 发现');
     assert.ok(!second.report!.gate!.passed, '门未过');
     assert.ok(second.report!.gate!.reason.includes('BLOCKING') || second.report!.gate!.reason.includes('质检'), `门原因含质检阻断（${second.report!.gate!.reason}）`);

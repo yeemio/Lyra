@@ -1,6 +1,6 @@
 /** 实际 PostgreSQL 门。仅显式 LYRA_REPAIR_TEST_PG + 随机隔离 schema；无业务库回退。 */
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -12,6 +12,8 @@ import { applySchema, dropSchema, srMigrationSqlUrl } from '../db/exec.js';
 import { createAccount } from './accounts.js';
 import { defaultSrPlanBudget, type SrModelTransport } from './contracts.js';
 import { askReportQuestion, runSrTask } from './engine.js';
+import type { SrInputCheckpoint } from './engine-checkpoint.js';
+import { readStepArtifact } from './report-artifacts.js';
 import { reportFixture } from './report-identity-test-helper.js';
 import { syntheticInitialEvidence, SyntheticRecoveryTransport } from './engine-recovery-test-helper.js';
 import { canonicalSha256 } from '../canonical.js';
@@ -93,13 +95,30 @@ test('PR5 actual isolated PG: identity, versions, immutable recovery and deliver
       assert.ok(saved);
       assert.equal(recoveryTransport.calls.length, 6, '原步骤通过正常发送与检查点入口');
       const savedSteps = await listSteps(pool, recoveryTask.taskId);
+      const plan = savedSteps.find((s) => s.stepKind === 'PLAN')!;
+      const frozen = (await pool.query<{ input_checkpoint: SrInputCheckpoint; input_checkpoint_hash: string }>(
+        'select input_checkpoint,input_checkpoint_hash from sr_step where step_id=$1', [plan.stepId])).rows[0]!;
+      const original = await readStepArtifact<{ inputJson: string; input: unknown }>(outputDir, plan, plan.outputArtifact);
+      assert.equal(canonicalSha256(frozen.input_checkpoint), frozen.input_checkpoint_hash);
+      assert.notEqual(original.inputJson, JSON.stringify(frozen.input_checkpoint.input, null, 1), '实际 JSONB 重排键，不可重新序列化充当原字节');
+      assert.equal(createHash('sha256').update(original.inputJson, 'utf8').digest('hex'), frozen.input_checkpoint.contract.inputHash);
+      assert.equal(Buffer.byteLength(original.inputJson, 'utf8'), frozen.input_checkpoint.contract.inputBytes);
+      assert.deepEqual(JSON.parse(original.inputJson), frozen.input_checkpoint.input);
+      assert.deepEqual(original.input, frozen.input_checkpoint.input);
+      const callsBefore = (await pool.query('select call_id,step_id,input_hash,input_bytes,sent_at,response_hash from sr_call where task_id=$1 order by call_id', [recoveryTask.taskId])).rows;
       await rm(join(work, 'report.md'), { recursive: true });
       await mkdir(join(work, 'steps'), { recursive: true });
       for (const step of savedSteps) await writeFile(join(work, 'steps', `${String(step.sequence).padStart(2, '0')}-${step.stepKind}${step.sectionKey ? '-' + step.sectionKey : ''}.json`), '{"forged":true}');
       await writeFile(join(work, 'evidence.json'), '{"forged":true}');
       const restored = await runSrTask(recoveryDeps, recoveryTask.taskId);
       assert.ok(['COMPLETED', 'PARTIAL'].includes(restored.task.status), JSON.stringify(restored.task.error));
+      assert.equal(restored.task.taskId, recoveryTask.taskId);
+      assert.equal(restored.report!.reportId, saved.reportId);
+      assert.equal(restored.report!.version, saved.version);
+      assert.deepEqual(restored.report!.qaFindings, saved.qaFindings);
       assert.equal(restored.report!.contentHash, saved.contentHash);
+      assert.deepEqual((await listSteps(pool, recoveryTask.taskId)).map((s) => s.stepId), savedSteps.map((s) => s.stepId), '原步骤身份不变');
+      assert.deepEqual((await pool.query('select call_id,step_id,input_hash,input_bytes,sent_at,response_hash from sr_call where task_id=$1 order by call_id', [recoveryTask.taskId])).rows, callsBefore, '原调用及成功回执不变');
       assert.equal((await listReportVersions(pool, recoveryTask.taskId)).length, 1);
       assert.equal(Number((await pool.query('select count(*) from sr_call where task_id=$1', [recoveryTask.taskId])).rows[0].count), 6, '原六次调用未新增');
       assert.equal(recoveryTransport.calls.length, 6, '恢复零模型重发');

@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 import { canonicalSha256 } from '../canonical.js';
 import { KernelError } from '../contracts.js';
@@ -49,6 +50,23 @@ export async function freezeSrInput(pool: Pool, lease: ExecutionLease, candidate
 
 export function srCheckpointInput(frozen: SrInputCheckpoint) {
   return { modelStep: frozen.modelStep, input: frozen.input, wire: frozen.wire };
+}
+
+/** CAS retains the sent text; JSONB retains its structure, not its original key order. */
+export function assertSrModelArtifact(
+  frozen: SrInputCheckpoint,
+  value: { inputJson: string; input: unknown; output: unknown },
+  successfulOutput: unknown,
+): void {
+  const conflict = () => new KernelError('SR_CHECKPOINT_CONFLICT', 'Step CAS differs from the original successful call');
+  if (typeof value?.inputJson !== 'string' || value.input === undefined || value.output === undefined) throw conflict();
+  let sentInput: unknown;
+  try { sentInput = JSON.parse(value.inputJson); } catch { throw conflict(); }
+  if (createHash('sha256').update(value.inputJson, 'utf8').digest('hex') !== frozen.contract.inputHash ||
+      Buffer.byteLength(value.inputJson, 'utf8') !== frozen.contract.inputBytes ||
+      canonicalSha256(sentInput) !== canonicalSha256(frozen.input) ||
+      canonicalSha256(value.input) !== canonicalSha256(frozen.input) ||
+      canonicalSha256(value.output) !== canonicalSha256(successfulOutput)) throw conflict();
 }
 
 export async function restoreSrResponse(pool: Pool, frozen: SrInputCheckpoint): Promise<{ permit: SrCallPermit; output: unknown } | null> {
